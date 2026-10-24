@@ -302,6 +302,12 @@ function createRuntime(name) {
       bufPct: $(".buf-pct", tpl),
       termHost: $(".term-host", tpl),
       fallback: $(".log-fallback", tpl),
+      portToggle: $("[data-port-toggle]", tpl),
+      portToggleLabel: $("[data-port-toggle-label]", tpl),
+      pins: $("[data-port-pins]", tpl),
+      pinDtr: $('[data-pin="dtr"]', tpl),
+      pinRts: $('[data-pin="rts"]', tpl),
+      pinReset: $("[data-pin-reset]", tpl),
       devChip: $(".dev-chip", tpl),
       devName: $(".dev-name", tpl),
       devDesc: $(".dev-desc", tpl),
@@ -315,12 +321,21 @@ function createRuntime(name) {
       devMapOnly: $("[data-dev-maponly]", tpl),
     },
     deviceSource: null,   // "device" | "match" | null (null => derive from config)
+    pins: null,           // last GET/POST /pins payload for this port
+    pinsProbed: false,    // capability probe already answered (or moot)
+    pinsProbing: false,   // a probe request is in flight
+    pinsProbeAt: 0,       // throttle for re-probes
+    pinsBusy: false,      // a pin action is in flight
+    portBusy: false,      // an open/close request is in flight
   };
   rt.el.name.textContent = name;
   wireDeviceControl(rt);
+  wirePortControl(rt);
   $("#panes").appendChild(tpl);
   termHosts.set(rt.el.termHost, rt);
   createTerminal(rt);
+  refreshPortToggle(rt);   // seed the toggle in the active language
+  updatePinsUI(rt);
   return rt;
 }
 
@@ -590,6 +605,197 @@ async function applyDevice(rt, spec) {
   toast(t("device.changed", { device: data.device || "" }), "ok");
 }
 
+/* 6c. port open/close + pin control ======================================== */
+/* Reuses the backend contract: POST /api/ports/{name}/open (empty JSON body =
+   keep the configured baud) and POST /api/ports/{name}/close both return the
+   full port status dict, which we fold back in with mergePortStatus(). Pins
+   (GET/POST /api/ports/{name}/pins) are optional per port: the controls stay
+   hidden unless the server reports pins.enabled. */
+function portPath(rt) { return "/api/ports/" + encodeURIComponent(rt.name) + "/pins"; }
+function portOpenPath(rt, verb) { return "/api/ports/" + encodeURIComponent(rt.name) + "/" + verb; }
+
+function portIsOpen(rt) {
+  if (rt.state === "open") return true;
+  const meta = state.ports.get(rt.name);
+  return !!(meta && meta.open);
+}
+
+function wirePortControl(rt) {
+  if (rt.el.portToggle) rt.el.portToggle.addEventListener("click", () => togglePort(rt));
+  if (rt.el.pinDtr) rt.el.pinDtr.addEventListener("click", () => pinAction(rt, { action: "set", pin: "dtr", value: !pinState(rt).dtr }));
+  if (rt.el.pinRts) rt.el.pinRts.addEventListener("click", () => pinAction(rt, { action: "set", pin: "rts", value: !pinState(rt).rts }));
+  if (rt.el.pinReset) rt.el.pinReset.addEventListener("click", () => pinAction(rt, { action: "reset", pin: null, value: null, duration_ms: null }));
+}
+
+/* Open <-> close. The button is disabled for the duration of the request so a
+   double click cannot fire two conflicting transitions. */
+async function togglePort(rt) {
+  if (rt.portBusy) return;
+  rt.portBusy = true;
+  refreshPortToggle(rt);
+  const data = await api("POST", portOpenPath(rt, portIsOpen(rt) ? "close" : "open"), { body: {} });
+  rt.portBusy = false;
+  if (!data.ok) { refreshPortToggle(rt); return; }   // server error already toasted
+  mergePortStatus(rt.name, data);
+  // a freshly (re)opened port may only now be able to answer /pins
+  if (!pinsFromStatus(rt)) rt.pinsProbed = false;
+  updatePortHeader(rt);
+  updateTabState(rt.name);
+  updateGlobalStats();
+  if (pinState(rt).enabled) refreshPins(rt);   // live levels: unknown when closed, initial after open
+  toast(t(data.open ? "port.opened" : "port.closed", { port: rt.name }), "ok");
+}
+
+/* Label, aria-pressed, title and disabled state all derive from the state. */
+function refreshPortToggle(rt) {
+  const btn = rt.el.portToggle;
+  if (!btn) return;
+  const open = portIsOpen(rt);
+  const label = open ? t("port.close") : t("port.open");
+  if (rt.el.portToggleLabel) rt.el.portToggleLabel.textContent = label;
+  btn.classList.toggle("is-open", open);
+  btn.setAttribute("aria-pressed", String(open));
+  btn.disabled = !!rt.portBusy;
+  btn.setAttribute("aria-busy", rt.portBusy ? "true" : "false");
+  const title = t(open ? "port.closeTitle" : "port.openTitle", { port: rt.name });
+  btn.title = title;
+  btn.setAttribute("aria-label", title);
+}
+
+/* ---- pins ---- */
+function pinsFromStatus(rt) {
+  const meta = state.ports.get(rt.name);
+  const p = meta && meta.pins;
+  return (p && typeof p === "object") ? p : null;
+}
+/* Last known pin record: rt.pins (fresh GET/POST) wins over the status dict. */
+function pinState(rt) {
+  const meta = pinsFromStatus(rt) || {};
+  const rec = rt.pins || {};
+  const pick = (k) => {
+    const v = rec[k] !== undefined && rec[k] !== null ? rec[k] : meta[k];
+    return v === undefined || v === null ? null : !!v;
+  };
+  return {
+    enabled: !!(rec.enabled || meta.enabled),
+    dtr: pick("dtr"),
+    rts: pick("rts"),
+    pulse_ms: rec.pulse_ms != null ? rec.pulse_ms : (meta.pulse_ms != null ? meta.pulse_ms : null),
+  };
+}
+
+/* Purely a renderer: reads state, never triggers requests. */
+function updatePinsUI(rt) {
+  const host = rt.el.pins;
+  if (!host) return;
+  const st = pinState(rt);
+  host.hidden = !st.enabled;
+  if (!st.enabled) return;
+  const open = portIsOpen(rt);
+  /* A closed port's line levels are not observable: GET /pins reports null for
+     them, while the status dict's pins view keeps the CONFIGURED initial levels.
+     Show "unknown" instead of a stale/configured value, and disable the actions. */
+  const enabled = open && !rt.pinsBusy;
+  [[rt.el.pinDtr, t("pins.dtr"), open ? st.dtr : null], [rt.el.pinRts, t("pins.rts"), open ? st.rts : null]].forEach(([btn, name, val]) => {
+    if (!btn) return;
+    const stateTxt = val === null ? "\u2013" : t(val ? "pins.on" : "pins.off");
+    const nameEl = $(".pin-name", btn), valEl = $(".pin-val", btn);
+    if (nameEl) nameEl.textContent = name;
+    if (valEl) valEl.textContent = stateTxt;
+    const title = t("pins.setTitle", { pin: name, state: stateTxt });
+    btn.title = title;
+    btn.setAttribute("aria-label", title);
+    btn.setAttribute("aria-pressed", val === null ? "mixed" : String(!!val));
+    btn.disabled = !enabled;
+  });
+  if (rt.el.pinReset) {
+    const btn = rt.el.pinReset;
+    btn.disabled = !enabled;
+    const title = t("pins.resetTitle");
+    btn.title = title;
+    btn.setAttribute("aria-label", title);
+  }
+  host.classList.toggle("busy", !!rt.pinsBusy);
+}
+
+/* Silent GET /pins (raw fetch, so it never raises a user-visible toast). */
+async function fetchPinsRaw(rt) {
+  const headers = {};
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  try {
+    const res = await fetch(apiUrl(portPath(rt)), { headers });
+    let data = null;
+    try { data = await res.json(); } catch (_e) { data = null; }
+    return { status: res.status, ok: res.ok, data };
+  } catch (_e) {
+    return { status: 0, ok: false, data: null };   // transient network failure
+  }
+}
+
+/* Optional-capability probe: only needed when the port status carries no `pins`
+   view (older server). 400 / 404 are definitive, 409 means the port is closed. */
+async function probePins(rt) {
+  if (rt.pinsProbed || rt.pinsProbing) return;
+  const now = Date.now();
+  if (now - rt.pinsProbeAt < 10000) return;      // throttle repeated retries
+  rt.pinsProbeAt = now;
+  rt.pinsProbing = true;
+  const r = await fetchPinsRaw(rt);
+  rt.pinsProbing = false;
+  if (r.status === 0 || r.status === 409) return; // transient / port not open yet
+  rt.pinsProbed = true;                          // 200 / 400 / 404 are all definitive
+  if (r.ok && r.data && r.data.ok && r.data.enabled) {
+    rt.pins = r.data;
+    updatePinsUI(rt);
+  }
+}
+
+/* Authoritative LIVE levels (GET /pins returns null while the port is closed and
+   the reloaded initial levels after an open) — the status dict's pins view only
+   mirrors the configured initial levels, so refresh after an open/close. */
+async function refreshPins(rt) {
+  if (rt.pinsProbing || !pinState(rt).enabled || !portIsOpen(rt)) return;
+  rt.pinsProbing = true;
+  const r = await fetchPinsRaw(rt);
+  rt.pinsProbing = false;
+  if (r.ok && r.data && r.data.ok && r.data.enabled) {
+    rt.pins = r.data;
+    updatePinsUI(rt);
+  }
+}
+
+function maybeProbePins(rt) {
+  if (rt.pinsProbed || !portIsOpen(rt)) return;
+  if (pinsFromStatus(rt)) { rt.pinsProbed = true; return; }
+  probePins(rt);
+}
+
+async function pinAction(rt, body) {
+  if (rt.pinsBusy) return;
+  rt.pinsBusy = true;
+  updatePinsUI(rt);
+  const data = await api("POST", portPath(rt), { body });
+  rt.pinsBusy = false;
+  if (!data.ok) { updatePinsUI(rt); return; }    // server error already toasted
+  const rec = Object.assign({ enabled: true }, rt.pins || {});
+  ["enabled", "dtr", "rts", "pulse_ms", "initial"].forEach((k) => {
+    if (data[k] !== undefined) rec[k] = data[k];
+  });
+  if (body.action === "set" && body.pin) rec[body.pin] = !!body.value;
+  rt.pins = rec;
+  if (data.open !== undefined) {                 // some builds echo the port status
+    mergePortStatus(rt.name, data);
+    updateTabState(rt.name);
+    updateGlobalStats();
+  }
+  updatePinsUI(rt);
+  if (body.action === "set") {
+    toast(t("pins.set", { pin: t("pins." + body.pin), state: t(body.value ? "pins.on" : "pins.off") }), "ok");
+  } else {
+    toast(t("pins.pulsed"), "ok");
+  }
+}
+
 let tabsTimer = null;
 function scheduleTabsRefresh() {
   if (tabsTimer) return;
@@ -707,6 +913,9 @@ function updatePortHeader(rt) {
   rt.el.bufPct.textContent = Math.round(pct) + "%";
   rt.el.bufPct.title = buf ? t("bufHint", { n: buf.count, bytes: fmtBytes(buf.bytes) }) : "";
   updateDeviceChip(rt);
+  refreshPortToggle(rt);
+  updatePinsUI(rt);
+  maybeProbePins(rt);
 }
 
 function drawSpark(rt) {
@@ -831,7 +1040,7 @@ function onStatus(msg) {
   const rt = ensurePort(name);
   const prev = state.ports.get(name) || {};
   const merged = Object.assign({}, prev);
-  ["open", "baud", "device", "last_error", "reconnect_count", "rx_lines", "tx_lines", "buffer"].forEach((k) => {
+  ["open", "baud", "device", "last_error", "reconnect_count", "rx_lines", "tx_lines", "buffer", "pins"].forEach((k) => {
     if (msg[k] !== undefined) merged[k] = msg[k];
   });
   state.ports.set(name, merged);

@@ -135,6 +135,23 @@
 //   "device.match_invalid": "",
 //   "device.noDevices": "",
 //   "device.loadFailed": "",
+//   "port.open": "",
+//   "port.close": "",
+//   "port.openTitle": "",
+//   "port.closeTitle": "",
+//   "port.opened": "",
+//   "port.closed": "",
+//   "pins.aria": "",
+//   "pins.title": "",
+//   "pins.dtr": "",
+//   "pins.rts": "",
+//   "pins.on": "",
+//   "pins.off": "",
+//   "pins.setTitle": "",
+//   "pins.set": "",
+//   "pins.reset": "",
+//   "pins.resetTitle": "",
+//   "pins.pulsed": "",
 // }, { label: 'XX', htmlLang: 'xx', name: '' });
 
 /* A filled-in example (kept inert so shipping this template changes nothing):

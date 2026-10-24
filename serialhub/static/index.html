@@ -136,6 +136,35 @@
           <span class="port-name"></span>
           <span class="port-meta"></span>
         </div>
+        <!-- manual open/close toggle: POST /api/ports/{name}/open|close.
+             The label + aria/title are state-dependent, so app.js owns them
+             (refreshPortToggle); the static text below is only the initial
+             English default before the first status arrives. -->
+        <div class="port-ctl">
+          <button class="port-toggle" type="button" data-port-toggle
+                  aria-pressed="false" title="Open port" aria-label="Open port">
+            <span class="bx" aria-hidden="true">&#9211;</span>
+            <span data-port-toggle-label data-i18n="port.open">Open</span>
+          </button>
+        </div>
+        <!-- pin control (DTR / RTS / reset pulse): POST /api/ports/{name}/pins.
+             Hidden unless the server reports pins.enabled for this port; the
+             buttons are additionally disabled while the port is closed. -->
+        <div class="port-pins" data-port-pins role="group" hidden
+             data-i18n-aria="pins.aria" aria-label="Pin control">
+          <span class="pins-label" data-i18n="pins.title">pins</span>
+          <button class="pin-btn" type="button" data-pin="dtr" aria-pressed="false">
+            <span class="pin-name" data-i18n="pins.dtr">DTR</span><span class="pin-val" data-i18n="pins.off">off</span>
+          </button>
+          <button class="pin-btn" type="button" data-pin="rts" aria-pressed="false">
+            <span class="pin-name" data-i18n="pins.rts">RTS</span><span class="pin-val" data-i18n="pins.off">off</span>
+          </button>
+          <button class="pin-btn pin-reset" type="button" data-pin-reset
+                  data-i18n-title="pins.resetTitle" data-i18n-aria="pins.resetTitle"
+                  title="Send a reset pulse" aria-label="Send a reset pulse">
+            <span class="bx" aria-hidden="true">&#8635;</span><span data-i18n="pins.reset">Reset</span>
+          </button>
+        </div>
         <!-- device chip (resolved COM + user note) + runtime change-device popover.
              The button is the popover trigger (aria-expanded/aria-controls wired in
              app.js); the chip mirrors the current device and shows an "auto" tag

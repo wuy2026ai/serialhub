@@ -271,7 +271,8 @@ button { cursor: pointer; }
 /* port header */
 .port-head {
   flex: 0 0 auto;
-  display: flex; align-items: center; gap: 16px;
+  display: flex; align-items: center; gap: 16px; row-gap: 8px;
+  flex-wrap: wrap;
   padding: 10px 16px;
   background: var(--bg-2);
   border-bottom: 1px solid var(--border);
@@ -407,6 +408,46 @@ button { cursor: pointer; }
 .dev-pop.busy .dev-row,
 .dev-pop.busy .dev-apply,
 .dev-pop.busy .dev-refresh { opacity: 0.55; pointer-events: none; }
+
+/* ---- per-port open/close toggle + pin control ---------------------------- */
+.port-ctl { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.port-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 24px; padding: 0 11px;
+  border: 1px solid var(--accent); border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent);
+  font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+  transition: all var(--speed) var(--ease);
+}
+.port-toggle:hover:not(:disabled) { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+.port-toggle .bx { font-size: 12px; }
+/* open => the button offers the destructive action (close) */
+.port-toggle.is-open {
+  border-color: var(--border-2); background: var(--surface-2); color: var(--text-dim); font-weight: 500;
+}
+.port-toggle.is-open:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); background: rgba(239,109,109,0.14); }
+.port-toggle:disabled { opacity: 0.55; cursor: progress; }
+
+.port-pins { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+.port-pins[hidden] { display: none; }
+.pins-label { font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-faint); }
+.pin-btn {
+  display: inline-flex; align-items: baseline; gap: 5px;
+  height: 24px; padding: 0 9px;
+  border: 1px solid var(--border-2); border-radius: 999px;
+  background: var(--surface-2); color: var(--text-dim);
+  font-family: var(--mono); font-size: 11px;
+  transition: all var(--speed) var(--ease);
+}
+.pin-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); background: var(--accent-soft); }
+.pin-btn .pin-name { font-weight: 600; color: var(--accent-2); }
+.pin-btn .pin-val { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); }
+.pin-btn[aria-pressed="true"] { border-color: var(--ok); background: var(--rx-soft); color: var(--text); }
+.pin-btn[aria-pressed="true"] .pin-val { color: var(--ok); }
+.pin-btn .bx { font-size: 12px; }
+.pin-reset:hover:not(:disabled) { color: var(--warn); border-color: var(--warn); background: rgba(230,179,74,0.16); }
+.pin-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.port-pins.busy .pin-btn { opacity: 0.55; pointer-events: none; }
 
 /* terminal */
 .term-wrap { flex: 1 1 auto; position: relative; min-height: 0; padding: 8px 0 8px 12px; background: var(--bg); }
