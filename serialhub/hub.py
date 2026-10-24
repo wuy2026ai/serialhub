@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 from serial.tools import list_ports as _list_ports
 
 from . import discovery
-from .config import Config, PortConfig
+from .config import Config, PortConfig, pins_view
 from .exporter import VALID_FORMATS, export_to_file
 from .i18n import t
 from .models import Line, has_ansi, now_ms, resolve_eol
@@ -38,7 +38,11 @@ _SUBSCRIBER_QUEUE_SIZE = 10000
 _IO_FIELDS = (
     "device", "baud", "data_bits", "parity", "stop_bits", "flow",
     "dtr", "rts", "encoding", "reconnect_ms", "reconnect_max_ms", "flush_ms",
+    "framing", "pins",
 )
+
+#: ``hub.set_pin`` 允许的动作。
+_PIN_ACTIONS = ("set", "pulse", "reset")
 
 
 def _compile(pattern: Any) -> "re.Pattern[str]":
@@ -222,6 +226,79 @@ class Hub:
 
     def is_open(self, name: str) -> bool:
         return self._require_worker(name).is_open
+
+    # ---- 引脚（DTR/RTS）----
+    def pins_status(self, name: str) -> dict:
+        """归一化引脚状态；引脚控制未启用 → ValueError，未知端口 → KeyError。
+
+        返回 ``{"port", "enabled", "dtr", "rts", "pulse_ms", "initial": {...}}``；
+        ``dtr``/``rts`` 是当前电平（``None`` 表示未知），``initial`` 是 open 时
+        生效的初始电平（``pins.dtr`` 优先，回退顶层 ``dtr``）。
+        """
+        worker = self._require_worker(name)
+        cfg = worker.pins_config
+        if not cfg["enabled"]:
+            raise ValueError(t("hub.error.pins_disabled", name=name))
+        state = worker.pin_state
+        return {
+            "port": name,
+            "enabled": True,
+            "dtr": state["dtr"],
+            "rts": state["rts"],
+            "pulse_ms": cfg["pulse_ms"],
+            "initial": {"dtr": cfg["dtr"], "rts": cfg["rts"]},
+        }
+
+    def set_pin(
+        self,
+        name: str,
+        action: str,
+        pin: Optional[str] = None,
+        value: Optional[bool] = None,
+        duration_ms: Optional[int] = None,
+    ) -> dict:
+        """操作 DTR/RTS：``set``（需 pin+value）/``pulse``（需 pin）/``reset``。
+
+        引脚控制未启用或参数非法 → ``ValueError``；端口未打开 → ``RuntimeError``；
+        未知端口 → ``KeyError``。返回 ``{"port", "action", "pin", "value", "dtr",
+        "rts", "duration_ms"}``（``reset`` 忽略并回显 ``pin=None``）。
+        """
+        act = str(action or "").strip().lower()
+        if act not in _PIN_ACTIONS:
+            raise ValueError(t("hub.error.pins_unknown_action", action=action))
+        worker = self._require_worker(name)
+        if act in ("set", "pulse") and not isinstance(pin, str):
+            raise ValueError(t("hub.error.pins_need_pin", action=act))
+        if act == "set" and not isinstance(value, bool):
+            raise ValueError(t("hub.error.pins_need_value"))
+
+        out_pin: Optional[str] = None
+        out_value: Optional[bool] = None
+        out_duration: Optional[int] = None
+        if act == "set":
+            worker.set_pin(pin, value)  # type: ignore[arg-type]
+            out_pin, out_value = pin, bool(value)
+        elif act == "pulse":
+            worker.pulse_pin(pin, duration_ms)  # type: ignore[arg-type]
+            out_pin = pin
+            out_duration = (
+                int(duration_ms) if duration_ms is not None else worker.pins_config["pulse_ms"]
+            )
+        else:
+            worker.reset_pins(duration_ms)
+            out_duration = (
+                int(duration_ms) if duration_ms is not None else worker.pins_config["pulse_ms"]
+            )
+        state = worker.pin_state
+        return {
+            "port": name,
+            "action": act,
+            "pin": out_pin,
+            "value": out_value,
+            "dtr": state["dtr"],
+            "rts": state["rts"],
+            "duration_ms": out_duration,
+        }
 
     def set_device(
         self,
@@ -687,6 +764,9 @@ class Hub:
             "parity": pc.parity,
             "stop_bits": pc.stop_bits,
             "flow": pc.flow,
+            "framing": pc.framing,
+            "flush_ms": pc.flush_ms,
+            "pins": pins_view(pc),
             "rx_lines": st["rx_lines"],
             "tx_lines": st["tx_lines"],
             "last_error": st["last_error"],

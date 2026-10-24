@@ -17,23 +17,34 @@ server:
 # 所有串口的默认参数（可被每个 ports[] 条目逐项覆盖）。
 # 字段与取值：baud / data_bits(5|6|7|8) / parity(N|E|O|M|S) / stop_bits(1|1.5|2)
 #            / flow(none|rtscts|xonxoff|dsrdtr) / dtr / rts / eol / encoding
-#            / reconnect_ms / reconnect_max_ms / flush_ms / buffer_lines / buffer_bytes / autostart
+#            / framing(line|idle) / reconnect_ms / reconnect_max_ms / flush_ms
+#            / buffer_lines / buffer_bytes / autostart
 defaults:
   baud: 115200
   data_bits: 8
   parity: N
   stop_bits: 1
   flow: none
-  dtr: true
-  rts: true
+  dtr: true              # ⚠ 仅在 pins.enabled=true 时生效
+  rts: true              # ⚠ 仅在 pins.enabled=true 时生效
   eol: "\r\n"            # send 默认结尾；也支持 none / \n / \r / 自定义字面量
   encoding: utf-8
   reconnect_ms: 1000     # 断线重连初始间隔
   reconnect_max_ms: 10000   # 重连退避上限
-  flush_ms: 50           # 无换行的残行，超过此毫秒数也作为一行吐出
+  framing: line          # line（默认，只按 \n/\r/\r\n 分行；残行留到断开/关闭才吐出）| idle（额外按时间片断行）
+  flush_ms: 50           # 仅 framing=idle 生效：无换行的残行超过此毫秒数也作为一行吐出（0=不按时间片断行）
   buffer_lines: 20000    # 每口环形缓冲保留的最大行数
   buffer_bytes: 8388608  # 每口环形缓冲保留的最大字节数（8 MiB）
   autostart: true        # 守护进程启动时是否立即打开
+  # 引脚控制（DTR/RTS）默认关闭：关闭时 worker 绝不调用 setDTR/setRTS（含 open 时），
+  # 上面的 dtr/rts 也不生效，REST/CLI/MCP 的引脚 API 一律报 "pins disabled"。
+  # 迁移：需要旧行为/自动复位能力时显式启用（也可只对某个端口写 pins）：
+  #   pins: { enabled: true, dtr: true, rts: true, pulse_ms: 100 }
+  pins:
+    enabled: false       # false（默认）= 不触碰 DTR/RTS；true = 启用
+    dtr: null            # null = 回退顶层 dtr
+    rts: null            # null = 回退顶层 rts
+    pulse_ms: 100        # pulse/reset 每段毫秒数（>= 0）
 
 # 当某口未显式给出 buffer_lines / buffer_bytes 时的兜底（同 defaults.buffer_*）。
 buffer_defaults:
@@ -64,6 +75,9 @@ ports:
     parity: N
     stop_bits: 1
     autostart: true
+    # 该口显式启用引脚控制（保持"打开即置 DTR/RTS"的旧行为，并可用 pins 命令自动复位）：
+    #   python -m serialhub pins c6 --reset
+    pins: { enabled: true, dtr: true, rts: true, pulse_ms: 100 }
 
   - name: stm32
     # 等价写法： match: { vid: 0x1A86, pid: 0x7523 }
@@ -74,6 +88,7 @@ ports:
     parity: N
     stop_bits: 1
     autostart: true
+    pins: { enabled: true, dtr: true, rts: true, pulse_ms: 100 }
 
   # ---- 其它真实口模板（按需复制修改）----
   # - name: linaro

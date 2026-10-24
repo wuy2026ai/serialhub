@@ -28,18 +28,28 @@ __all__ = [
     "LoggingConfig",
     "UIConfig",
     "Config",
+    "normalize_pins",
+    "pins_view",
 ]
 
 _VALID_DATA_BITS = {5, 6, 7, 8}
 _VALID_PARITY = {"N", "E", "O", "M", "S"}
 _VALID_STOP_BITS = {1, 1.5, 2}
 _VALID_FLOW = {"none", "rtscts", "xonxoff", "dsrdtr"}
+_VALID_FRAMING = {"line", "idle"}
+
+#: ``pins`` 配置允许出现的键（未知键 → ValueError）。
+_VALID_PINS_KEYS = {"enabled", "dtr", "rts", "pulse_ms"}
+#: ``pins.pulse_ms`` 缺省值（毫秒）。
+DEFAULT_PULSE_MS = 100
+#: ``pins`` 省略/None 时的归一化形状（enabled=False ⇒ 引脚控制完全关闭）。
+_DEFAULT_PINS = {"enabled": False, "dtr": None, "rts": None, "pulse_ms": DEFAULT_PULSE_MS}
 
 _PORT_FIELDS = {
     "name", "device", "baud", "data_bits", "parity", "stop_bits", "flow",
     "dtr", "rts", "eol", "encoding", "reconnect_ms", "reconnect_max_ms",
-    "flush_ms", "buffer_lines", "buffer_bytes", "autostart", "tcp_bridge",
-    "description", "match",
+    "flush_ms", "framing", "pins", "buffer_lines", "buffer_bytes", "autostart",
+    "tcp_bridge", "description", "match",
 }
 
 #: match 规格里允许出现的键（与 discovery.MATCH_KEYS 同源）。
@@ -75,6 +85,13 @@ class PortConfig:
     reconnect_ms: int = 1000
     reconnect_max_ms: int = 10000
     flush_ms: int = 50
+    # 断帧策略： "line"（默认）只按 \n/\r/\r\n 分行，残行留到断开/关闭时才吐出；
+    # "idle" 额外按 flush_ms 时间片把无结束符的残行切出（仅 flush_ms > 0 时生效）。
+    framing: str = "line"
+    # 串口芯片引脚控制（DTR/RTS/reset）。缺省/None ⇒ enabled=False：worker 任何时刻
+    # 都不调用 setDTR/setRTS（dtr/rts 顶层字段仅在启用引脚控制后才生效）。
+    # 归一化形状：{"enabled": bool, "dtr": bool|None, "rts": bool|None, "pulse_ms": int}
+    pins: Optional[dict] = None
     buffer_lines: int = 20000
     buffer_bytes: int = 8 * 1024 * 1024
     autostart: bool = True
@@ -243,6 +260,8 @@ class Config:
             server.cors = bool(kw["cors"])
 
         ports = [replace(pc) for pc in self.ports]
+        for pc in ports:
+            pc.pins = copy.deepcopy(pc.pins)  # 覆盖后不与原 Config 共享可变 dict
         if kw.get("autostart") is not None:
             flag = bool(kw["autostart"])
             for pc in ports:
@@ -294,6 +313,8 @@ def _validate_port(pc: PortConfig, path_label: str) -> None:
     pc.reconnect_ms = _as_int(pc.reconnect_ms, f"{path_label}.reconnect_ms")
     pc.reconnect_max_ms = _as_int(pc.reconnect_max_ms, f"{path_label}.reconnect_max_ms")
     pc.flush_ms = _as_int(pc.flush_ms, f"{path_label}.flush_ms")
+    pc.framing = str(pc.framing).lower()
+    pc.pins = normalize_pins(pc.pins, f"{path_label}.pins")
 
     if pc.data_bits not in _VALID_DATA_BITS:
         raise ValueError(f"{path_label}.data_bits must be one of {sorted(_VALID_DATA_BITS)}, got {pc.data_bits!r}")
@@ -313,6 +334,10 @@ def _validate_port(pc: PortConfig, path_label: str) -> None:
         raise ValueError(f"{path_label}.reconnect_max_ms must be >= reconnect_ms, got {pc.reconnect_max_ms!r}")
     if pc.flush_ms < 0:
         raise ValueError(f"{path_label}.flush_ms must be >= 0, got {pc.flush_ms!r}")
+    if pc.framing not in _VALID_FRAMING:
+        raise ValueError(
+            f"{path_label}.framing must be one of {sorted(_VALID_FRAMING)}, got {pc.framing!r}"
+        )
     if not pc.name:
         raise ValueError(f"{path_label}.name must be non-empty")
     if not pc.device and not pc.match:
@@ -321,6 +346,73 @@ def _validate_port(pc: PortConfig, path_label: str) -> None:
         )
     if pc.match is not None:
         _validate_match(pc.match, f"{path_label}.match")
+
+
+def normalize_pins(raw: Any, path_label: str = "pins", *, strict: bool = True) -> dict:
+    """归一化 ``pins`` 配置为冻结形状。
+
+    返回 ``{"enabled": bool, "dtr": bool|None, "rts": bool|None, "pulse_ms": int}``；
+    ``raw`` 为 ``None``/省略 ⇒ ``enabled=False`` 的默认形状。
+
+    ``strict=True``（配置加载路径）：未知键、非法类型、负 ``pulse_ms`` → ``ValueError``，
+    消息含字段路径（如 ``ports[a].pins.bogus is not a valid pins key``）。
+    ``strict=False``（运行时/直接构造的 ``PortConfig``）：尽力归一化，绝不抛异常。
+    """
+    if raw is None:
+        return dict(_DEFAULT_PINS)
+    if not isinstance(raw, dict):
+        if strict:
+            raise ValueError(f"{path_label} must be a mapping, got {raw!r}")
+        return dict(_DEFAULT_PINS)
+
+    for key in raw:
+        if key not in _VALID_PINS_KEYS:
+            if strict:
+                raise ValueError(f"{path_label}.{key} is not a valid pins key")
+            return dict(_DEFAULT_PINS)
+
+    out = dict(_DEFAULT_PINS)
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        if strict:
+            raise ValueError(f"{path_label}.enabled must be a boolean, got {enabled!r}")
+    else:
+        out["enabled"] = enabled
+
+    for key in ("dtr", "rts"):
+        if key not in raw or raw[key] is None:
+            continue
+        value = raw[key]
+        if not isinstance(value, bool):
+            if strict:
+                raise ValueError(
+                    f"{path_label}.{key} must be a boolean or null, got {value!r}"
+                )
+            continue
+        out[key] = value
+
+    if raw.get("pulse_ms") is not None:
+        if strict:
+            pulse = _as_int(raw["pulse_ms"], f"{path_label}.pulse_ms")
+            if pulse < 0:
+                raise ValueError(f"{path_label}.pulse_ms must be >= 0, got {pulse!r}")
+            out["pulse_ms"] = pulse
+        else:
+            try:
+                pulse = int(raw["pulse_ms"])
+            except (TypeError, ValueError):
+                pulse = DEFAULT_PULSE_MS
+            out["pulse_ms"] = pulse if pulse >= 0 else DEFAULT_PULSE_MS
+    return out
+
+
+def pins_view(pc: Any) -> dict:
+    """``pc.pins`` 的容错只读视图（归一化形状，绝不抛异常）。
+
+    供 ``hub._port_status()[``"pins"``]`` 使用：即便 ``PortConfig`` 是直接构造的、
+    未经 :func:`normalize_pins` 校验，也总是给出冻结形状的 dict。
+    """
+    return normalize_pins(getattr(pc, "pins", None), strict=False)
 
 
 def _validate_match(match: Any, path_label: str) -> None:
@@ -366,6 +458,8 @@ def _port_to_dict(pc: PortConfig) -> dict:
         "reconnect_ms": pc.reconnect_ms,
         "reconnect_max_ms": pc.reconnect_max_ms,
         "flush_ms": pc.flush_ms,
+        "framing": pc.framing,
+        "pins": copy.deepcopy(pc.pins),
         "buffer_lines": pc.buffer_lines,
         "buffer_bytes": pc.buffer_bytes,
         "autostart": pc.autostart,

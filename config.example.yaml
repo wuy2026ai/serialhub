@@ -16,16 +16,31 @@ defaults:
   parity: N              # N|E|O|M|S
   stop_bits: 1           # 1|1.5|2
   flow: none             # none|rtscts|xonxoff|dsrdtr
-  dtr: true
-  rts: true
+  dtr: true              # ⚠ 仅在 pins.enabled=true 时生效（见下方 pins 段）
+  rts: true              # ⚠ 仅在 pins.enabled=true 时生效（见下方 pins 段）
   eol: "\r\n"            # send 默认结尾；亦支持 none|\n|\r|custom
   encoding: utf-8
   reconnect_ms: 1000     # 断线重连初始间隔
   reconnect_max_ms: 10000   # 重连退避上限
-  flush_ms: 50           # 无换行的残行，超过此毫秒数也作为一行吐出
+  framing: line          # line（默认，只按 \n/\r/\r\n 分行；残行留到断开/关闭才吐出）| idle（额外按时间片断行）
+  flush_ms: 50           # 仅 framing=idle 生效：无换行的残行超过此毫秒数也作为一行吐出（0=不按时间片断行）
   buffer_lines: 20000    # 每口环形缓冲保留的最大行数
   buffer_bytes: 8388608  # 每口环形缓冲保留的最大字节数（8 MiB）
   autostart: true        # 守护进程启动时是否立即打开
+  # ---- 引脚控制（DTR/RTS）----
+  # 默认关闭（enabled: false）。关闭时 worker 任何时刻都不调用 setDTR/setRTS（含 open
+  # 时），因此上面的 dtr/rts 也不生效；所有运行时引脚 API（REST/CLI/MCP）都以
+  # "pins disabled" 报错。
+  # ⚠ 迁移说明：旧版本"打开端口即按 dtr/rts 置位"是隐式行为，现已改为显式启用——
+  #   需要该行为（或需要 ESP 自动复位）时，按下面这样显式打开：
+  #     pins: { enabled: true, dtr: true, rts: true }
+  #   启用后：open 时置初始电平（pins.dtr/rts 优先，未给时回退顶层 dtr/rts）；
+  #   并开放 GET/POST /api/ports/{name}/pins、CLI `pins`、MCP `set_pin`。
+  pins:
+    enabled: false       # false（默认）= 完全不触碰 DTR/RTS；true = 启用引脚控制
+    dtr: null            # open 时的初始 DTR 电平；null = 回退顶层 dtr
+    rts: null            # open 时的初始 RTS 电平；null = 回退顶层 rts
+    pulse_ms: 100        # pulse/reset 每段持续毫秒数（>= 0）
 
 buffer_defaults:         # 未在端口级指定时使用（同 defaults.buffer_*）
   lines: 20000
@@ -38,6 +53,8 @@ ports:
     buffer_lines: 50000
     buffer_bytes: 16777216
     autostart: true
+    # 单口可覆盖 pins（未写则沿用 defaults.pins）。例：ESP/CH340 自动复位（DTR/RTS）：
+    # pins: { enabled: true, dtr: true, rts: true, pulse_ms: 100 }
     tcp_bridge:          # 可选：把本口暴露为 TCP 桥（也可运行时用 bridge 命令起停）
       mode: server       # server（监听，客户端写=下发串口）| client（连远端串口服务，透传）
       port: 4001         # mode=server 时的监听端口
