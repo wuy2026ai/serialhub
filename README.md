@@ -41,10 +41,11 @@ in a browser; both `python -m serialhub list` on the command line and MCP `wait_
 | Search | `search` runs a regex over the whole buffer, optionally with a context window |
 | Export | raw / noansi / json (JSONL) to disk |
 | REST + WS | Every CLI action has a matching REST endpoint; `/ws` pushes live line events |
-| Web UI | Dark/light, multi-tab, ANSI color, timestamps/seq, filter/search, pause/clear, export, send bar |
+| Web UI | Dark/light, multi-tab, ANSI color, timestamps/seq, filter/search, pause/clear, export, send bar, manual port open/close |
+| Pin control | DTR / RTS drive plus a Reset pulse, configured per port via `pins` (**off by default**: the daemon then never touches DTR/RTS); the Web UI group appears only when a port reports `pins.enabled: true` |
 | TCP bridge | server (listen; client writes go down to the serial port) / client (dial a remote and relay) |
 | CLI | Every subcommand prints a **single line of JSON** `{"ok":true,"data":{...}}`, exit code 0/1 |
-| MCP | 16 tools (stdio) that let an agent drive the serial port through tool calls |
+| MCP | 17 tools (stdio) that let an agent drive the serial port through tool calls |
 | Hot reload | After editing config, `serialhub reload` applies added/removed ports, changed params, and rebuilt buffers immediately |
 | No-hardware demo | `device: loop://` runs the full open→send→read→wait_for loop with no hardware |
 
@@ -57,7 +58,7 @@ serialhub/
 ├── README.md                 # this file (user manual)
 ├── docs/
 │   ├── ARCHITECTURE.md        # the frozen contract (single source of truth)
-│   ├── MCP.md                 # MCP guide (16-tool reference + agent manual)
+│   ├── MCP.md                 # MCP guide (17-tool reference + agent manual)
 │   └── DSH.md                 # DSH (DeepSeek Harness) integration walkthrough
 ├── examples/
 │   ├── config.yaml            # loop:// demo + a commented real port
@@ -72,7 +73,7 @@ serialhub/
 │   ├── __main__.py            # python -m serialhub entry
 │   ├── cli.py                 # command line (serve/list/open/read/wait/send/bridge/mcp/...)
 │   ├── client.py              # HTTP thin client (stdlib, shared by CLI/MCP)
-│   ├── mcp_server.py          # the 16 MCP tools (stdio)
+│   ├── mcp_server.py          # the 17 MCP tools (stdio)
 │   ├── mcp_compat.py          # mcp 1.x/2.x compatibility shim
 │   ├── server.py              # FastAPI + REST + WS + static UI
 │   ├── hub.py                 # the hub (ports/buffers/broadcast/bridges/waiting)
@@ -189,7 +190,9 @@ Field-by-field names and defaults (consistent with `config.py` / `config.example
 | `encoding` | str | `utf-8` | Used for byte decoding (errors=replace) |
 | `reconnect_ms` | int | `1000` | Initial reconnect interval on disconnect |
 | `reconnect_max_ms` | int | `10000` | Reconnect backoff ceiling |
-| `flush_ms` | int | `50` | A partial line with no newline is flushed as a line after this many ms |
+| `flush_ms` | int | `50` | Time-slice framing: a partial line with no newline is flushed as a line after this many ms. **Only used by `framing: idle`** and only when `> 0` (`0` no longer means "flush on every read") |
+| `framing` | str | `line` | How bytes are split into lines. `line`: split only on `\n` / `\r` / `\r\n`; a residual line with no terminator is **kept** until the port disconnects or is closed, then emitted as one line (a trailing `\r` is dropped). `idle`: additionally flush the residual after `flush_ms` (see above) |
+| `pins` | dict\|null | `null` | DTR/RTS pin control: `{enabled, dtr, rts, pulse_ms}`. `null`/omitted ⇒ **disabled** (the worker never calls `setDTR`/`setRTS`, not even at open). See §5.3.2 |
 | `buffer_lines` | int | `20000` | Max lines per port ring buffer |
 | `buffer_bytes` | int | `8388608` | Max bytes per port ring buffer (8 MiB) |
 | `autostart` | bool | `true` | Whether to open immediately when the daemon starts |
@@ -209,6 +212,7 @@ the remaining keys share names with `defaults` and override them per entry. Addi
 | `match` | dict\|null | Auto-discovery spec (used when `device` is empty). See §5.3.1 |
 | `description` | str | Optional free-text note. Passed through to `list_ports`/`status`/Web UI to identify the device (e.g. `ESP32C6`) |
 | `tcp_bridge` | dict\|null | Optional: `{mode: server\|client, port: <int>, host: <str\|null>}`; the daemon starts the bridge automatically at boot |
+| `pins` | dict\|null | DTR/RTS pin control for this port (a port-level `pins` **replaces** `defaults.pins` wholesale, no deep merge). See §5.3.2 |
 
 #### 5.3.1 `match` (port auto-discovery)
 
@@ -241,6 +245,39 @@ ports:
 
 To repoint a port at runtime without editing the config, use `set-device` (§7.1, §9.3) or
 `open NAME --device COMx`; that remap is **transient** (see §7.1).
+
+#### 5.3.2 `pins` (DTR/RTS pin control, **off by default**)
+
+```yaml
+ports:
+  - name: c6
+    pins: { enabled: true, dtr: true, rts: true, pulse_ms: 100 }
+```
+
+| `pins` key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | `false` = pin control is **off**: the worker never calls `setDTR`/`setRTS` (not even at open), and every runtime pin API fails with `pins disabled ...` |
+| `dtr` | bool\|null | `null` | Initial DTR level applied at open; `null` falls back to the top-level `dtr` |
+| `rts` | bool\|null | `null` | Initial RTS level applied at open; `null` falls back to the top-level `rts` |
+| `pulse_ms` | int | `100` | Segment duration (ms, `>= 0`) used by `pulse` / `reset` |
+
+Unknown keys, a non-boolean `enabled`/`dtr`/`rts`, and a negative `pulse_ms` all raise `ValueError` with the
+field path (e.g. `ports[c6].pins.bogus is not a valid pins key`). `pins` may live under `defaults` too; a
+port-level `pins` **replaces** it wholesale (no deep merge — the same rule as `match` / `tcp_bridge`).
+
+> **Migration (intentional behaviour change)**: the daemon used to apply the top-level `dtr`/`rts` on every
+> open. Now it touches DTR/RTS **only** when `pins.enabled: true`; the top-level `dtr`/`rts` then serve as the
+> initial levels (unless `pins.dtr` / `pins.rts` override them). To keep the old behaviour, set
+> `pins: { enabled: true }`. The sample comments are in [`config.example.yaml`](config.example.yaml).
+
+With pin control enabled and the port open, the pins can be driven at runtime: REST
+`GET`/`POST /api/ports/{name}/pins` (§7.1, §9.3), CLI `pins NAME ...`, MCP `set_pin`.
+`set` drives one pin, `pulse` flips it for `pulse_ms` (or `duration_ms`) and restores it, and `reset` runs the
+classic CH340/ESP reset sequence (`rts=true,dtr=false` → `rts=false,dtr=true` → restore the initial levels).
+After the port is closed the levels are unknown again (`dtr`/`rts` read back as `null`).
+
+> The port dict returned by `list` / `status` / the Web UI carries three extra keys:
+> `framing`, `flush_ms` and `pins` (the normalized pin configuration).
 
 ### 5.4 `logging` / `ui`
 
@@ -282,7 +319,8 @@ ui:
 Validation rules (validated on load; an invalid config raises `ValueError` with a message that includes
 the field path, such as `ports[console].data_bits`):
 `name` unique and non-empty, a non-empty `device` **or** a `match` spec, `data_bits∈{5,6,7,8}`, `parity∈{N,E,O,M,S}`,
-`stop_bits∈{1,1.5,2}`, `flow∈{none,rtscts,xonxoff,dsrdtr}`, `buffer_lines>0`, `buffer_bytes>0`. A `match` spec
+`stop_bits∈{1,1.5,2}`, `flow∈{none,rtscts,xonxoff,dsrdtr}`, `framing∈{line,idle}`, `flush_ms>=0`, `buffer_lines>0`, `buffer_bytes>0`; `pins` (§5.3.2) accepts only
+`enabled`/`dtr`/`rts`/`pulse_ms` with `enabled`/`dtr`/`rts` boolean-or-`null` and `pulse_ms>=0`. A `match` spec
 accepts only the keys in §5.3.1; unknown keys, a non-string `description`/`hwid`/`device`/`serial`, an invalid
 `vid`/`pid`, and a negative `index` all raise.
 
@@ -310,6 +348,8 @@ Open `http://127.0.0.1:8765/`. Dark by default, with a light toggle in the top-r
 | export | Export this port's buffer: `raw` / `noansi` / `json` (the server writes the file) |
 | Send bar | Pick target port + input + EOL (CRLF/LF/CR/none) + Send; `↑`/`↓` cycle send history |
 | Port header | Device name / baud / status; on the right, lines/s, B/s, buffer-fill percentage, and a mini rate chart |
+| Open / Close | Toggle button on the port header (calls `POST /api/ports/{name}/open` or `/close`, keeping the current baud); it is disabled while the request is in flight, and on success the status dot, tab and top-bar stats refresh |
+| Pin control | DTR / RTS toggles and a Reset pulse (pulse sequence), shown only when the port status reports `pins.enabled`; hidden otherwise |
 
 > The UI works over `/api/*` and `/ws`; the first WS frame pushes `hello` (port overview), then it pushes `line` / `status` / `mark` events.
 
@@ -341,6 +381,7 @@ Exit codes: `0`=success, `1`=failure. Global options: `--url` (default `http://1
 | `open` | `NAME` `[--baud]` `[--device]` | `POST /api/ports/{n}/open` | Open (optionally override baud/device; `--device` also performs a transient remap) |
 | `set-device` | `NAME` `[--device COMx]` `[--match SPEC]` `[--no-reopen]` | `POST /api/ports/{n}/device` | Remap which device a port uses at runtime (**transient**, see below) |
 | `close` | `NAME` | `POST /api/ports/{n}/close` | Close (buffer kept) |
+| `pins` | `NAME` `[--set dtr=on\|off]` `[--set rts=on\|off]` `[--pulse dtr\|rts]` `[--reset]` `[--duration-ms N]` | `GET/POST /api/ports/{n}/pins` | Read or drive DTR/RTS; no action flag = read the status. Needs `pins.enabled: true` (§5.3.2); actions need the port open |
 | `read` | `NAME` `[--since-seq]` `[--since-ts]` `[--filter]` `[--limit]` `[--strip-ansi]` `[--kinds]` | `GET .../read` | Incrementally read buffered lines |
 | `search` | `NAME REGEX` `[--context]` `[--since-seq]` `[--limit]` | `GET .../search` | Regex search (optionally with context) |
 | `wait` | `NAME REGEX` `[--timeout-ms]` `[--since-seq]` | `GET .../wait` | Block until one line matches (timeout is not an error) |
@@ -373,6 +414,12 @@ python -m serialhub status console
 # Open (override baud) and close
 python -m serialhub open console --baud 921600
 python -m serialhub close console
+
+# Pin control (needs pins.enabled: true on that port, see §5.3.2, and an open port)
+python -m serialhub pins console                     # read the current DTR/RTS
+python -m serialhub pins console --set dtr=off
+python -m serialhub pins console --pulse rts --duration-ms 120
+python -m serialhub pins console --reset             # CH340/ESP auto-reset sequence
 
 # Incremental read: from 0, at most 50 lines, rx only
 python -m serialhub read console --since-seq 0 --limit 50 --kinds rx
@@ -462,7 +509,7 @@ The MCP server lets an agent drive serial ports **through tool calls** (rather t
 every tool calls the persistent daemon over HTTP, so you **must `serve` first**. The transport is **stdio**
 (the common local approach for opencode / Claude Desktop / Cursor).
 
-> The complete 16-tool reference, agent playbook, error conventions, and sequence diagram are in [`docs/MCP.md`](docs/MCP.md).
+> The complete 17-tool reference, agent playbook, error conventions, and sequence diagram are in [`docs/MCP.md`](docs/MCP.md).
 
 ### 9.1 Launch
 
@@ -539,14 +586,14 @@ The equivalent module form: `"command": ["python", "-m", "serialhub", "mcp", "--
 ```
 
 DSH ships the `@deepseek-ai/dsh-mcp-client` plugin, so no source changes are needed: saving the profile
-patch hot-reloads it and the 16 tools appear as `mcp__serialhub__*` in the running session. Full
+patch hot-reloads it and the 17 tools appear as `mcp__serialhub__*` in the running session. Full
 walkthrough: [`docs/DSH.md`](docs/DSH.md).
 
 > Replace `<path-to-serialhub>` with this repository's absolute path and `<python>` with the interpreter that has `mcp` installed.
 
 Environment variables: `SERIALHUB_URL` (daemon base, default `http://127.0.0.1:8765`), `SERIALHUB_TOKEN` (when the daemon sets a token).
 
-### 9.3 Tool cheat sheet (16)
+### 9.3 Tool cheat sheet (17)
 
 Every tool returns `{"ok": true, ...}` on success and `{"ok": false, "error": "..."}` on failure.
 
@@ -568,6 +615,7 @@ Every tool returns `{"ok": true, ...}` on success and `{"ok": false, "error": ".
 | `reload` | - | `added`/`removed`/`restarted`/`updated` |
 | `set_device` | `port, device=None, match=None, reopen=True` | port dict (remapped `device` / `open`); transient, not persisted |
 | `discover` | - | `devices[]` (`{index, device, description, hwid, vid, pid}`) |
+| `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`, `pin`, `value`, `dtr`, `rts`, `duration_ms`; needs `pins.enabled: true` and an open port, and `reset` ignores `pin` |
 
 Loopback demo:
 
@@ -670,14 +718,14 @@ see [`examples/mcp_client.py`](examples/mcp_client.py) for runnable code.
 ## 11. Tests and self-checks
 
 ```powershell
-# Unit/integration tests (entries in pytest.ini and pyproject.toml; tests live in tests/; currently 73 pass)
+# Unit/integration tests (entries in pytest.ini and pyproject.toml; tests live in tests/; currently 203 pass)
 pip install -r requirements-dev.txt
 python -m pytest -q
 
 # MCP protocol self-check (hand-written stdio JSON-RPC client, no daemon needed)
 python tools/mcp_smoke.py
 
-# End-to-end smoke (needs the daemon running): initialize + tools/list(16) + list_ports
+# End-to-end smoke (needs the daemon running): initialize + tools/list(17) + list_ports
 python -m serialhub serve --config examples/config.yaml   # in another terminal
 python tools/mcp_smoke.py --full --tool-timeout 30
 ```
@@ -700,7 +748,7 @@ following methodology (reproducible):
 | `export` | File truly written, `bytes`/`count` match |
 | TCP bridge round trip | A wire round trip TCP write → serial → TCP write-back succeeds |
 | CLI `list` / `read` | Single-line JSON envelope, exit code 0 |
-| MCP `initialize` + `tools/list` | Returns **16** tools |
+| MCP `initialize` + `tools/list` | Returns **17** tools |
 | MCP `send` + `wait_for` | Sentinel hit (`matched:true`) |
 
 Rerun with one command:
@@ -727,8 +775,12 @@ python tools/mcp_smoke.py --full
 | No data after a serial disconnect | Device unplugged/replugged, worker is backoff-reconnecting | Check `status`'s `last_error` / `reconnect_count`; after reconnect the **old buffer is kept** |
 | `serve` reports the port is in use | 8765 is occupied | Change `--port` or `server.port` in the config; update `SERIALHUB_URL` to match |
 | `open` reports the device can't be opened | Wrong device name / already in use | Use `list` to see the real `device` in `system[]`; confirm no other program holds it |
+| `pins disabled for port 'x'` (HTTP 400) | Pin control is off — that is the default | Add `pins: { enabled: true }` to that port (or `defaults`) and `reload`; then `GET/POST /api/ports/{name}/pins`, CLI `pins` and MCP `set_pin` work (§5.3.2) |
+| `port 'x' is not open` (HTTP 409) from a pins `set`/`pulse`/`reset` | Driving pins needs an open port | `open` the port first. A plain `GET /api/ports/{name}/pins` works while closed and reports `dtr`/`rts` as `null` plus the configured `initial` levels |
+| After upgrading, DTR/RTS are no longer raised at open | Intentional: pin control is opt-in | Set `pins.enabled: true` to restore the old "open applies `dtr`/`rts`" behaviour (§5.3.2) |
 | Want to try the full pipeline without hardware | - | Use `device: loop://` (see `examples/config.yaml`) |
-| `send` shows garbled CJK | Encoding mismatch | Set that port's `encoding`; have the parsing side use the same encoding |
+| `send` / `read` shows garbled CJK | Two causes: (a) an `encoding` mismatch; (b) a time slice (`framing: idle`) cutting a multi-byte character in half | (a) set that port's `encoding` and have the parsing side use the same encoding; (b) keep the default `framing: line` — decoding is incremental per worker, so a character split across reads/segments is no longer turned into `U+FFFD` — and use `idle` only when you really need a time slice, with a `flush_ms` large enough |
+| A half line arrives late (looks like two lines) | The residual line was flushed by the time slice | Default `framing: line` keeps the residual until the terminator arrives (or the port closes); `framing: idle` + `flush_ms` deliberately re-enables the time slice |
 | `wait_for` keeps waiting until timeout | The sentinel never appeared / wrong regex | Use `snapshot`/`search` first to see existing output, then adjust the regex; a timeout is a normal return, not an error |
 
 ---

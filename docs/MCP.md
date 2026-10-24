@@ -3,9 +3,9 @@
 # serialhub MCP guide
 
 This document is for **AI agents that operate serial ports with serialhub** (and for engineers configuring
-MCP for those agents). It exposes the persistent `serialhub serve` daemon as **16 MCP tools**, letting an
+MCP for those agents). It exposes the persistent `serialhub serve` daemon as **17 MCP tools**, letting an
 agent complete the whole flow of "list ports → open → wait/read/search → send → snapshot/export/bridge"
-through tool calls (plus runtime remap: `set_device` / `discover`).
+through tool calls (plus runtime remap: `set_device` / `discover`, and DTR/RTS pin control: `set_pin`).
 
 > Contract source: [`ARCHITECTURE.md`](ARCHITECTURE.md) §11; implementation: [`../serialhub/mcp_server.py`](../serialhub/mcp_server.py).
 > Main manual: [`../README.md`](../README.md).
@@ -58,7 +58,7 @@ pip install "mcp>=1.9"               # MCP support (or pip install -r requiremen
 
 # Protocol self-check (hand-written stdio JSON-RPC client, no daemon needed)
 python tools/mcp_smoke.py
-#   initialize + tools/list -> should print 16 tools and end with "# RESULT: PASS"
+#   initialize + tools/list -> should print 17 tools and end with "# RESULT: PASS"
 
 # End-to-end smoke (needs the daemon running)
 python -m serialhub serve --config examples/config.yaml
@@ -163,6 +163,8 @@ HMR). The full walkthrough — locating the profile, verification, pitfalls and 
 | `unknown port: 'nope'` | 404 | Port name not in the config |
 | `<ValueError text>` | 400 | Invalid argument (e.g. an unrecognized `export` format) |
 | `<RuntimeError text>` | 409 | e.g. `send` before the device is open |
+| `pins disabled for port 'x' (...)` | 400 | Pin control is off for that port (`pins.enabled: false`, the default) |
+| `port 'x' is not open` | 409 | A `set_pin` `set`/`pulse`/`reset` on a closed port (a plain `GET /pins` would still work) |
 | `invalid request` | 422 | Request body missing a field / wrong type |
 | `unauthorized` | 401 | The daemon sets a token but it wasn't sent correctly |
 
@@ -172,7 +174,7 @@ HMR). The full walkthrough — locating the profile, verification, pitfalls and 
 
 ---
 
-## 5. Tool reference (16)
+## 5. Tool reference (17)
 
 Convention: the defaults in the "Args" tables below are the tool-signature defaults; "Returns" omits the
 common `ok` / `port` fields.
@@ -572,6 +574,50 @@ current COM of a replugged adapter.
 
 ---
 
+### 5.17 `set_pin`
+
+Drive a port's **DTR / RTS modem-control lines** (hardware pin control; separate from `send`/`read` data).
+
+> Requires `pins.enabled: true` for that port in the daemon config (README §5.3.2). Pin control is **off by
+> default**: with `pins.enabled: false` the daemon never touches DTR/RTS and every call here fails with
+> `pins disabled ...` (HTTP 400). Actions also require the port to be **open** (otherwise HTTP 409).
+
+| Args | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `port` | str | yes | | Logical port name |
+| `action` | str | no | `"set"` | `set` (drive `pin` to `value`) / `pulse` (flip `pin` for `duration_ms`, then restore) / `reset` (CH340/ESP auto-reset pulse sequence) |
+| `pin` | str | no | `null` | `dtr` or `rts`; required for `set`/`pulse`, ignored by `reset` |
+| `value` | bool | no | `null` | Target level for `action="set"` (missing → 400) |
+| `duration_ms` | int | no | `null` | Segment duration in ms (`>= 0`) for `pulse`/`reset`; defaults to that port's `pins.pulse_ms` |
+
+Returns: `{action, pin, value, dtr, rts, duration_ms}` — `dtr`/`rts` are the levels **after** the call, and
+`null` when the port is closed (the level is then unknown); `reset` echoes `pin: null`.
+
+```json
+{ "port": "c6", "action": "set", "pin": "dtr", "value": false }
+```
+```json
+{"ok":true,"port":"c6","action":"set","pin":"dtr","value":false,"dtr":false,"rts":true,"duration_ms":null}
+```
+
+```json
+{ "port": "c6", "action": "reset", "duration_ms": 100 }
+```
+```json
+{"ok":true,"port":"c6","action":"reset","pin":null,"value":null,"dtr":true,"rts":true,"duration_ms":100}
+```
+
+`pulse` flips the pin to the opposite level, holds it for `duration_ms`, then restores it. `reset` runs the
+classic CH340/ESP auto-reset sequence — `rts=true,dtr=false` → wait → `rts=false,dtr=true` → wait → restore the
+configured initial levels — which is the usual way to drop an ESP32/STM32 into the bootloader.
+
+**When to use**: reboot / enter bootloader / toggle a control line on a board from an agent, without pressing a
+button. **There is deliberately no read-only pins tool in MCP**: MCP exposes only this mutating tool, so to
+*read* the current levels (or to read them while the port is closed) use REST
+`GET /api/ports/{name}/pins` or CLI `python -m serialhub pins NAME`.
+
+---
+
 ## 6. Agent playbook
 
 ### 6.1 Cursor increments (no double consumption)
@@ -735,6 +781,7 @@ Every MCP tool maps to a CLI subcommand / REST endpoint, making cross-verificati
 | `reload` | `reload` | `POST /api/reload` |
 | `set_device` | `set-device` | `POST /api/ports/{n}/device` |
 | `discover` | `discover` | `GET /api/devices` |
+| `set_pin` | `pins` | `GET/POST /api/ports/{n}/pins` |
 
 Difference note: MCP `read` has **no** `kinds` argument (REST/CLI do); when you need to filter by kind, go through
 REST/CLI, or approximate it with MCP `read`'s `filter` regex.

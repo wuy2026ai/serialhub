@@ -40,10 +40,11 @@
 | 搜索 | `search` 正则搜全缓冲，可带上下文窗口 |
 | 导出 | raw / noansi / json(JSONL) 落盘 |
 | REST + WS | 每个 CLI 动作都有对应 REST 端点；`/ws` 推送实时行事件 |
-| Web UI | 深/浅色、多标签、ANSI 彩色、时间戳/序号、过滤/搜索、暂停/清屏、导出、发送栏 |
+| Web UI | 深/浅色、多标签、ANSI 彩色、时间戳/序号、过滤/搜索、暂停/清屏、导出、发送栏、手动开/关端口 |
+| 引脚控制 | 每口用 `pins` 配置 DTR / RTS 驱动与 Reset 脉冲（**默认关闭**：此时守护完全不碰 DTR/RTS）；仅当该口 `pins.enabled: true` 时 Web UI 才显示该组控件 |
 | TCP 桥 | server（监听，客户端写=下发串口）/ client（连远端透传） |
 | CLI | 每个子命令输出**单行 JSON** `{"ok":true,"data":{...}}`，退出码 0/1 |
-| MCP | 16 个工具（stdio），让 agent 直接以工具调用操作串口 |
+| MCP | 17 个工具（stdio），让 agent 直接以工具调用操作串口 |
 | 热重载 | 改配置后 `serialhub reload`，增删口 / 改参数 / 重建缓冲即时生效 |
 | 无硬件演示 | `device: loop://` 直接空跑 open→send→read→wait_for |
 
@@ -56,7 +57,7 @@ serialhub/
 ├── README.md                 # 本文件（用户手册）
 ├── docs/
 │   ├── ARCHITECTURE.md        # 冻结契约（唯一事实来源）
-│   ├── MCP.md                 # MCP 使用说明（16 工具参考 + agent 手册）
+│   ├── MCP.md                 # MCP 使用说明（17 工具参考 + agent 手册）
 │   └── DSH.md                 # DSH（DeepSeek Harness）接入全过程
 ├── examples/
 │   ├── config.yaml            # loop:// 演示 + 带注释的真实口
@@ -71,7 +72,7 @@ serialhub/
 │   ├── __main__.py            # python -m serialhub 入口
 │   ├── cli.py                 # 命令行（serve/list/open/read/wait/send/bridge/mcp/...）
 │   ├── client.py              # HTTP 瘦客户端（stdlib，CLI/MCP 共用）
-│   ├── mcp_server.py          # MCP 16 工具（stdio）
+│   ├── mcp_server.py          # MCP 17 工具（stdio）
 │   ├── mcp_compat.py          # mcp 1.x/2.x 兼容垫片
 │   ├── server.py              # FastAPI + REST + WS + 静态 UI
 │   ├── hub.py                 # 中枢（端口/缓冲/广播/桥/等待）
@@ -188,7 +189,9 @@ python -m serialhub serve --config config.example.yaml --no-autostart
 | `encoding` | str | `utf-8` | 字节解码用（errors=replace） |
 | `reconnect_ms` | int | `1000` | 断线重连初始间隔 |
 | `reconnect_max_ms` | int | `10000` | 重连退避上限 |
-| `flush_ms` | int | `50` | 无换行的残行，超过此毫秒数也作为一行吐出 |
+| `flush_ms` | int | `50` | 时间片断帧：无换行的残行超过此毫秒数即作为一行吐出。**仅 `framing: idle` 使用**，且仅当 `> 0` 时生效（`0` 不再等于“每轮都吐”） |
+| `framing` | str | `line` | 分行策略。`line`：只按 `\n` / `\r` / `\r\n` 分行；无结束符的残行**一直保留**，直到该口断开或被 close 时才作为一行吐出（吐出前去掉结尾单个 `\r`）。`idle`：额外按 `flush_ms` 时间片把残行切出（见上一行） |
+| `pins` | dict\|null | `null` | DTR/RTS 引脚控制：`{enabled, dtr, rts, pulse_ms}`。`null`/省略 ⇒ **不启用**（worker 任何时刻都不调用 `setDTR`/`setRTS`，含 open 时）。见 §5.3.2 |
 | `buffer_lines` | int | `20000` | 每口环形缓冲最大行数 |
 | `buffer_bytes` | int | `8388608` | 每口环形缓冲最大字节数（8 MiB） |
 | `autostart` | bool | `true` | 守护启动时是否立即打开 |
@@ -207,6 +210,7 @@ python -m serialhub serve --config config.example.yaml --no-autostart
 | `match` | dict\|null | 自动发现规格（`device` 为空时使用）。见 §5.3.1 |
 | `description` | str | 可选备注（自由文本）。透传到 `list_ports`/`status`/Web UI，便于辨识设备（如 `ESP32C6`） |
 | `tcp_bridge` | dict\|null | 可选：`{mode: server\|client, port: <int>, host: <str\|null>}`，守护启动时自动起桥 |
+| `pins` | dict\|null | 该口的 DTR/RTS 引脚控制（端口级 `pins` **整体覆盖** `defaults.pins`，不做深合并）。见 §5.3.2 |
 
 #### 5.3.1 `match`（端口自动发现）
 
@@ -238,6 +242,38 @@ ports:
 
 要在运行时把某口改指到别的设备而不改配置，用 `set-device`（§7.1、§9.3）或
 `open NAME --device COMx`；该改写是**临时的**（见 §7.1）。
+
+#### 5.3.2 `pins`（DTR/RTS 引脚控制，**默认关闭**）
+
+```yaml
+ports:
+  - name: c6
+    pins: { enabled: true, dtr: true, rts: true, pulse_ms: 100 }
+```
+
+| `pins` 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `enabled` | bool | `false` | `false` = 引脚控制**关闭**：worker 任何时刻都不调用 `setDTR`/`setRTS`（含 open 时），所有运行时引脚 API 报 `pins disabled ...` |
+| `dtr` | bool\|null | `null` | open 时生效的初始 DTR 电平；`null` 回退顶层 `dtr` |
+| `rts` | bool\|null | `null` | open 时生效的初始 RTS 电平；`null` 回退顶层 `rts` |
+| `pulse_ms` | int | `100` | `pulse` / `reset` 每段持续毫秒数（`>= 0`） |
+
+未知键、`enabled`/`dtr`/`rts` 非布尔、`pulse_ms` 为负都会抛 `ValueError`，消息含字段路径
+（如 `ports[c6].pins.bogus is not a valid pins key`）。`pins` 也可写在 `defaults` 下；端口级 `pins` 会
+**整体替换**它（不做深合并——与 `match` / `tcp_bridge` 同规则）。
+
+> **迁移说明（有意的行为变化）**：旧版本每次打开端口都会按顶层 `dtr`/`rts` 置位；现在只有在
+> `pins.enabled: true` 时守护才触碰 DTR/RTS，顶层 `dtr`/`rts` 退化为“open 时的初始电平”
+> （除非被 `pins.dtr` / `pins.rts` 覆盖）。要保留旧行为，写 `pins: { enabled: true }`。
+> 样例注释见 [`config.example.yaml`](config.example.yaml)。
+
+启用且端口已打开后，可在运行时操作引脚：REST `GET`/`POST /api/ports/{name}/pins`（§7.1、§9.3）、
+CLI `pins NAME ...`、MCP `set_pin`。
+`set` 直接置某脚电平；`pulse` 把该脚翻到相反电平、保持 `pulse_ms`（或 `duration_ms`）后恢复；
+`reset` 走经典 CH340/ESP 自动复位序列（`rts=true,dtr=false` → `rts=false,dtr=true` → 恢复初始电平）。
+端口关闭后电平重新变为未知（`dtr`/`rts` 读回 `null`）。
+
+> `list` / `status` / Web UI 返回的端口 dict 会多出三个键：`framing`、`flush_ms`、`pins`（归一化后的引脚配置）。
 
 ### 5.4 `logging` / `ui`
 
@@ -278,7 +314,8 @@ ui:
 
 校验规则（加载即校验，非法抛 `ValueError` 且消息含字段路径如 `ports[console].data_bits`）：
 `name` 唯一非空、非空 `device` **或** `match` 规格、`data_bits∈{5,6,7,8}`、`parity∈{N,E,O,M,S}`、
-`stop_bits∈{1,1.5,2}`、`flow∈{none,rtscts,xonxoff,dsrdtr}`、`buffer_lines>0`、`buffer_bytes>0`。`match` 规格
+`stop_bits∈{1,1.5,2}`、`flow∈{none,rtscts,xonxoff,dsrdtr}`、`framing∈{line,idle}`、`flush_ms>=0`、`buffer_lines>0`、`buffer_bytes>0`；`pins`（§5.3.2）只接受
+`enabled`/`dtr`/`rts`/`pulse_ms`，其中 `enabled`/`dtr`/`rts` 为布尔或 `null`、`pulse_ms>=0`。`match` 规格
 只接受 §5.3.1 的键；未知键、非字符串的 `description`/`hwid`/`device`/`serial`、非法的 `vid`/`pid`、
 负的 `index` 均报错。
 
@@ -306,6 +343,8 @@ ui:
 | export | 导出该口缓冲：`raw` / `noansi` / `json`（服务端写文件） |
 | 发送栏 | 选目标口 + 输入 + EOL(CRLF/LF/CR/none) + Send；`↑`/`↓` 翻发送历史 |
 | 端口头 | 设备名 / 波特率 / 状态；右侧 lines/s、B/s、buffer 占用百分比与迷你速率图 |
+| 开/关 | 端口头上的切换按钮（调用 `POST /api/ports/{name}/open` 或 `/close`，保留当前波特率）；请求进行中禁用，成功后刷新状态点、页签与顶部统计 |
+| 引脚控制 | DTR / RTS 切换与 Reset 脉冲（脉冲序列）；仅当端口状态里 `pins.enabled` 为真时显示，否则隐藏 |
 
 > UI 通过 `/api/*` 与 `/ws` 工作；WS 首帧推 `hello`（端口概览），随后推 `line` / `status` / `mark` 事件。
 
@@ -337,6 +376,7 @@ CLI 是**瘦客户端**：除 `serve` / `mcp` 外，每个子命令打印**恰�
 | `open` | `NAME` `[--baud]` `[--device]` | `POST /api/ports/{n}/open` | 打开（可覆盖波特率/设备；`--device` 同时是一次临时 remap） |
 | `set-device` | `NAME` `[--device COMx]` `[--match SPEC]` `[--no-reopen]` | `POST /api/ports/{n}/device` | 运行时改写某口用哪个设备（**临时**，见下） |
 | `close` | `NAME` | `POST /api/ports/{n}/close` | 关闭（保留缓冲） |
+| `pins` | `NAME` `[--set dtr=on\|off]` `[--set rts=on\|off]` `[--pulse dtr\|rts]` `[--reset]` `[--duration-ms N]` | `GET/POST /api/ports/{n}/pins` | 读/驱动 DTR/RTS；不带动作参数=读状态。需 `pins.enabled: true`（§5.3.2）；动作需端口已打开 |
 | `read` | `NAME` `[--since-seq]` `[--since-ts]` `[--filter]` `[--limit]` `[--strip-ansi]` `[--kinds]` | `GET .../read` | 增量读缓冲行 |
 | `search` | `NAME REGEX` `[--context]` `[--since-seq]` `[--limit]` | `GET .../search` | 正则搜索（可带上下文） |
 | `wait` | `NAME REGEX` `[--timeout-ms]` `[--since-seq]` | `GET .../wait` | 阻塞等一条匹配（超时非错） |
@@ -369,6 +409,12 @@ python -m serialhub status console
 # 打开（覆盖波特率）与关闭
 python -m serialhub open console --baud 921600
 python -m serialhub close console
+
+# 引脚控制（需该口 pins.enabled: true，见 §5.3.2，且端口已打开）
+python -m serialhub pins console                     # 读取当前 DTR/RTS
+python -m serialhub pins console --set dtr=off
+python -m serialhub pins console --pulse rts --duration-ms 120
+python -m serialhub pins console --reset             # CH340/ESP 自动复位序列
 
 # 增量读取：从 0 开始，最多 50 行，仅 rx
 python -m serialhub read console --since-seq 0 --limit 50 --kinds rx
@@ -455,7 +501,7 @@ nc 127.0.0.1 4001
 MCP 服务器让 agent **以工具调用**（而非 shell）操作串口。它是**瘦客户端**：每个工具都通过 HTTP
 调用常驻守护，所以**必须先 `serve`**。transport 为 **stdio**（opencode / Claude Desktop / Cursor 的通用本地方式）。
 
-> 完整的 16 工具逐项参考、agent 操作手册、错误约定与序列图见 [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)。
+> 完整的 17 工具逐项参考、agent 操作手册、错误约定与序列图见 [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)。
 
 ### 9.1 启动
 
@@ -532,14 +578,14 @@ python -m serialhub mcp --transport stdio
 ```
 
 DSH 自带 `@deepseek-ai/dsh-mcp-client` 插件，所以**无需改任何源码**：保存 profile patch 即热重载，
-16 个工具会以 `mcp__serialhub__*` 出现在运行中的会话里。完整接入过程（含踩坑与撤销）见
+17 个工具会以 `mcp__serialhub__*` 出现在运行中的会话里。完整接入过程（含踩坑与撤销）见
 [`docs/DSH.zh-CN.md`](docs/DSH.zh-CN.md)。
 
 > 把 `<path-to-serialhub>` 换成本仓库的绝对路径、`<python>` 换成已安装 `mcp` 的解释器。
 
 环境变量：`SERIALHUB_URL`（守护基址，默认 `http://127.0.0.1:8765`）、`SERIALHUB_TOKEN`（守护设了 token 时）。
 
-### 9.3 工具速查表（16 个）
+### 9.3 工具速查表（17 个）
 
 所有工具成功返回 `{"ok": true, ...}`，失败返回 `{"ok": false, "error": "..."}`。
 
@@ -561,6 +607,7 @@ DSH 自带 `@deepseek-ai/dsh-mcp-client` 插件，所以**无需改任何源码*
 | `reload` | — | `added`/`removed`/`restarted`/`updated` |
 | `set_device` | `port, device=None, match=None, reopen=True` | 端口 dict（改后的 `device` / `open`）；临时，不落盘 |
 | `discover` | — | `devices[]`（`{index, device, description, hwid, vid, pid}`） |
+| `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`、`pin`、`value`、`dtr`、`rts`、`duration_ms`；需 `pins.enabled: true` 且端口已打开，`reset` 忽略 `pin` |
 
 回环演示：
 
@@ -658,14 +705,14 @@ python tools/mcp_smoke.py --full --tool-timeout 30         # 再跑 list_ports�
 ## 11. 测试与自检
 
 ```powershell
-# 单元/集成测试（入口见 pytest.ini 与 pyproject.toml，测试位于 tests/；当前 73 项全部通过）
+# 单元/集成测试（入口见 pytest.ini 与 pyproject.toml，测试位于 tests/；当前 203 项全部通过）
 pip install -r requirements-dev.txt
 python -m pytest -q
 
 # MCP 协议自检（自写 stdio JSON-RPC 客户端，不需要守护）
 python tools/mcp_smoke.py
 
-# 端到端冒烟（需要守护在跑）：initialize + tools/list(16) + list_ports
+# 端到端冒烟（需要守护在跑）：initialize + tools/list(17) + list_ports
 python -m serialhub serve --config examples/config.yaml   # 另一个终端
 python tools/mcp_smoke.py --full --tool-timeout 30
 ```
@@ -687,7 +734,7 @@ python tools/mcp_smoke.py --full --tool-timeout 30
 | `export` | 文件真实写出，`bytes`/`count` 一致 |
 | TCP 桥往返 | 经 TCP 写→串口→回写 TCP 的线上往返成功 |
 | CLI `list` / `read` | 单行 JSON envelope，退出码 0 |
-| MCP `initialize` + `tools/list` | 返回 **16** 个工具 |
+| MCP `initialize` + `tools/list` | 返回 **17** 个工具 |
 | MCP `send` + `wait_for` | 哨兵命中（`matched:true`） |
 
 一键复跑：
@@ -714,8 +761,12 @@ python tools/mcp_smoke.py --full
 | 串口断线后没数据 | 设备拔插，worker 在退避重连 | 看 `status` 的 `last_error` / `reconnect_count`；重连后**旧缓冲保留** |
 | `serve` 报端口占用 | 8765 被占用 | 改 `--port` 或配置 `server.port`；同步改 `SERIALHUB_URL` |
 | `open` 报打不开设备 | 设备名错 / 被占用 | 用 `list` 看 `system[]` 的真实 `device`；确认没被别的程序占用 |
+| `pins disabled for port 'x'`（HTTP 400） | 引脚控制未启用——这是默认状态 | 给该口（或 `defaults`）加 `pins: { enabled: true }` 后 `reload`；之后 `GET/POST /api/ports/{name}/pins`、CLI `pins`、MCP `set_pin` 即可用（§5.3.2） |
+| pins 的 `set`/`pulse`/`reset` 报 `port 'x' is not open`（HTTP 409） | 驱动引脚需要端口已打开 | 先 `open` 该口。纯 `GET /api/ports/{name}/pins` 在关闭时也可用，`dtr`/`rts` 为 `null`，并给出配置的 `initial` 电平 |
+| 升级后打开端口不再自动置 DTR/RTS | 有意为之：引脚控制改为显式启用 | 设 `pins.enabled: true` 恢复旧的“打开即按 `dtr`/`rts` 置位”行为（§5.3.2） |
 | 想无硬件试全链路 | — | 用 `device: loop://`（见 `examples/config.yaml`） |
-| `send` 中文乱码 | 编码不匹配 | 配置该口 `encoding`；解析端按同编码 |
+| `send` / `read` 中文乱码 | 两类原因：(a) `encoding` 不匹配；(b) 时间片（`framing: idle`）把多字节字符切在两行中间 | (a) 配置该口 `encoding`，解析端按同编码；(b) 保持默认 `framing: line`——解码改为每 worker 增量解码器，跨读/跨分片的多字节字符不再变成 `U+FFFD`；确实需要时间片时才用 `idle`，并把 `flush_ms` 设得足够大 |
+| 半行数据来得晚（看起来被拆成两行） | 残行被时间片提前吐出了 | 默认 `framing: line` 会把残行留到结束符到达（或该口关闭）；`framing: idle` + `flush_ms` 才是主动启用时间片 |
 | `wait_for` 一直等到超时 | 哨兵没出现 / 正则不对 | 先用 `snapshot`/`search` 看已有输出，再调正则；超时是正常返回，不是错误 |
 
 ---

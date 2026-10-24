@@ -7,7 +7,7 @@
 >
 > **Bottom line: no source changes to serialhub or DSH are needed.** DSH ships the
 > `@deepseek-ai/dsh-mcp-client` plugin, so wiring up = adding one stdio MCP server record to the DSH
-> profile's **user patch layer**. DSH enables config hot-reload (HMR) by default, so the 16 tools
+> profile's **user patch layer**. DSH enables config hot-reload (HMR) by default, so the 17 tools
 > appear **immediately after saving** — no restart required.
 >
 > Applies to DSH builds that ship the `@deepseek-ai/dsh-mcp-client` plugin (desktop and CLI profiles alike).
@@ -28,7 +28,7 @@ DSH model
   ▼
 dsh-mcp-client (DSH plugin; spawns the child from config, JSON-RPC over stdio)
   ▼
-serialhub/mcp_server.py (16 tools; each forwards to one HTTP call)
+serialhub/mcp_server.py (17 tools; each forwards to one HTTP call)
   ▼
 serialhub serve (persistent daemon, default 127.0.0.1:8765, holds the ports + ring buffers)
   ▼
@@ -65,7 +65,7 @@ Two preconditions (both pre-existing serialhub design, not introduced by the int
 python tools/mcp_smoke.py
 ```
 
-Expect: `initialize` returns `serverInfo.name = serialhub`, `tools/list` lists **16** tools, and the
+Expect: `initialize` returns `serverInfo.name = serialhub`, `tools/list` lists **17** tools, and the
 run ends with `# RESULT: PASS`. This step does **not** need the daemon.
 
 ### 3.2 Locate the DSH config file to edit
@@ -90,7 +90,7 @@ Copy-Item "$env:DSH_HOME\profiles\<profile>\cordis.patch.yml" `
 Append to `cordis.patch.yml` (`insert` is the loader's “insert list” patch semantics):
 
 ```yaml
-# serialhub MCP — the 16 tools of the persistent serial hub; model-facing names are mcp__serialhub__*
+# serialhub MCP — the 17 tools of the persistent serial hub; model-facing names are mcp__serialhub__*
 # Prerequisite: start the daemon first (this MCP server is only an HTTP thin client):
 #   python -m serialhub serve --config config.yaml
 - insert:
@@ -144,8 +144,8 @@ simpler.
 
 ## 5. Verification (three layers)
 
-1. **Protocol layer**: `python tools/mcp_smoke.py` → 16 tools / `PASS`.
-2. **DSH loading layer**: after saving, a new session (or the hot-reloaded current session) lists 16
+1. **Protocol layer**: `python tools/mcp_smoke.py` → 17 tools / `PASS`.
+2. **DSH loading layer**: after saving, a new session (or the hot-reloaded current session) lists 17
    `mcp__serialhub__*` tools; the MCP resource server list also shows `serialhub` (this server exposes
    no resources — `resources: []` is normal).
 3. **Business layer**: actually call a serial tool (`<port>` is a port name from your own config,
@@ -236,10 +236,10 @@ naming is uniformly `mcp__<serverName>__<tool>`.
 
 ## 9. Integration checklist
 
-- [ ] `python tools/mcp_smoke.py` passes; `tools/list` returns 16 tools
+- [ ] `python tools/mcp_smoke.py` passes; `tools/list` returns 17 tools
 - [ ] the daemon is running and `SERIALHUB_URL` points at it
 - [ ] the profile patch is saved; HMR took effect (or DSH was restarted)
-- [ ] the session lists 16 `mcp__serialhub__*` tools
+- [ ] the session lists 17 `mcp__serialhub__*` tools
 - [ ] `list_ports` returns `ok:true` and shows the configured ports
 - [ ] `read(port, since_seq=...)` resumes at new lines without duplicate consumption
 - [ ] `wait_for(port, regex, since_seq=...)` catches a **new** line
@@ -249,7 +249,7 @@ naming is uniformly `mcp__<serverName>__<tool>`.
 
 ## 10. References
 
-- [`MCP.md`](MCP.md): the 16-tool reference and agent playbook
+- [`MCP.md`](MCP.md): the 17-tool reference and agent playbook
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): the frozen contract (MCP / REST / CLI)
 - The `@deepseek-ai/dsh-mcp-client` README: full config-field reference (shipped with DSH)
 - The `@deepseek-ai/dsh` README: profile composition, patch-layer order and HMR behavior (shipped with DSH)

@@ -169,7 +169,9 @@ class PortConfig:
     eol: str = "\r\n"
     encoding: str = "utf-8"
     reconnect_ms: int = 1000; reconnect_max_ms: int = 10000
-    flush_ms: int = 50
+    flush_ms: int = 50                  # 时间片断帧阈值（仅 framing=="idle" 且 >0 时生效）
+    framing: str = "line"               # line|idle：分行策略（默认只按 \n/\r/\r\n）
+    pins: Optional[dict] = None         # DTR/RTS 引脚控制；None/省略 ⇒ enabled=False（见 §5.1 语义）
     buffer_lines: int = 20000; buffer_bytes: int = 8*1024*1024
     autostart: bool = True
     tcp_bridge: Optional[dict] = None   # {mode:'server'|'client', port:int, host:str|None}
@@ -199,7 +201,17 @@ class Config:
     def merge_overrides(self, **kw) -> "Config":  # 命令行覆盖 host/port/...
 ```
 
-校验（`load` 内）：name 唯一非空；device 非空；`data_bits∈{5,6,7,8}`；`parity∈{N,E,O,M,S}`（大小写归一）；`stop_bits∈{1,1.5,2}`；`flow∈{none,rtscts,xonxoff,dsrdtr}`；`buffer_lines>0`；`buffer_bytes>0`。非法→`ValueError`（消息含字段路径）。
+校验（`load` 内）：name 唯一非空；device 非空；`data_bits∈{5,6,7,8}`；`parity∈{N,E,O,M,S}`（大小写归一）；`stop_bits∈{1,1.5,2}`；`flow∈{none,rtscts,xonxoff,dsrdtr}`；`framing∈{line,idle}`；`flush_ms>=0`；`buffer_lines>0`；`buffer_bytes>0`。非法→`ValueError`（消息含字段路径，如 `ports[console].framing`）。
+
+**`pins`（引脚控制，默认关闭）**：`PortConfig.pins: Optional[dict]`，归一化形状（`config.normalize_pins`）
+`{"enabled": bool(默认 False), "dtr": bool|None(默认 None), "rts": bool|None(默认 None), "pulse_ms": int(默认 100)}`；
+`None`/省略 ⇒ `enabled=False`。只允许这四个键，未知键 → `ValueError`（`ports[<name>].pins.<key> is not a valid pins key`）；
+`enabled`/`dtr`/`rts` 非布尔、`pulse_ms` 非整数或为负 → `ValueError`（含字段路径）。
+`defaults.pins` 可被端口级 `pins` **整体替换**（`merged = dict(defaults); merged.update(entry)`，非深合并）。
+`config.to_dict()["ports"][i]["pins"]` 为归一化形状；`hub._IO_FIELDS` 含 `pins`（改 pins 会重启该口）。
+`enabled=False`（默认）时 worker **任何时刻都不调用 `setDTR`/`setRTS`**（含 open 时）——这是相对旧版
+“开端口即按顶层 `dtr`/`rts` 置位”的有意行为变化；`enabled=True` 时 open 置初始电平
+（`pins.dtr` 优先，`None` 回退顶层 `dtr`；`rts` 同理）。
 
 ---
 
@@ -224,6 +236,8 @@ class Hub:
     # 查询
     def list_ports(self) -> dict
     def status(self, name: str|None = None) -> dict
+    def list_devices(self) -> dict                # 系统串口枚举（GET /api/devices）
+    def set_device(self, name, *, device=None, match=None, reopen=True) -> dict   # 运行时改口（临时，不落盘）
 
     # 数据
     def read(self, name, *, since_seq=None, since_ts=None, regex=None,
@@ -243,6 +257,15 @@ class Hub:
     def subscribe(self) -> "queue.Queue[dict]": ...   # 广播队列（事件见下）
     def unsubscribe(self, q) -> None: ...
 
+    # 引脚（DTR/RTS；仅 pins.enabled=true 时可用）
+    def pins_status(self, name: str) -> dict
+        # {"port","enabled":True,"dtr":bool|None,"rts":bool|None,"pulse_ms":int,
+        #  "initial":{"dtr":bool,"rts":bool}}；未启用 → ValueError（含 "pins disabled"）；未知口 → KeyError
+    def set_pin(self, name, action, pin=None, value=None, duration_ms=None) -> dict
+        # action∈{set,pulse,reset}；set 需 pin+value(bool)，pulse 需 pin，reset 忽略 pin
+        # 返回 {"port","action","pin","value","dtr","rts","duration_ms"}
+        # 未启用/参数非法 → ValueError；端口未打开 → RuntimeError；未知口 → KeyError
+
     # 桥
     def bridge_start(self, name, *, mode="server", tcp_port=None, host=None) -> dict
     def bridge_stop(self, name) -> dict
@@ -256,11 +279,15 @@ class Hub:
 **`list_ports()`**
 ```python
 {"system":[{"device","description","hwid"}...],       # serial.tools.list_ports
- "ports":[{"name","device","open":bool,"baud","data_bits","parity","stop_bits",
-           "flow","rx_lines","tx_lines","last_error","reconnect_count",
+ "ports":[{"name","device","description","open":bool,"baud","data_bits","parity","stop_bits",
+           "flow","framing","flush_ms","pins":{"enabled","dtr","rts","pulse_ms"},
+           "rx_lines","tx_lines","last_error","reconnect_count",
            "buffer":{"count","bytes","first_seq","last_seq","dropped_total"},
            "tcp_bridge":{"mode","port","host","active"}|None}...]}
 ```
+`pins` 是**配置视图**（`config.pins_view(pc)`，归一化形状），不是当前电平；当前 DTR/RTS 电平要读
+`hub.pins_status(name)`（REST `GET /api/ports/{name}/pins`），端口关闭时其 `dtr`/`rts` 为 `null`。
+`framing`/`flush_ms` 为该口生效的断帧配置。
 **`status(name=None)`**：`name` 给定→单个 port dict（同 ports[] 元素）加 `"server"` 字段；否则
 ```python
 {"server":{"host","port","version","uptime_ms"},"ports":[<port dict>...]}
@@ -313,13 +340,29 @@ class SerialPortWorker(threading.Thread):
     def close(self) -> None:      # 停止线程并释放端口
     def write(self, data: bytes) -> int:   # 线程安全；未开→抛 RuntimeError
     def status(self) -> dict: ...
+    # 引脚（DTR/RTS）
+    @property
+    def pin_state(self) -> dict: ...       # {"dtr": bool|None, "rts": bool|None}（关闭后为 None）
+    @property
+    def pins_config(self) -> dict: ...     # {"enabled","dtr","rts","pulse_ms"}，dtr/rts 为 open 时生效的初始电平
+    def set_pin(self, pin: str, value: bool) -> dict
+    def pulse_pin(self, pin: str, duration_ms: Optional[int] = None) -> dict
+    def reset_pins(self, duration_ms: Optional[int] = None) -> dict
 ```
 要点：
 - 用 `serial.serial_for_url(pc.device, baudrate=pc.baud, bytesize=pc.data_bits, parity=pc.parity,
   stopbits=pc.stop_bits, rtscts=pc.flow=="rtscts", xonxoff=pc.flow=="xonxoff",
-  dsrdtr=pc.flow=="dsrdtr", timeout=0.1, write_timeout=1)`；随后按需 `setDTR/setRTS`。
-- 读循环：`read(4096)`；累积字节→按 `\n`/`\r` 断行（`\r\n` 视为一个）；无换行残行超过 `flush_ms` 也吐出。
-- 每个完整行→`hub.ingest(name, text, kind="rx")`（解码 `pc.encoding`, errors="replace"）。
+  dsrdtr=pc.flow=="dsrdtr", timeout=0.1, write_timeout=1)`；随后**仅当 `pc.pins.enabled` 为真**时按初始电平 `setDTR`/`setRTS`（`pins.dtr/rts` 优先，`None` 回退顶层 `dtr`/`rts`）；单脚失败只记 `last_error`，不关端口。
+- 引脚 API：`pin∈{"dtr","rts"}`，其他 → `ValueError`；引脚控制未启用 → `ValueError`（消息含 `pins disabled` 与端口名）；端口未打开 → `RuntimeError`。
+  `pulse` = 把该脚翻到相反电平、保持 `duration_ms`（默认 `pins.pulse_ms`）再恢复；`reset` = 经典 CH340/ESP 自动复位序列
+  （`rts=True,dtr=False` → `rts=False,dtr=True` → 恢复初始电平），每段间隔 `duration_ms`。睡眠在 `_state_lock` 之外，
+  序列途中端口关闭则安静退出；`_close_serial()` 后 `pin_state` 两脚均为 `None`。
+- 读循环：`read(4096)`；累积字节→按 `\n`/`\r` 断行（`\r\n` 视为一个）；**断帧由 `pc.framing` 决定**：
+  `"line"`（默认）只按 EOL 分行，无结束符的残行一直保留，直到该口断开/被 `close` 时才作为一行吐出（吐出前去掉结尾单个 `\r`）；
+  `"idle"` 才额外按 `flush_ms` 时间片把残行切出，且仅当 `flush_ms > 0` 时生效（`flush_ms=0` 不再等于“每轮都吐”）。
+- 每个产出边界→`hub.ingest(name, text, kind="rx")`；解码用**每 worker 一个增量解码器**
+  （`codecs.getincrementaldecoder(pc.encoding)(errors="replace")`，(重)连接时 `reset()`），
+  跨读/跨分片的多字节字符（中文等）留到下一段拼成完整字符，绝不产生 U+FFFD。
 - 断线：捕获串口异常→关闭→`hub` 广播 status→按 `reconnect_ms` 指数退避至 `reconnect_max_ms` 重试；**旧缓冲不丢**。
 - `close()` 唤醒读循环并 join（带超时）。
 
@@ -349,6 +392,10 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   | GET | `/api/status` | `name?` | `{"ok":true,**hub.status(name)}` |
   | POST | `/api/ports/{name}/open` | `{baud?,device?}` | `{"ok":true,**hub.open(...)}` |
   | POST | `/api/ports/{name}/close` | — | `{"ok":true,**hub.close(...)}` |
+  | GET | `/api/devices` | — | `{"ok":true,**hub.list_devices()}` |
+  | POST | `/api/ports/{name}/device` | `{device?,match?,reopen?}` | `{"ok":true,**hub.set_device(...)}`（运行时改口，临时） |
+  | GET | `/api/ports/{name}/pins` | — | `{"ok":true,**hub.pins_status(...)}`（引脚未启用 → 400） |
+  | POST | `/api/ports/{name}/pins` | `{action?,pin?,value?,duration_ms?}` | `{"ok":true,**hub.set_pin(...)}` |
   | GET | `/api/ports/{name}/read` | `since_seq?,since_ts?,filter?,limit?,strip_ansi?,kinds?` | `{"ok":true,**hub.read(...)}` |
   | GET | `/api/ports/{name}/search` | `regex,context?,since_seq?,limit?` | `{"ok":true,**hub.search(...)}` |
   | GET | `/api/ports/{name}/wait` | `regex,timeout_ms?,since_seq?` | `{"ok":true,**hub.wait_for(...)}` |
@@ -362,10 +409,13 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   | GET | `/api/config` | — | `{"ok":true,"config":config.to_dict(redact=True)}` |
   | WS  | `/ws` | — | 服务端推送 `hub.subscribe()` 事件原样（`type`∈line/status/mark/hello） |
 - 参数命名：`filter`（read 的正则）与 `regex`（search/wait/send 的正则）不同名，勿混。
+- 错误映射：`ValueError`→400、`KeyError`→404、`RuntimeError`→409、请求体非法→422。
+  引脚端点：引脚未启用或参数非法 → 400（消息含 `pins disabled`）；`POST`（`set`/`pulse`/`reset`）在端口未打开时 → 409；
+  `GET /api/ports/{name}/pins` 只读，引脚已启用时端口关闭也返回 200（`dtr`/`rts` 为 `null`，并给出配置的 `initial` 电平）。
 - 布尔参数接受 `true/false/1/0`。`kinds` 逗号分隔。
 - 静态 UI：`GET /` 返回 `serialhub/static/index.html`；`/static/*` 挂载静态目录。UI 通过 `/ws` 与 `/api/*` 工作。
 
-**Web UI（B）必须满足**：深色为主可切浅色；xterm.js（CDN 或本地，需能离线降级）；多口标签页；ANSI 彩色渲染；每行时间戳开关 + 序号；实时过滤（regex）+ 搜索高亮/跳转；暂停/继续、自动滚屏、清屏；导出 raw/noansi/json；发送栏（选口/输入/结尾选项/历史）；顶部统计（行速率/字节速率/缓冲占用）；连接状态与波特率显示。
+**Web UI（B）必须满足**：深色为主可切浅色；xterm.js（CDN 或本地，需能离线降级）；多口标签页；ANSI 彩色渲染；每行时间戳开关 + 序号；实时过滤（regex）+ 搜索高亮/跳转；暂停/继续、自动滚屏、清屏；导出 raw/noansi/json；发送栏（选口/输入/结尾选项/历史）；端口头手动开/关按钮（`POST /api/ports/{n}/open|close`，请求中禁用）；引脚控件（DTR/RTS/Reset 脉冲，仅该口 `pins.enabled` 为真时显示）；顶部统计（行速率/字节速率/缓冲占用）；连接状态与波特率显示。
 
 ---
 
@@ -379,9 +429,12 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   |---|---|
   | `serve --config F [--host][--port][--no-autostart][--log-level]` | 启 uvicorn + Hub |
   | `list` | GET /api/ports |
+  | `discover` | GET /api/devices |
   | `status [NAME]` | GET /api/status |
   | `open NAME [--baud][--device]` | POST /api/ports/{n}/open |
+  | `set-device NAME [--device COMx][--match SPEC][--no-reopen]` | POST /api/ports/{n}/device（临时改口） |
   | `close NAME` | POST /api/ports/{n}/close |
+  | `pins NAME [--set PIN=on\|off]...[--pulse dtr\|rts][--reset][--duration-ms N]` | GET/POST /api/ports/{n}/pins |
   | `read NAME [--since-seq][--since-ts][--filter][--limit][--strip-ansi][--kinds]` | GET .../read |
   | `search NAME REGEX [--context][--since-seq][--limit]` | GET .../search |
   | `wait NAME REGEX [--timeout-ms][--since-seq]` | GET .../wait |
@@ -396,6 +449,9 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   | `mcp [--stdio]` | 运行 MCP（见 §11） |
 - `send` 的 `DATA` 为 `-` 时读 stdin（去尾随换行）。`--eol` 接受 `crlf|lf|cr|none`；默认取该口 `Config` 的 `eol`（客户端不知道时用 `\r\n`）。
 - `--kinds` 逗号分隔（rx,tx,mark）。
+- `pins` 无动作参数 → 读状态（`GET`）；`--set PIN=on|off` 可重复（接受 `on/off/true/false/1/0/yes/no`）；
+  `--pulse` 与 `--reset` 互斥（`{"ok":false,...}` + exit 1）；同一调用里的多个动作按顺序执行，
+  返回最后一个动作的结果并附 `actions[]`（`data.actions`）。引脚未启用/端口未开由 REST 的 400/409 转成错误信封。
 
 ---
 
@@ -419,7 +475,7 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
           """返回 REST 的 JSON（已含 ok）。连接失败→{'ok':False,'error':'...'}。
           按需把 params 转 query（None 值省略；bool→'true'/'false'）。"""
   ```
-- 工具（名字即 MCP 工具名；返回 `{"ok":true,...}` / `{"ok":false,"error"}`）：
+- 工具（共 **17** 个，名字即 MCP 工具名；返回 `{"ok":true,...}` / `{"ok":false,"error"}`）：
   | 工具 | 参数 | 返回关键字段 |
   |---|---|---|
   | `list_ports` | — | `system[]`,`ports[]` |
@@ -436,6 +492,9 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   | `mark` | `port, label` | `seq`,`ts_ms` |
   | `clear` | `port` | `cleared` |
   | `reload` | — | `added/removed/restarted/updated` |
+  | `set_device` | `port, device=None, match=None, reopen=True` | `port` dict（改后的 `device`/`open`；临时不落盘） |
+  | `discover` | — | `devices[]`（`{index,device,description,hwid,vid,pid}`） |
+  | `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`,`pin`,`value`,`dtr`,`rts`,`duration_ms`（需 `pins.enabled=true` 且端口已打开） |
 - `wait_for` 用长超时（`timeout_ms/1000 + 10`s）。工具在 worker 线程调用 `Client`（`asyncio.to_thread`），事件循环不阻塞。
 - `tools/mcp_smoke.py`：自写 stdio JSON-RPC 客户端，`initialize`+`tools/list`（默认）；`--full` 再跑 `list_ports`。
 

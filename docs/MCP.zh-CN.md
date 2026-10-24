@@ -3,8 +3,8 @@
 # serialhub MCP 使用说明
 
 本文件面向**要用 serialhub 操作串口的 AI agent**（以及为 agent 配置 MCP 的工程师）。
-它把常驻守护 `serialhub serve` 暴露为 **16 个 MCP 工具**，让 agent 直接以工具调用完成
-「列口 → 打开 → 等待/读取/搜索 → 发送 → 快照/导出/桥」的全流程（另有运行时改写：`set_device` / `discover`）。
+它把常驻守护 `serialhub serve` 暴露为 **17 个 MCP 工具**，让 agent 直接以工具调用完成
+「列口 → 打开 → 等待/读取/搜索 → 发送 → 快照/导出/桥」的全流程（另有运行时改写：`set_device` / `discover`，以及 DTR/RTS 引脚控制：`set_pin`）。
 
 > 契约来源：[`ARCHITECTURE.md`](ARCHITECTURE.md) §11；实现：[`../serialhub/mcp_server.py`](../serialhub/mcp_server.py)。
 > 主手册：[`../README.zh-CN.md`](../README.zh-CN.md)。
@@ -57,7 +57,7 @@ pip install "mcp>=1.9"               # MCP 支持（或 pip install -r requireme
 
 # 协议自检（自写 stdio JSON-RPC 客户端，不需要守护）
 python tools/mcp_smoke.py
-#   initialize + tools/list -> 应打印 16 个工具，末尾 "# RESULT: PASS"
+#   initialize + tools/list -> 应打印 17 个工具，末尾 "# RESULT: PASS"
 
 # 端到端冒烟（需先起守护）
 python -m serialhub serve --config examples/config.yaml
@@ -161,6 +161,8 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 | `unknown port: 'nope'` | 404 | 端口名不在配置里 |
 | `<ValueError 文本>` | 400 | 参数非法（如 `export` 的 format 不认识） |
 | `<RuntimeError 文本>` | 409 | 设备未打开就 `send` 等 |
+| `pins disabled for port 'x' (...)` | 400 | 该口未启用引脚控制（`pins.enabled: false`，默认即如此） |
+| `port 'x' is not open` | 409 | 端口未打开时调 `set_pin` 的 `set`/`pulse`/`reset`（只读的 `GET /pins` 不受影响） |
 | `invalid request` | 422 | 请求体缺字段 / 类型错 |
 | `unauthorized` | 401 | 守护设了 token 但没带对 |
 
@@ -170,7 +172,7 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 
 ---
 
-## 5. 工具参考（16 个）
+## 5. 工具参考（17 个）
 
 约定：下文「参数表」中的默认值即工具签名默认值；「返回」省略公共的 `ok` / `port` 字段。
 
@@ -562,6 +564,49 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 
 ---
 
+### 5.17 `set_pin`
+
+驱动某口的 **DTR / RTS 调制解调器控制线**（硬件引脚控制，与 `send`/`read` 的数据通路无关）。
+
+> 需要该口在守护配置里 `pins.enabled: true`（见 README §5.3.2）。引脚控制**默认关闭**：
+> `pins.enabled: false` 时守护完全不碰 DTR/RTS，这里任何调用都报 `pins disabled ...`（HTTP 400）；
+> 动作还要求端口已**打开**（否则 HTTP 409）。
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|---|---|---|---|---|
+| `port` | str | 是 | | 逻辑口名 |
+| `action` | str | 否 | `"set"` | `set`（把 `pin` 置为 `value`）/ `pulse`（把 `pin` 翻转保持 `duration_ms` 后恢复）/ `reset`（CH340/ESP 自动复位脉冲序列） |
+| `pin` | str | 否 | `null` | `dtr` 或 `rts`；`set`/`pulse` 必填，`reset` 忽略 |
+| `value` | bool | 否 | `null` | `action="set"` 的目标电平（缺 → 400） |
+| `duration_ms` | int | 否 | `null` | `pulse`/`reset` 每段毫秒数（`>= 0`）；缺省用该口 `pins.pulse_ms` |
+
+返回：`{action, pin, value, dtr, rts, duration_ms}`——`dtr`/`rts` 是**调用后**的电平，端口关闭时为
+`null`（电平未知）；`reset` 回显 `pin: null`。
+
+```json
+{ "port": "c6", "action": "set", "pin": "dtr", "value": false }
+```
+```json
+{"ok":true,"port":"c6","action":"set","pin":"dtr","value":false,"dtr":false,"rts":true,"duration_ms":null}
+```
+
+```json
+{ "port": "c6", "action": "reset", "duration_ms": 100 }
+```
+```json
+{"ok":true,"port":"c6","action":"reset","pin":null,"value":null,"dtr":true,"rts":true,"duration_ms":100}
+```
+
+`pulse` = 把该脚翻到相反电平、保持 `duration_ms` 再恢复；`reset` = 经典 CH340/ESP 自动复位序列
+（`rts=true,dtr=false` → 等待 → `rts=false,dtr=true` → 等待 → 恢复配置的初始电平），是让 ESP32/STM32
+进入 bootloader 的常用手法。
+
+**何时用**：让 agent 不按按钮就复位 / 进 bootloader / 拨动某条控制线。
+**MCP 故意没有只读的引脚工具**：这里只有这个写操作，要*读*当前电平（或端口关闭时读）请用 REST
+`GET /api/ports/{name}/pins` 或 CLI `python -m serialhub pins NAME`。
+
+---
+
 ## 6. Agent 操作手册（playbook）
 
 ### 6.1 游标增量（不重复消费）
@@ -720,6 +765,7 @@ MCP 的每个工具都对应 CLI 子命令 / REST 端点，便于交叉验证：
 | `reload` | `reload` | `POST /api/reload` |
 | `set_device` | `set-device` | `POST /api/ports/{n}/device` |
 | `discover` | `discover` | `GET /api/devices` |
+| `set_pin` | `pins` | `GET/POST /api/ports/{n}/pins` |
 
 差异提示：MCP `read` **没有** `kinds` 参数（REST/CLI 有）；需要按 kind 过滤时走 REST/CLI，
 或用 MCP `read` 的 `filter` 正则近似。
