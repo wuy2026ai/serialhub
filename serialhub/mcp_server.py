@@ -366,6 +366,34 @@ async def discover() -> dict[str, Any]:
     return await asyncio.to_thread(_client().discover)
 
 
+@mcp.tool(name="set_pin", annotations=_MUTATING)
+async def set_pin(port: str, action: str = "set", pin: Optional[str] = None,
+                  value: Optional[bool] = None,
+                  duration_ms: Optional[int] = None) -> dict[str, Any]:
+    """Drive the DTR/RTS modem lines (set / pulse / reset)./
+    操作 DTR/RTS 引脚（set / pulse / reset）。
+
+    Requires ``pins.enabled: true`` for that port in the daemon config; otherwise
+    every call fails with ``pins disabled`` (the daemon never touches DTR/RTS by
+    default). The port must be open.
+
+    Args:
+        port: Logical port name.
+        action: ``set`` (drive ``pin`` to ``value``), ``pulse`` (flip ``pin`` for
+            ``duration_ms`` then restore) or ``reset`` (CH340/ESP reset sequence).
+        pin: ``dtr`` or ``rts`` (ignored by ``reset``).
+        value: Target level for ``action=set``.
+        duration_ms: Segment duration for ``pulse``/``reset`` (default the port's
+            ``pins.pulse_ms``).
+
+    Returns:
+        dict: ``{"ok": true, "port", "action", "pin", "value", "dtr", "rts",
+        "duration_ms"}``. On failure ``{"ok": false, "error": "<message>"}``.
+    """
+    return await asyncio.to_thread(_client().set_pin, port, action=action, pin=pin,
+                                   value=value, duration_ms=duration_ms)
+
+
 # --------------------------------------------------------------------------- #
 # entry point
 # --------------------------------------------------------------------------- #

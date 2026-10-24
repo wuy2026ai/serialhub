@@ -85,6 +85,15 @@ class SetDeviceBody(BaseModel):
     reopen: bool = True
 
 
+class PinBody(BaseModel):
+    """``POST /api/ports/{name}/pins`` 请求体（action=set/pulse/reset）。"""
+
+    action: str = "set"
+    pin: Optional[str] = None
+    value: Optional[bool] = None
+    duration_ms: Optional[int] = None
+
+
 class SendBody(BaseModel):
     data: str
     eol: Optional[str] = None
@@ -238,6 +247,21 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         return {
             "ok": True,
             **hub.set_device(name, device=b.device, match=b.match, reopen=b.reopen),
+        }
+
+    # ---- 引脚：DTR/RTS 状态与操作（需 pins.enabled=true） ------------------- #
+    @app.get("/api/ports/{name}/pins")
+    async def api_pins(name: str) -> dict[str, Any]:
+        return {"ok": True, **hub.pins_status(name)}
+
+    @app.post("/api/ports/{name}/pins")
+    async def api_set_pin(name: str, body: Optional[PinBody] = None) -> dict[str, Any]:
+        b = body or PinBody()
+        return {
+            "ok": True,
+            **hub.set_pin(
+                name, b.action, pin=b.pin, value=b.value, duration_ms=b.duration_ms
+            ),
         }
 
     # ---- 数据：read / search / wait ---------------------------------------- #

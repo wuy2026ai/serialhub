@@ -122,6 +122,18 @@ class Client:
         """Enumerate system serial devices (indexed, sorted by device name)."""
         return self.call("GET", "/api/devices")
 
+    def pins(self, name: str) -> dict[str, Any]:
+        """Read a port's DTR/RTS state (requires ``pins.enabled: true``)."""
+        return self.call("GET", self._port_path(name, "pins"))
+
+    def set_pin(self, name: str, action: str = "set", pin: Optional[str] = None,
+                value: Optional[bool] = None,
+                duration_ms: Optional[int] = None) -> dict[str, Any]:
+        """Operate DTR/RTS: ``set`` (pin+value) / ``pulse`` (pin) / ``reset``."""
+        return self.call("POST", self._port_path(name, "pins"), body={
+            "action": action, "pin": pin, "value": value, "duration_ms": duration_ms,
+        })
+
     def read(self, name: str, *, since_seq: Optional[int] = None,
              since_ts: Optional[int] = None, filter: Optional[str] = None,
              limit: Optional[int] = None, strip_ansi: bool = False,

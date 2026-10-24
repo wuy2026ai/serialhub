@@ -23,6 +23,10 @@ from .i18n import t
 DEFAULT_EOL = "\r\n"
 _EOL_TOKENS = {"crlf", "lf", "cr", "none"}
 _EOL_ESCAPES = {"\\r\\n": "\r\n", "\\n": "\n", "\\r": "\r", "\\t": "\t"}
+#: ``--set PIN=on|off`` 的真/假取值（大小写不敏感）。
+_PIN_TRUE = {"on", "true", "1", "yes"}
+_PIN_FALSE = {"off", "false", "0", "no"}
+_PIN_CHOICES = ("dtr", "rts")
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +89,59 @@ def _global_options(args: argparse.Namespace) -> tuple[str, Optional[str]]:
     return url, token
 
 
+def _parse_pin_set(text: str) -> tuple[str, bool]:
+    """解析 ``--set`` 参数：``dtr=on`` / ``rts=0`` → ``("dtr", True)``。
+
+    接受 on/off/true/false/1/0/yes/no（大小写不敏感）；格式非法 → ``ValueError``。
+    """
+    key, sep, raw = str(text).partition("=")
+    pin = key.strip().lower()
+    token = raw.strip().lower()
+    if not sep or pin not in _PIN_CHOICES or token not in (_PIN_TRUE | _PIN_FALSE):
+        raise ValueError(t("cli.error.pins_set_format", text=text))
+    return pin, token in _PIN_TRUE
+
+
+def _pins_command(client: Any, args: argparse.Namespace) -> dict[str, Any]:
+    """``pins`` 子命令：无动作 → GET 状态；否则按 --set/--pulse/--reset 依次调用。
+
+    ``--pulse`` 与 ``--reset`` 互斥（错误信封）；任一步失败立即返回该错误信封。
+    """
+    sets: list[str] = list(getattr(args, "set_pins", None) or [])
+    pulse: Optional[str] = getattr(args, "pulse", None)
+    do_reset: bool = bool(getattr(args, "reset", False))
+    name = args.name
+    if pulse and do_reset:
+        return {"ok": False, "error": t("cli.error.pins_pulse_reset")}
+    if not sets and not pulse and not do_reset:
+        return client.pins(name)
+
+    actions: list[tuple[str, str, Optional[bool]]] = []
+    for item in sets:
+        try:
+            pin, value = _parse_pin_set(item)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        actions.append(("set", pin, value))
+    if pulse:
+        actions.append(("pulse", pulse, None))
+    if do_reset:
+        actions.append(("reset", None, None))  # type: ignore[arg-type]
+
+    results: list[dict[str, Any]] = []
+    for action, pin, value in actions:
+        env = client.set_pin(name, action=action, pin=pin, value=value,
+                             duration_ms=args.duration_ms)
+        if not env.get("ok"):
+            return env
+        results.append(env)
+    if len(results) == 1:
+        return results[0]
+    merged = dict(results[-1])
+    merged["actions"] = results
+    return merged
+
+
 def _print_env(env: dict[str, Any]) -> int:
     """Emit the single-line JSON envelope and return the process exit code."""
     if env.get("ok"):
@@ -135,6 +192,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-reopen", action="store_true", help=t("cli.arg.no_reopen"))
 
     add("discover", help=t("cli.cmd.discover"))
+
+    p = add("pins", help=t("cli.cmd.pins"))
+    p.add_argument("name")
+    p.add_argument("--set", dest="set_pins", action="append", default=None,
+                   metavar="PIN=ON|OFF", help=t("cli.arg.pins_set"))
+    p.add_argument("--pulse", default=None, choices=list(_PIN_CHOICES),
+                   help=t("cli.arg.pins_pulse"))
+    p.add_argument("--reset", action="store_true", help=t("cli.arg.pins_reset"))
+    p.add_argument("--duration-ms", type=int, default=None,
+                   help=t("cli.arg.duration_ms"))
 
     p = add("read", help=t("cli.cmd.read"))
     p.add_argument("name")
@@ -232,6 +299,8 @@ def _dispatch(command: str, args: argparse.Namespace) -> int:
                                         reopen=not args.no_reopen)
     elif command == "discover":
         env = client.discover()
+    elif command == "pins":
+        env = _pins_command(client, args)
     elif command == "read":
         env = client.read(args.name, since_seq=args.since_seq, since_ts=args.since_ts,
                           filter=args.filter, limit=args.limit,
