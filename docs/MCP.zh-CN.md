@@ -511,13 +511,17 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 |---|---|---|
 | （无） | | |
 
-返回：`{added[], removed[], restarted[], updated[]}`。
+可选参数 `config`（str）：运行时切换到另一个配置文件（见下方**何时用**）；省略则重读当前生效的文件。
+
+返回：`{added[], removed[], restarted[], updated[]}`；发生切换时额外含 `config`（生效的绝对路径）。
 
 ```json
 {"ok":true,"added":["c6"],"removed":[],"restarted":["console"],"updated":[]}
 ```
 
 **何时用**：改过 `config.yaml` 后应用（增删口、改波特率/缓冲上限等）。缓冲区上限变化会**保留现有行**重建。
+
+给出 `config` 可在**不重启守护进程**的前提下换用另一份配置（例如每块板一份 profile）。切换是**临时的**：不写盘，重启后回到 `serve --config` 指定的文件；相对路径相对 MCP 服务器 cwd 解析。
 
 ---
 

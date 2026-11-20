@@ -16,7 +16,7 @@
   "cli.cmd.mark": "insert a marker line",
   "cli.cmd.clear": "clear a port buffer",
   "cli.cmd.bridge": "start/stop/inspect a TCP bridge",
-  "cli.cmd.reload": "hot-reload the daemon config",
+  "cli.cmd.reload": "hot-reload the daemon config (optionally switch to another file)",
   "cli.cmd.serve": "run the serialhub daemon",
   "cli.cmd.mcp": "run the MCP server (stdio)",
   "cli.cmd.set_device": "remap a port's device/match at runtime",
@@ -27,6 +27,7 @@
   "cli.arg.send_data": "payload; '-' reads stdin (one trailing newline stripped)",
   "cli.arg.eol": "crlf|lf|cr|none or escapes (default \\r\\n)",
   "cli.arg.range": "optional range selector for the daemon",
+  "cli.arg.config_reload": "switch to another config file at runtime (path; memory only)",
   "cli.arg.stdio": "use stdio transport (default)",
   "cli.arg.transport": "stdio|sse|streamable-http",
   "cli.arg.match": "match spec: JSON object or k=v pairs (e.g. description=CH340,vid=0x1A86)",
@@ -61,5 +62,7 @@
   "hub.error.pins_need_pin": "action '{action}' requires a pin: 'dtr' or 'rts'",
   "hub.error.pins_need_value": "action 'set' requires a boolean 'value'",
   "hub.error.pins_bad_duration": "duration_ms must be a non-negative integer, got {value!r}",
-  "hub.error.pins_failed": "pin '{pin}' write failed on port '{name}': {error}"
+  "hub.error.pins_failed": "pin '{pin}' write failed on port '{name}': {error}",
+  "hub.error.switch_no_path": "config path must be a non-empty string",
+  "hub.error.switch_not_found": "config file not found: {path}"
 }

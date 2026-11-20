@@ -225,6 +225,7 @@ class Hub:
     def start(self) -> None:                      # 打开 autostart 口 + 起 config 里声明的 tcp_bridge
     def stop(self) -> None:                       # 关所有口+桥；幂等
     def reload(self, new_config: Config) -> dict: # 热重载（见 §6.3）
+    def switch_config(self, path: str) -> dict:    # 运行时切换配置文件（见 §6.3）
 
     # 端口
     def add_port(self, pc: PortConfig, *, autostart: bool = True) -> None
@@ -318,6 +319,7 @@ class Hub:
 ### 6.3 `reload(new_config)`
 - 更新 `self._config`；对每个口：若缓冲区上限变化→用新上限重建 RingBuffer 并**保留现有行**；若设备/参数变化且已打开→重启该 worker；新增口→add_port；移除的口→close+remove；桥按需重建。
 - 返回 `{"added":[...],"removed":[...],"restarted":[...],"updated":[...]}`。
+- `switch_config(path)`：`Config.load` 校验通过后调用上面的 reload，并把 `self._config.path` 记为后续 reload 的来源；路径先 `expanduser + abspath`（相对**守护进程 cwd**），文件不存在/校验失败 → `ValueError`，且因"先加载后应用"当前配置不变；切换只在内存（不落盘，重启回到 `serve --config`）。返回 reload 摘要 + `config`（生效的绝对路径）。
 
 ---
 
@@ -405,8 +407,8 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   | POST | `/api/ports/{name}/clear` | — | `{"ok":true,**hub.clear(...)}` |
   | POST | `/api/ports/{name}/mark` | `{label}` | `{"ok":true,**hub.mark(...)}` |
   | POST | `/api/bridge` | `{action,port,mode?,tcp_port?,host?}` | `{"ok":true,**bridge_*}` |
-  | POST | `/api/reload` | — | `{"ok":true,**hub.reload(Config.load(config.path))}` |
-  | GET | `/api/config` | — | `{"ok":true,"config":config.to_dict(redact=True)}` |
+  | POST | `/api/reload` | `{config?,path?}` | 无路径：`{"ok":true,**hub.reload(Config.load(当前生效的 path))}`；给出路径：`{"ok":true,**hub.switch_config(path)}`（含 `config`） |
+  | GET | `/api/config` | — | `{"ok":true,"config":当前生效配置.to_dict(redact=True)}`（跟随运行时切换，即 `hub.config`） |
   | WS  | `/ws` | — | 服务端推送 `hub.subscribe()` 事件原样（`type`∈line/status/mark/hello） |
 - 参数命名：`filter`（read 的正则）与 `regex`（search/wait/send 的正则）不同名，勿混。
 - 错误映射：`ValueError`→400、`KeyError`→404、`RuntimeError`→409、请求体非法→422。
@@ -444,7 +446,7 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   | `mark NAME LABEL` | POST .../mark |
   | `clear NAME` | POST .../clear |
   | `bridge {start,stop,status} --port NAME [--mode][--tcp-port][--host]` | POST /api/bridge |
-  | `reload` | POST /api/reload |
+  | `reload [--config F]` | POST /api/reload |
   | `ports` | `list` 别名 |
   | `mcp [--stdio]` | 运行 MCP（见 §11） |
 - `send` 的 `DATA` 为 `-` 时读 stdin（去尾随换行）。`--eol` 接受 `crlf|lf|cr|none`；默认取该口 `Config` 的 `eol`（客户端不知道时用 `\r\n`）。
@@ -491,7 +493,7 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   | `tcp_bridge` | `action, port, tcp_port=None, mode="server", host=None` | `active`,`mode`,`tcp_port` |
   | `mark` | `port, label` | `seq`,`ts_ms` |
   | `clear` | `port` | `cleared` |
-  | `reload` | — | `added/removed/restarted/updated` |
+  | `reload` | `config?` | `added/removed/restarted/updated`（切换时含 `config`） |
   | `set_device` | `port, device=None, match=None, reopen=True` | `port` dict（改后的 `device`/`open`；临时不落盘） |
   | `discover` | — | `devices[]`（`{index,device,description,hwid,vid,pid}`） |
   | `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`,`pin`,`value`,`dtr`,`rts`,`duration_ms`（需 `pins.enabled=true` 且端口已打开） |

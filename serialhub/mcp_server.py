@@ -305,13 +305,24 @@ async def clear(port: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="reload", annotations=_MUTATING)
-async def reload() -> dict[str, Any]:
-    """Hot-reload the daemon config from disk./ 从磁盘热重载守护进程配置。
+async def reload(config: Optional[str] = None) -> dict[str, Any]:
+    """Hot-reload the daemon config from disk; optionally switch the active file./
+    从磁盘热重载守护进程配置；给出 config 时在运行时切换到该配置文件。
+
+    Args:
+        config: Optional path to another config file (YAML/JSON). Relative paths are
+            resolved against the MCP server's cwd before sending. The switch is
+            transient: nothing is written to disk and it does not survive a daemon
+            restart (``serve --config`` still wins).
 
     Returns:
-        dict: ``{"ok": true, "added", "removed", "restarted", "updated"}``.
+        dict: ``{"ok": true, "added", "removed", "restarted", "updated"}``, plus
+        ``config`` (the now-active absolute path) when a switch was requested.
     """
-    return await asyncio.to_thread(_client().reload)
+    target: Optional[str] = None
+    if config:
+        target = os.path.abspath(os.path.expanduser(str(config)))
+    return await asyncio.to_thread(_client().reload, target)
 
 
 @mcp.tool(name="set_device", annotations=_MUTATING)

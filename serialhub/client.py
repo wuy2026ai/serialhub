@@ -188,8 +188,9 @@ class Client:
             "tcp_port": tcp_port, "host": host,
         })
 
-    def reload(self) -> dict[str, Any]:
-        return self.call("POST", "/api/reload")
+    def reload(self, path: Optional[str] = None) -> dict[str, Any]:
+        """Hot-reload the daemon config; ``path`` switches the active file at runtime."""
+        return self.call("POST", "/api/reload", body={"config": path} if path else None)
 
 
 def _read_error_body(exc: urllib.error.HTTPError) -> dict[str, Any]:

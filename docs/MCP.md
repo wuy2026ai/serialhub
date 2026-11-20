@@ -517,7 +517,11 @@ Hot-reload the daemon config from disk.
 |---|---|---|
 | (none) | | |
 
-Returns: `{added[], removed[], restarted[], updated[]}`.
+Optional arg `config` (str): switch to another config file at runtime (see **When to use**). Omit it to
+re-read the currently active file.
+
+Returns: `{added[], removed[], restarted[], updated[]}`, plus `config` (the now-active absolute path) when a
+switch was requested.
 
 ```json
 {"ok":true,"added":["c6"],"removed":[],"restarted":["console"],"updated":[]}
@@ -525,6 +529,10 @@ Returns: `{added[], removed[], restarted[], updated[]}`.
 
 **When to use**: apply after editing `config.yaml` (add/remove ports, change baud/buffer ceiling, etc.). A change
 to a buffer ceiling rebuilds the buffer while **keeping the existing lines**.
+
+Pass `config` to switch to a different file without restarting the daemon (e.g. one profile per board). The
+switch is **transient**: nothing is written to disk, and a restart goes back to `serve --config`. Relative paths
+resolve against the MCP server's cwd.
 
 ---
 

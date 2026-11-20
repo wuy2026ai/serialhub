@@ -46,7 +46,7 @@ in a browser; both `python -m serialhub list` on the command line and MCP `wait_
 | TCP bridge | server (listen; client writes go down to the serial port) / client (dial a remote and relay) |
 | CLI | Every subcommand prints a **single line of JSON** `{"ok":true,"data":{...}}`, exit code 0/1 |
 | MCP | 17 tools (stdio) that let an agent drive the serial port through tool calls |
-| Hot reload | After editing config, `serialhub reload` applies added/removed ports, changed params, and rebuilt buffers immediately |
+| Hot reload | After editing config, `serialhub reload` applies added/removed ports, changed params, and rebuilt buffers immediately; `serialhub reload --config other.yaml` switches the active config file at runtime (transient) |
 | No-hardware demo | `device: loop://` runs the full open→send→read→wait_for loop with no hardware |
 
 ---
@@ -391,7 +391,7 @@ Exit codes: `0`=success, `1`=failure. Global options: `--url` (default `http://1
 | `mark` | `NAME LABEL` | `POST .../mark` | Insert a marker line |
 | `clear` | `NAME` | `POST .../clear` | Clear that port's buffer |
 | `bridge` | `{start,stop,status}` `--port NAME` `[--mode server\|client]` `[--tcp-port]` `[--host]` | `POST /api/bridge` | Start/stop/inspect the TCP bridge |
-| `reload` | - | `POST /api/reload` | Hot-reload the config |
+| `reload` | `[--config F]` | `POST /api/reload` | Hot-reload the config; `--config` switches to another config file at runtime (transient, not persisted) |
 | `mcp` | `[--stdio]` `[--transport]` | (MCP) | Run the MCP server |
 
 Argument details:
@@ -401,7 +401,7 @@ Argument details:
 - `send`'s `DATA` reads from stdin when passed `-` (one trailing newline is stripped); `--eol` accepts `crlf|lf|cr|none` or an escaped literal, defaulting to that port's `eol`.
 - The timeout unit for `wait` / `send` is **milliseconds** (`--timeout-ms`).
 - `set-device` requires **exactly one** of `--device` / `--match`; `--match` takes a JSON object (`'{"vid":0x1A86,"pid":0x7523}'`) or compact pairs (`description=CH340,vid=0x1A86`). `--no-reopen` changes only the in-memory mapping (applied on the next open/reconnect); the default reopens the port now (buffer kept).
-- **Runtime remap is transient**: `set-device` (and `open --device`) only change the in-memory mapping; nothing is written to the config file. To persist, edit the config and run `reload`.
+- **Runtime remap is transient**: `set-device` (and `open --device`) only change the in-memory mapping; nothing is written to the config file. To persist, edit the config and run `reload`. Likewise `reload --config <file>` only switches the active config for this process; restart with `serve --config <file>` to make it the default.
 
 ### 7.2 Common examples
 
@@ -446,6 +446,8 @@ python -m serialhub clear console
 
 # Hot reload
 python -m serialhub reload
+# Switch the active config file at runtime (transient; restart with `serve --config` to revert)
+python -m serialhub reload --config other.yaml
 ```
 
 ### 7.3 Return envelope example
@@ -612,7 +614,7 @@ Every tool returns `{"ok": true, ...}` on success and `{"ok": false, "error": ".
 | `tcp_bridge` | `action, port, tcp_port=None, mode="server", host=None` | `active`, `mode`, `tcp_port` |
 | `mark` | `port, label` | `seq`, `ts_ms` |
 | `clear` | `port` | `cleared` |
-| `reload` | - | `added`/`removed`/`restarted`/`updated` |
+| `reload` | `config=None` | `added`/`removed`/`restarted`/`updated` (+ `config` when switching) |
 | `set_device` | `port, device=None, match=None, reopen=True` | port dict (remapped `device` / `open`); transient, not persisted |
 | `discover` | - | `devices[]` (`{index, device, description, hwid, vid, pid}`) |
 | `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`, `pin`, `value`, `dtr`, `rts`, `duration_ms`; needs `pins.enabled: true` and an open port, and `reset` ignores `pin` |

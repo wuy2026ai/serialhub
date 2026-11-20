@@ -171,6 +171,25 @@ class Hub:
         self._config = new_config
         return {"added": added, "removed": removed, "restarted": restarted, "updated": updated}
 
+    def switch_config(self, path: str) -> dict:
+        """运行时切换配置文件：加载+校验后整体热重载，并把该文件记为后续 reload 的来源。
+
+        路径先归一化（``~`` 展开 + ``abspath``；相对路径相对**守护进程 cwd** 解析）。
+        文件不存在或校验失败一律 ``ValueError``；因为"先加载后应用"，此时当前配置
+        完全不受影响。切换只作用于内存（不写盘、不改启动参数），守护进程重启后
+        仍以 ``serve --config`` 的文件为准。返回 :meth:`reload` 的摘要，并附加
+        ``config``（生效的绝对路径）。
+        """
+        raw = str(path or "").strip()
+        if not raw:
+            raise ValueError(t("hub.error.switch_no_path"))
+        target = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isfile(target):
+            raise ValueError(t("hub.error.switch_not_found", path=target))
+        summary = self.reload(Config.load(target))
+        summary["config"] = self._config.path
+        return summary
+
     # ---- 端口管理 ----
     def add_port(self, pc: PortConfig, *, autostart: bool = True) -> None:
         """新增端口（已存在则 ValueError）。"""

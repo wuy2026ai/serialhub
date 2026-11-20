@@ -45,7 +45,7 @@
 | TCP 桥 | server（监听，客户端写=下发串口）/ client（连远端透传） |
 | CLI | 每个子命令输出**单行 JSON** `{"ok":true,"data":{...}}`，退出码 0/1 |
 | MCP | 17 个工具（stdio），让 agent 直接以工具调用操作串口 |
-| 热重载 | 改配置后 `serialhub reload`，增删口 / 改参数 / 重建缓冲即时生效 |
+| 热重载 | 改配置后 `serialhub reload`，增删口 / 改参数 / 重建缓冲即时生效；`serialhub reload --config other.yaml` 可在运行时切换配置文件（临时） |
 | 无硬件演示 | `device: loop://` 直接空跑 open→send→read→wait_for |
 
 ---
@@ -386,7 +386,7 @@ CLI 是**瘦客户端**：除 `serve` / `mcp` 外，每个子命令打印**恰�
 | `mark` | `NAME LABEL` | `POST .../mark` | 插入标记行 |
 | `clear` | `NAME` | `POST .../clear` | 清空该口缓冲 |
 | `bridge` | `{start,stop,status}` `--port NAME` `[--mode server\|client]` `[--tcp-port]` `[--host]` | `POST /api/bridge` | 起停/查看 TCP 桥 |
-| `reload` | — | `POST /api/reload` | 热重载配置 |
+| `reload` | `[--config F]` | `POST /api/reload` | 热重载配置；`--config` 在运行时切换到另一个配置文件（临时，不落盘） |
 | `mcp` | `[--stdio]` `[--transport]` | (MCP) | 运行 MCP 服务器 |
 
 参数细节：
@@ -396,7 +396,7 @@ CLI 是**瘦客户端**：除 `serve` / `mcp` 外，每个子命令打印**恰�
 - `send` 的 `DATA` 传 `-` 时从 stdin 读（去掉一个尾随换行）；`--eol` 接受 `crlf|lf|cr|none` 或转义字面量，缺省取该口 `eol`。
 - `wait` / `send` 的超时单位是**毫秒**（`--timeout-ms`）。
 - `set-device` 必须且只能给出 `--device` / `--match` 之一；`--match` 接受 JSON 对象（`'{"vid":0x1A86,"pid":0x7523}'`）或紧凑 `k=v` 对（`description=CH340,vid=0x1A86`）。`--no-reopen` 只改内存映射（下次 open/重连生效）；默认立即重开该口（缓冲保留）。
-- **运行时 remap 是临时的**：`set-device`（以及 `open --device`）只改内存映射，**不写入配置文件**。要持久化，请改配置后 `reload`。
+- **运行时 remap 是临时的**：`set-device`（以及 `open --device`）只改内存映射，**不写入配置文件**。要持久化，请改配置后 `reload`。同理 `reload --config <file>` 只切换本进程的生效配置；要让某文件成为默认，请用 `serve --config <file>` 重启。
 
 ### 7.2 常用示例
 
@@ -441,6 +441,8 @@ python -m serialhub clear console
 
 # 热重载
 python -m serialhub reload
+# 运行时切换配置文件（临时；重启后回到 serve --config 指定的文件）
+python -m serialhub reload --config other.yaml
 ```
 
 ### 7.3 返回 envelope 示例
@@ -604,7 +606,7 @@ DSH 自带 `@deepseek-ai/dsh-mcp-client` 插件，所以**无需改任何源码*
 | `tcp_bridge` | `action, port, tcp_port=None, mode="server", host=None` | `active`, `mode`, `tcp_port` |
 | `mark` | `port, label` | `seq`, `ts_ms` |
 | `clear` | `port` | `cleared` |
-| `reload` | — | `added`/`removed`/`restarted`/`updated` |
+| `reload` | `config=None` | `added`/`removed`/`restarted`/`updated`（切换时额外含 `config`） |
 | `set_device` | `port, device=None, match=None, reopen=True` | 端口 dict（改后的 `device` / `open`）；临时，不落盘 |
 | `discover` | — | `devices[]`（`{index, device, description, hwid, vid, pid}`） |
 | `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`、`pin`、`value`、`dtr`、`rts`、`duration_ms`；需 `pins.enabled: true` 且端口已打开，`reset` 忽略 `pin` |

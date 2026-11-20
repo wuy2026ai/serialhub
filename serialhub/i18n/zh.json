@@ -16,7 +16,7 @@
   "cli.cmd.mark": "插入一条标记行",
   "cli.cmd.clear": "清空端口缓冲",
   "cli.cmd.bridge": "启动/停止/查看 TCP 桥",
-  "cli.cmd.reload": "热重载守护进程配置",
+  "cli.cmd.reload": "热重载守护进程配置（可切换到另一个配置文件）",
   "cli.cmd.serve": "运行 serialhub 守护进程",
   "cli.cmd.mcp": "运行 MCP 服务器（stdio）",
   "cli.cmd.set_device": "运行时改写端口的 device/match",
@@ -27,6 +27,7 @@
   "cli.arg.send_data": "负载；'-' 从 stdin 读取（去掉一个尾随换行）",
   "cli.arg.eol": "crlf|lf|cr|none 或转义字面量（默认 \\r\\n）",
   "cli.arg.range": "守护进程可选的区间选择器",
+  "cli.arg.config_reload": "运行时切换到另一个配置文件（路径；仅内存生效）",
   "cli.arg.stdio": "使用 stdio 传输（默认）",
   "cli.arg.transport": "stdio|sse|streamable-http",
   "cli.arg.match": "匹配规格：JSON 对象或 k=v 对（如 description=CH340,vid=0x1A86）",
@@ -61,5 +62,7 @@
   "hub.error.pins_need_pin": "操作 '{action}' 需要 pin：'dtr' 或 'rts'",
   "hub.error.pins_need_value": "操作 'set' 需要布尔型 'value'",
   "hub.error.pins_bad_duration": "duration_ms 必须是非负整数，实际为 {value!r}",
-  "hub.error.pins_failed": "端口 '{name}' 的引脚 '{pin}' 写入失败：{error}"
+  "hub.error.pins_failed": "端口 '{name}' 的引脚 '{pin}' 写入失败：{error}",
+  "hub.error.switch_no_path": "配置路径必须是非空字符串",
+  "hub.error.switch_not_found": "找不到配置文件：{path}"
 }

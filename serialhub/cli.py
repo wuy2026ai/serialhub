@@ -256,7 +256,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tcp-port", type=int, default=None)
     p.add_argument("--host", default=None)
 
-    add("reload", help=t("cli.cmd.reload"))
+    p = add("reload", help=t("cli.cmd.reload"))
+    p.add_argument("--config", default=None, help=t("cli.arg.config_reload"))
 
     p = add("serve", help=t("cli.cmd.serve"))
     p.add_argument("--config", required=True)
@@ -327,7 +328,10 @@ def _dispatch(command: str, args: argparse.Namespace) -> int:
         env = client.bridge(args.action, args.port, mode=args.mode,
                             tcp_port=args.tcp_port, host=args.host)
     elif command == "reload":
-        env = client.reload()
+        target = getattr(args, "config", None)
+        if target:
+            target = os.path.abspath(os.path.expanduser(str(target)))
+        env = client.reload(target)
     else:
         env = {"ok": False, "error": f"unknown command: {command}"}
     return _print_env(env)

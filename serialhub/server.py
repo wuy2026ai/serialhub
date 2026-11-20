@@ -119,6 +119,13 @@ class BridgeBody(BaseModel):
     host: Optional[str] = None
 
 
+class ReloadBody(BaseModel):
+    """``POST /api/reload`` 请求体：给出 ``config``（或别名 ``path``）时切换配置文件。"""
+
+    config: Optional[str] = None
+    path: Optional[str] = None  # 别名，便于直接 curl 时少想一个字段名
+
+
 # --------------------------------------------------------------------------- #
 # 小工具
 # --------------------------------------------------------------------------- #
@@ -365,17 +372,24 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         raise ValueError(t("server.error.unknown_bridge_action", action=body.action))
 
     @app.post("/api/reload")
-    async def api_reload() -> dict[str, Any]:
+    async def api_reload(body: Optional[ReloadBody] = None) -> dict[str, Any]:
+        """热重载；``{"config": "<path>"}`` 时在运行时切换到该配置文件（仅内存，不落盘）。"""
         from .config import Config as RuntimeConfig  # 延迟导入：config.py 可能尚未落地
 
-        path = getattr(config, "path", None)
+        b = body or ReloadBody()
+        wanted = str(b.config or b.path or "").strip()
+        if wanted:
+            return {"ok": True, **hub.switch_config(wanted)}
+        # 未指定路径：沿用"当前生效"的配置源（可能是之前切换过的那个文件）
+        path = getattr(getattr(hub, "config", None), "path", None) or getattr(config, "path", None)
         if not path:
             raise ValueError(t("server.error.no_reload_path"))
         return {"ok": True, **hub.reload(RuntimeConfig.load(path))}
 
     @app.get("/api/config")
     async def api_config() -> dict[str, Any]:
-        return {"ok": True, "config": config.to_dict(redact=True)}
+        active = getattr(hub, "config", None) or config  # 跟随运行时切换
+        return {"ok": True, "config": active.to_dict(redact=True)}
 
     # ---- WebSocket --------------------------------------------------------- #
     @app.websocket("/ws")
