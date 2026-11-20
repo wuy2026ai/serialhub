@@ -268,6 +268,7 @@ function applyLang(lang) {
   applyI18n(document);
   refreshPauseBtn();
   $("#connText").textContent = t(conn.key, conn.vars);
+  updateConfigIndicator();
   state.runtimes.forEach((rt) => { applyI18n(rt.pane); updatePortHeader(rt); });
   if (openDevPop && deviceCache) renderDeviceList(openDevPop.rt, deviceCache);
   updateLangSwitcher();
@@ -282,7 +283,7 @@ function createRuntime(name) {
   const rt = {
     name,
     pane: tpl,
-    term: null, fit: null,
+    term: null, fit: null, ro: null,
     lines: [],          // retained records for filter/search/fallback
     deferred: [],       // lines buffered while paused
     hits: [], hitIdx: -1,
@@ -426,6 +427,7 @@ function createTerminal(rt) {
   if (rt.fit) {
     const ro = new ResizeObserver(() => refit(rt));
     ro.observe(rt.el.termHost);
+    rt.ro = ro;
   }
 }
 
@@ -443,6 +445,21 @@ function ensurePort(name) {
   state.runtimes.set(name, rt);
   scheduleTabsRefresh();
   return rt;
+}
+
+/* Tear down a pane that no longer belongs to the active config: close any open
+   popover bound to it, dispose the xterm instance + its ResizeObserver, detach
+   the pane from the DOM and drop the runtime (buffers die with it). */
+function destroyRuntime(name) {
+  const rt = state.runtimes.get(name);
+  if (!rt) return;
+  if (openDevPop && openDevPop.rt === rt) closeDevicePop();
+  if (rt.ro) { try { rt.ro.disconnect(); } catch (_e) { /* ignore */ } rt.ro = null; }
+  if (rt.fit) { try { rt.fit.dispose(); } catch (_e) { /* ignore */ } rt.fit = null; }
+  if (rt.term) { try { rt.term.dispose(); } catch (_e) { /* ignore */ } rt.term = null; }
+  termHosts.delete(rt.el.termHost);
+  if (rt.pane && rt.pane.parentNode) rt.pane.parentNode.removeChild(rt.pane);
+  state.runtimes.delete(name);
 }
 
 /* 6b. device control (resolved COM chip + runtime change popover) ========== */
@@ -852,6 +869,7 @@ function renderFallback(rt, rec) {
 function trimArr(arr, n) { while (arr.length > n) arr.shift(); }
 
 function onLine(name, line) {
+  if (!portStillKnown(name)) return;   // late line from a port a config switch removed
   const rt = ensurePort(name);
   const rec = buildRecord(line);
   rt.lineCount += 1;
@@ -1023,7 +1041,7 @@ function handleWsMessage(msg) {
 function onHello(ports) {
   const seen = new Set();
   ports.forEach((p) => {
-    if (!p || !p.name) return;
+    if (!p || !p.name || !portInActiveConfig(p.name)) return;
     seen.add(p.name);
     state.ports.set(p.name, p);
     const rt = ensurePort(p.name);
@@ -1036,7 +1054,7 @@ function onHello(ports) {
 
 function onStatus(msg) {
   const name = msg.port;
-  if (!name) return;
+  if (!name || !portStillKnown(name)) return;
   const rt = ensurePort(name);
   const prev = state.ports.get(name) || {};
   const merged = Object.assign({}, prev);
@@ -1245,7 +1263,7 @@ async function exportPort(fmt) {
 
 function updateGlobalStats() {
   const ports = Array.from(state.ports.values());
-  $("#statPorts").textContent = String(ports.length || state.runtimes.size);
+  $("#statPorts").textContent = String(Math.max(ports.length, state.runtimes.size));
   $("#statOpen").textContent = String(ports.filter((p) => p.open).length);
 }
 
@@ -1255,7 +1273,7 @@ async function pollStatus() {
   const st = await api("GET", "/api/status");
   if (!st.ok) return;
   (st.ports || []).forEach((p) => {
-    if (!p || !p.name) return;
+    if (!p || !p.name || !portInActiveConfig(p.name)) return;
     state.ports.set(p.name, p);
     const rt = ensurePort(p.name);
     rt.state = p.open ? "open" : (p.last_error ? "error" : "closed");
@@ -1265,15 +1283,22 @@ async function pollStatus() {
   updateGlobalStats();
 }
 
+/* Fold a GET /api/config payload into shared state (path, ui knobs, i18n'd chip). */
+function applyConfig(cfg) {
+  state.config = cfg;
+  const ui = cfg.ui || {};
+  if (ui.max_render_lines) state.maxRenderLines = ui.max_render_lines;
+  if (!safeGet("serialhub.timestamp", "")) state.timestamp = ui.timestamp !== false;
+  updateConfigIndicator();
+}
+
 async function loadConfig() {
   const r = await api("GET", "/api/config");
   if (!r.ok || !r.config) return;
-  state.config = r.config;
-  const ui = r.config.ui || {};
-  if (ui.max_render_lines) state.maxRenderLines = ui.max_render_lines;
-  if (!safeGet("serialhub.timestamp", "")) state.timestamp = ui.timestamp !== false;
+  applyConfig(r.config);
   // build port runtimes from config (ensures tabs before WS hello)
   (state.config.ports || []).forEach((p) => { if (p && p.name) ensurePort(p.name); });
+  updateEmptyState();
 }
 state.portConfig = function (name) {
   const cfg = state.config;
@@ -1281,6 +1306,142 @@ state.portConfig = function (name) {
   const list = cfg.ports || [];
   return list.find((p) => p.name === name) || null;
 };
+
+/* 10b. runtime config switch =============================================== */
+/* GET /api/config carries the active file's absolute path; POST /api/reload with
+   {"config": path} switches it (memory-only, no write) and with no body re-reads
+   the active file. A switch can ADD or REMOVE ports, so after a successful call
+   we re-read the config and reconcile the whole port surface: panes/runtimes for
+   disappeared ports are destroyed (xterm disposed), new ones are created, the
+   active tab falls back to the first remaining port, and tabs / the send-port
+   dropdown / the top stats are rebuilt from the new set. */
+let configBusy = false;
+
+function configBaseName(path) {
+  const s = String(path || "");
+  const cut = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return cut >= 0 ? s.slice(cut + 1) : s;
+}
+
+function updateConfigIndicator() {
+  const el = $("#configCurrent");
+  if (!el) return;
+  const path = (state.config && state.config.path) || "";
+  el.textContent = path ? configBaseName(path) : t("config.none");
+  el.classList.toggle("is-none", !path);
+  const label = path ? t("config.currentTitle", { path }) : t("config.none");
+  el.title = label;
+  el.setAttribute("aria-label", label);
+}
+
+function setConfigBusy(busy) {
+  configBusy = busy;
+  const ctl = $("#configCtl");
+  if (ctl) {
+    ctl.classList.toggle("busy", busy);
+    ctl.setAttribute("aria-busy", busy ? "true" : "false");
+  }
+  ["#configInput", "#configReload", "#configSwitch"].forEach((sel) => {
+    const el = $(sel);
+    if (el) el.disabled = busy;
+  });
+  const input = $("#configInput");
+  if (input) input.setAttribute("aria-busy", busy ? "true" : "false");
+}
+
+function updateEmptyState() {
+  const el = $("#emptyState");
+  if (el) el.hidden = state.runtimes.size > 0;
+}
+
+/* Re-derive the port surface from state.config. Only names present in the new
+   config survive; the Map is re-ordered to config order so tabs follow the file. */
+function reconcilePorts() {
+  const names = [];
+  ((state.config && state.config.ports) || []).forEach((p) => {
+    if (p && p.name && names.indexOf(p.name) < 0) names.push(p.name);
+  });
+  const wanted = new Set(names);
+  Array.from(state.runtimes.keys()).forEach((name) => {
+    if (!wanted.has(name)) destroyRuntime(name);
+  });
+  Array.from(state.ports.keys()).forEach((name) => {
+    if (!wanted.has(name)) state.ports.delete(name);
+  });
+  names.forEach((name) => ensurePort(name));
+  const ordered = new Map();
+  names.forEach((name) => {
+    const rt = state.runtimes.get(name);
+    if (rt) ordered.set(name, rt);
+  });
+  state.runtimes.forEach((rt, name) => { if (!ordered.has(name)) ordered.set(name, rt); });
+  state.runtimes = ordered;
+  // the active tab may have just disappeared: fall back to the first remaining
+  if (!state.active || !state.runtimes.has(state.active)) {
+    const first = state.runtimes.keys().next();
+    if (!first.done) activate(first.value);
+    else {
+      state.active = null;
+      $("#sendPort").value = "";
+      $("#filterInput").value = "";
+      $("#searchResults").hidden = true;
+      updateSearchCount();
+    }
+  }
+  updateEmptyState();
+  buildTabs();
+  fillSendPorts();
+  updateGlobalStats();
+}
+
+async function reloadConfig(switchTo) {
+  if (configBusy) return;
+  const input = $("#configInput");
+  const wanted = switchTo ? String(input.value || "").trim() : "";
+  if (switchTo && !wanted) {
+    input.focus();
+    toast(t("config.needPath"), "warn");
+    return;
+  }
+  setConfigBusy(true);
+  const data = await api("POST", "/api/reload", switchTo ? { body: { config: wanted } } : {});
+  if (!data.ok) {
+    setConfigBusy(false);      // api() already toasted the server error
+    return;
+  }
+  const r = await api("GET", "/api/config");
+  if (r.ok && r.config) {
+    applyConfig(r.config);
+    reconcilePorts();
+    await pollStatus();        // seed open/baud/buffer for ports added by the switch
+  } else if (data.config) {
+    state.config = Object.assign({}, state.config || {}, { path: data.config });
+    updateConfigIndicator();
+  }
+  setConfigBusy(false);
+  if (switchTo) input.value = "";
+  const delta = t("config.delta", {
+    added: (data.added || []).length,
+    removed: (data.removed || []).length,
+    restarted: (data.restarted || []).length,
+  });
+  // a switch echoes the new path; a no-body reload does not, so fall back to the
+  // path we just re-read (or the one we sent) to keep the toast self-explanatory
+  const activePath = data.config || (state.config && state.config.path) || wanted;
+  toast(t(switchTo ? "config.switched" : "config.reloaded", { path: activePath }) + "  " + delta, "ok");
+}
+
+/* A port that is no longer in the active config must never resurrect a pane from
+   a late WebSocket line/status (the daemon may still flush old-port events). */
+function portInActiveConfig(name) {
+  const cfg = state.config;
+  if (!cfg) return true;               // config not loaded yet: trust the event
+  const list = cfg.ports || [];
+  return list.some((p) => p && p.name === name);
+}
+function portStillKnown(name) {
+  return state.runtimes.has(name) || state.ports.has(name) || portInActiveConfig(name);
+}
 
 function bindUI() {
   $("#themeToggle").addEventListener("click", () => applyTheme(state.theme === "dark" ? "light" : "dark"));
@@ -1295,6 +1456,16 @@ function bindUI() {
     toast(t("toastTokenUpdated"), "info");
     restartWS();
   });
+
+  // config switch: Enter in the input == clicking Switch; ↻ reloads in place.
+  const configInput = $("#configInput");
+  if (configInput) {
+    configInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); reloadConfig(true); }
+    });
+  }
+  if ($("#configSwitch")) $("#configSwitch").addEventListener("click", () => reloadConfig(true));
+  if ($("#configReload")) $("#configReload").addEventListener("click", () => reloadConfig(false));
 
   $("#btnPause").addEventListener("click", (e) => {
     state.paused = !state.paused;
@@ -1412,6 +1583,7 @@ async function init() {
   bindUI();
 
   await loadConfig();
+  updateEmptyState();
   fillSendPorts();
 
   // Show configured ports immediately, before the WebSocket hello arrives.

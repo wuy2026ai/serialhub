@@ -152,6 +152,19 @@
 //   "pins.reset": "",
 //   "pins.resetTitle": "",
 //   "pins.pulsed": "",
+//   "config.label": "",
+//   "config.currentTitle": "",
+//   "config.none": "",
+//   "config.inputAria": "",
+//   "config.placeholder": "",
+//   "config.switch": "",
+//   "config.switchTitle": "",
+//   "config.reloadTitle": "",
+//   "config.needPath": "",
+//   "config.switched": "",
+//   "config.reloaded": "",
+//   "config.delta": "",
+//   "config.empty": "",
 // }, { label: 'XX', htmlLang: 'xx', name: '' });
 
 /* A filled-in example (kept inert so shipping this template changes nothing):

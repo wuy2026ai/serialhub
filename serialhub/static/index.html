@@ -38,6 +38,29 @@
       </div>
 
       <div class="top-actions">
+        <!-- runtime config switch: the chip mirrors the active config file's
+             basename (full path in title/aria-label, from GET /api/config); the
+             input + Switch POSTs /api/reload with {"config": "<path>"} and the
+             ↻ button POSTs without a body (re-read the active file in place).
+             Both may add/remove ports, so app.js reconciles tabs/panes after. -->
+        <div class="config-ctl" id="configCtl" role="group" data-i18n-aria="config.label" aria-label="config">
+          <span class="cfg-current is-none" id="configCurrent">&ndash;</span>
+          <input class="cfg-input" id="configInput" type="text" spellcheck="false" autocomplete="off"
+                 data-i18n-ph="config.placeholder" data-i18n-aria="config.inputAria"
+                 data-i18n-title="config.switchTitle"
+                 placeholder="absolute path, e.g. D:\...\profiles\board-b.yaml"
+                 aria-label="Configuration file path to switch to" />
+          <button class="cfg-btn cfg-reload" id="configReload" type="button"
+                  data-i18n-title="config.reloadTitle" data-i18n-aria="config.reloadTitle"
+                  title="Reload the active configuration file" aria-label="Reload the active configuration file">
+            <span class="bx" aria-hidden="true">&#8635;</span>
+          </button>
+          <button class="cfg-btn cfg-switch" id="configSwitch" type="button"
+                  data-i18n-title="config.switchTitle" data-i18n-aria="config.switch"
+                  title="Load this config file at runtime" aria-label="Switch">
+            <span data-i18n="config.switch">Switch</span>
+          </button>
+        </div>
         <div class="conn-pill" id="connPill" data-state="idle" role="status" aria-live="polite">
           <span class="dot"></span><span id="connText">idle</span>
         </div>
@@ -65,7 +88,12 @@
     </div>
 
     <!-- ===================================================== workspace -->
-    <main class="workspace" id="panes"></main>
+    <main class="workspace" id="panes">
+      <!-- shown when the active config exposes no ports (e.g. after a switch) -->
+      <div class="empty-state" id="emptyState" hidden>
+        <span data-i18n="config.empty">No ports in the active configuration.</span>
+      </div>
+    </main>
 
     <!-- ===================================================== toolbar -->
     <div class="toolbar" id="toolbar">

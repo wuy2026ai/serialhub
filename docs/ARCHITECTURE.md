@@ -417,7 +417,7 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
 - 布尔参数接受 `true/false/1/0`。`kinds` 逗号分隔。
 - 静态 UI：`GET /` 返回 `serialhub/static/index.html`；`/static/*` 挂载静态目录。UI 通过 `/ws` 与 `/api/*` 工作。
 
-**Web UI（B）必须满足**：深色为主可切浅色；xterm.js（CDN 或本地，需能离线降级）；多口标签页；ANSI 彩色渲染；每行时间戳开关 + 序号；实时过滤（regex）+ 搜索高亮/跳转；暂停/继续、自动滚屏、清屏；导出 raw/noansi/json；发送栏（选口/输入/结尾选项/历史）；端口头手动开/关按钮（`POST /api/ports/{n}/open|close`，请求中禁用）；引脚控件（DTR/RTS/Reset 脉冲，仅该口 `pins.enabled` 为真时显示）；顶部统计（行速率/字节速率/缓冲占用）；连接状态与波特率显示。
+**Web UI（B）必须满足**：深色为主可切浅色；xterm.js（CDN 或本地，需能离线降级）；多口标签页；ANSI 彩色渲染；每行时间戳开关 + 序号；实时过滤（regex）+ 搜索高亮/跳转；暂停/继续、自动滚屏、清屏；导出 raw/noansi/json；发送栏（选口/输入/结尾选项/历史）；端口头手动开/关按钮（`POST /api/ports/{n}/open|close`，请求中禁用）；引脚控件（DTR/RTS/Reset 脉冲，仅该口 `pins.enabled` 为真时显示）；顶部统计（行速率/字节速率/缓冲占用）；连接状态与波特率显示；顶栏配置文件切换（chip 显示当前配置文件，输入路径切换 / ↻ 重读当前文件；切换后收敛页签、面板、发送栏，并对已移除端口的迟到 WS 事件忽略）。
 
 ---
 

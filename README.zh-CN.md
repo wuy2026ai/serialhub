@@ -344,6 +344,7 @@ ui:
 | 发送栏 | 选目标口 + 输入 + EOL(CRLF/LF/CR/none) + Send；`↑`/`↓` 翻发送历史 |
 | 端口头 | 设备名 / 波特率 / 状态；右侧 lines/s、B/s、buffer 占用百分比与迷你速率图 |
 | 开/关 | 端口头上的切换按钮（调用 `POST /api/ports/{name}/open` 或 `/close`，保留当前波特率）；请求进行中禁用，成功后刷新状态点、页签与顶部统计 |
+| 配置切换 | 顶栏 chip 显示当前生效配置文件（完整路径在 title 里）；输入路径点 **Switch** 即 `POST /api/reload {"config": …}` 运行时切换，**↻** 重读当前文件。切换可能增删端口，页签 / 面板 / 发送栏随后自动收敛 |
 | 引脚控制 | DTR / RTS 切换与 Reset 脉冲（脉冲序列）；仅当端口状态里 `pins.enabled` 为真时显示，否则隐藏 |
 
 > UI 通过 `/api/*` 与 `/ws` 工作；WS 首帧推 `hello`（端口概览），随后推 `line` / `status` / `mark` 事件。

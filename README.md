@@ -349,6 +349,7 @@ Open `http://127.0.0.1:8765/`. Dark by default, with a light toggle in the top-r
 | Send bar | Pick target port + input + EOL (CRLF/LF/CR/none) + Send; `↑`/`↓` cycle send history |
 | Port header | Device name / baud / status; on the right, lines/s, B/s, buffer-fill percentage, and a mini rate chart |
 | Open / Close | Toggle button on the port header (calls `POST /api/ports/{name}/open` or `/close`, keeping the current baud); it is disabled while the request is in flight, and on success the status dot, tab and top-bar stats refresh |
+| Config switch | Top-bar chip shows the active config file (full path in its title); type a path and press **Switch** to `POST /api/reload {"config": …}` at runtime, or **↻** to re-read the active file. A switch may add/remove ports, so tabs, panes and the send bar are reconciled afterwards |
 | Pin control | DTR / RTS toggles and a Reset pulse (pulse sequence), shown only when the port status reports `pins.enabled`; hidden otherwise |
 
 > The UI works over `/api/*` and `/ws`; the first WS frame pushes `hello` (port overview), then it pushes `line` / `status` / `mark` events.

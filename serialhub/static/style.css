@@ -188,6 +188,61 @@ button { cursor: pointer; }
   font-family: var(--mono); font-size: 12px; color: var(--text);
 }
 
+/* runtime config switch: active filename + path input + reload/switch */
+.config-ctl {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 6px 0 9px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface-2);
+  transition: border-color var(--speed) var(--ease), box-shadow var(--speed) var(--ease);
+}
+.config-ctl:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.config-ctl.busy { opacity: 0.65; }
+.cfg-current {
+  max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding-right: 6px; border-right: 1px solid var(--border);
+  font-family: var(--mono); font-size: 11.5px; color: var(--text-dim);
+}
+.cfg-current.is-none { color: var(--text-faint); }
+.cfg-input {
+  width: 150px; border: 0; background: transparent; outline: none;
+  font-family: var(--mono); font-size: 12px; color: var(--text);
+}
+.cfg-input::placeholder { color: var(--text-faint); }
+.cfg-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  height: 22px; padding: 0 7px;
+  border: 1px solid var(--border-2); border-radius: var(--radius-xs);
+  background: transparent; color: var(--text-dim);
+  font-family: var(--mono); font-size: 11px;
+  transition: color var(--speed) var(--ease), border-color var(--speed) var(--ease),
+              background var(--speed) var(--ease);
+}
+.cfg-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.cfg-btn.cfg-switch { color: var(--bg); background: var(--accent); border-color: var(--accent); font-weight: 600; }
+.cfg-btn.cfg-switch:hover:not(:disabled) { background: var(--accent-2); border-color: var(--accent-2); color: var(--bg); }
+.cfg-btn:disabled { opacity: 0.5; cursor: progress; }
+.cfg-btn .bx { font-size: 12px; }
+
+/* empty workspace: the active config exposes no ports */
+.empty-state {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  padding: 24px; text-align: center;
+  font-family: var(--mono); font-size: 13px; color: var(--text-faint);
+}
+.empty-state[hidden] { display: none; }
+
+@media (max-width: 1180px) {
+  .cfg-input { width: 110px; }
+  .cfg-current { max-width: 92px; }
+}
+/* below this width the topbar would clip; wrap like the existing 820px layout
+   so the config control never pushes the theme/language buttons out of view */
+@media (max-width: 1080px) {
+  .topbar { flex-wrap: wrap; height: auto; padding: 10px 12px; gap: 10px; }
+  .top-stats { order: 3; width: 100%; justify-content: space-between; gap: 8px; }
+}
+
 .icon-btn {
   width: 32px; height: 30px; display: grid; place-items: center;
   border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2);
@@ -594,6 +649,11 @@ button { cursor: pointer; }
   .dev-chip { max-width: 60vw; }
   .dev-chip .dev-desc { max-width: 30vw; }
   .token-field input { width: 84px; }
+  /* let the config control take its own row instead of overflowing the bar */
+  .top-actions { flex-wrap: wrap; }
+  .config-ctl { order: 10; flex: 1 1 100%; }
+  .cfg-input { width: auto; flex: 1 1 auto; }
+  .cfg-current { max-width: 40vw; }
 }
 
 /* ------------------------------------------------------------ a11y / motion */
