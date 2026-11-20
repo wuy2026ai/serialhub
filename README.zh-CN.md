@@ -44,7 +44,7 @@
 | 引脚控制 | 每口用 `pins` 配置 DTR / RTS 驱动与 Reset 脉冲（**默认关闭**：此时守护完全不碰 DTR/RTS）；仅当该口 `pins.enabled: true` 时 Web UI 才显示该组控件 |
 | TCP 桥 | server（监听，客户端写=下发串口）/ client（连远端透传） |
 | CLI | 每个子命令输出**单行 JSON** `{"ok":true,"data":{...}}`，退出码 0/1 |
-| MCP | 17 个工具（stdio），让 agent 直接以工具调用操作串口 |
+| MCP | 18 个工具（stdio），让 agent 直接以工具调用操作串口 |
 | 热重载 | 改配置后 `serialhub reload`，增删口 / 改参数 / 重建缓冲即时生效；`serialhub reload --config other.yaml` 可在运行时切换配置文件（临时） |
 | 无硬件演示 | `device: loop://` 直接空跑 open→send→read→wait_for |
 
@@ -57,7 +57,7 @@ serialhub/
 ├── README.md                 # 本文件（用户手册）
 ├── docs/
 │   ├── ARCHITECTURE.md        # 冻结契约（唯一事实来源）
-│   ├── MCP.md                 # MCP 使用说明（17 工具参考 + agent 手册）
+│   ├── MCP.md                 # MCP 使用说明（18 工具参考 + agent 手册）
 │   └── DSH.md                 # DSH（DeepSeek Harness）接入全过程
 ├── examples/
 │   ├── config.yaml            # loop:// 演示 + 带注释的真实口
@@ -72,7 +72,7 @@ serialhub/
 │   ├── __main__.py            # python -m serialhub 入口
 │   ├── cli.py                 # 命令行（serve/list/open/read/wait/send/bridge/mcp/...）
 │   ├── client.py              # HTTP 瘦客户端（stdlib，CLI/MCP 共用）
-│   ├── mcp_server.py          # MCP 17 工具（stdio）
+│   ├── mcp_server.py          # MCP 18 工具（stdio）
 │   ├── mcp_compat.py          # mcp 1.x/2.x 兼容垫片
 │   ├── server.py              # FastAPI + REST + WS + 静态 UI
 │   ├── hub.py                 # 中枢（端口/缓冲/广播/桥/等待）
@@ -503,7 +503,7 @@ nc 127.0.0.1 4001
 MCP 服务器让 agent **以工具调用**（而非 shell）操作串口。它是**瘦客户端**：每个工具都通过 HTTP
 调用常驻守护，所以**必须先 `serve`**。transport 为 **stdio**（opencode / Claude Desktop / Cursor 的通用本地方式）。
 
-> 完整的 17 工具逐项参考、agent 操作手册、错误约定与序列图见 [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)。
+> 完整的 18 工具逐项参考、agent 操作手册、错误约定与序列图见 [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)。
 
 ### 9.1 启动
 
@@ -580,14 +580,14 @@ python -m serialhub mcp --transport stdio
 ```
 
 DSH 自带 `@deepseek-ai/dsh-mcp-client` 插件，所以**无需改任何源码**：保存 profile patch 即热重载，
-17 个工具会以 `mcp__serialhub__*` 出现在运行中的会话里。完整接入过程（含踩坑与撤销）见
+18 个工具会以 `mcp__serialhub__*` 出现在运行中的会话里。完整接入过程（含踩坑与撤销）见
 [`docs/DSH.zh-CN.md`](docs/DSH.zh-CN.md)。
 
 > 把 `<path-to-serialhub>` 换成本仓库的绝对路径、`<python>` 换成已安装 `mcp` 的解释器。
 
 环境变量：`SERIALHUB_URL`（守护基址，默认 `http://127.0.0.1:8765`）、`SERIALHUB_TOKEN`（守护设了 token 时）。
 
-### 9.3 工具速查表（17 个）
+### 9.3 工具速查表（18 个）
 
 所有工具成功返回 `{"ok": true, ...}`，失败返回 `{"ok": false, "error": "..."}`。
 
@@ -610,6 +610,7 @@ DSH 自带 `@deepseek-ai/dsh-mcp-client` 插件，所以**无需改任何源码*
 | `set_device` | `port, device=None, match=None, reopen=True` | 端口 dict（改后的 `device` / `open`）；临时，不落盘 |
 | `discover` | — | `devices[]`（`{index, device, description, hwid, vid, pid}`） |
 | `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`、`pin`、`value`、`dtr`、`rts`、`duration_ms`；需 `pins.enabled: true` 且端口已打开，`reset` 忽略 `pin` |
+| `switch_config` | `config` | `added`/`removed`/`restarted`/`updated` 与 `config`（生效的绝对路径）；运行时切换配置文件（临时，不落盘） |
 
 回环演示：
 
@@ -714,7 +715,7 @@ python -m pytest -q
 # MCP 协议自检（自写 stdio JSON-RPC 客户端，不需要守护）
 python tools/mcp_smoke.py
 
-# 端到端冒烟（需要守护在跑）：initialize + tools/list(17) + list_ports
+# 端到端冒烟（需要守护在跑）：initialize + tools/list(18) + list_ports
 python -m serialhub serve --config examples/config.yaml   # 另一个终端
 python tools/mcp_smoke.py --full --tool-timeout 30
 ```
@@ -736,7 +737,7 @@ python tools/mcp_smoke.py --full --tool-timeout 30
 | `export` | 文件真实写出，`bytes`/`count` 一致 |
 | TCP 桥往返 | 经 TCP 写→串口→回写 TCP 的线上往返成功 |
 | CLI `list` / `read` | 单行 JSON envelope，退出码 0 |
-| MCP `initialize` + `tools/list` | 返回 **17** 个工具 |
+| MCP `initialize` + `tools/list` | 返回 **18** 个工具 |
 | MCP `send` + `wait_for` | 哨兵命中（`matched:true`） |
 
 一键复跑：

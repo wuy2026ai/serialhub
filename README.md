@@ -45,7 +45,7 @@ in a browser; both `python -m serialhub list` on the command line and MCP `wait_
 | Pin control | DTR / RTS drive plus a Reset pulse, configured per port via `pins` (**off by default**: the daemon then never touches DTR/RTS); the Web UI group appears only when a port reports `pins.enabled: true` |
 | TCP bridge | server (listen; client writes go down to the serial port) / client (dial a remote and relay) |
 | CLI | Every subcommand prints a **single line of JSON** `{"ok":true,"data":{...}}`, exit code 0/1 |
-| MCP | 17 tools (stdio) that let an agent drive the serial port through tool calls |
+| MCP | 18 tools (stdio) that let an agent drive the serial port through tool calls |
 | Hot reload | After editing config, `serialhub reload` applies added/removed ports, changed params, and rebuilt buffers immediately; `serialhub reload --config other.yaml` switches the active config file at runtime (transient) |
 | No-hardware demo | `device: loop://` runs the full open→send→read→wait_for loop with no hardware |
 
@@ -58,7 +58,7 @@ serialhub/
 ├── README.md                 # this file (user manual)
 ├── docs/
 │   ├── ARCHITECTURE.md        # the frozen contract (single source of truth)
-│   ├── MCP.md                 # MCP guide (17-tool reference + agent manual)
+│   ├── MCP.md                 # MCP guide (18-tool reference + agent manual)
 │   └── DSH.md                 # DSH (DeepSeek Harness) integration walkthrough
 ├── examples/
 │   ├── config.yaml            # loop:// demo + a commented real port
@@ -73,7 +73,7 @@ serialhub/
 │   ├── __main__.py            # python -m serialhub entry
 │   ├── cli.py                 # command line (serve/list/open/read/wait/send/bridge/mcp/...)
 │   ├── client.py              # HTTP thin client (stdlib, shared by CLI/MCP)
-│   ├── mcp_server.py          # the 17 MCP tools (stdio)
+│   ├── mcp_server.py          # the 18 MCP tools (stdio)
 │   ├── mcp_compat.py          # mcp 1.x/2.x compatibility shim
 │   ├── server.py              # FastAPI + REST + WS + static UI
 │   ├── hub.py                 # the hub (ports/buffers/broadcast/bridges/waiting)
@@ -511,7 +511,7 @@ The MCP server lets an agent drive serial ports **through tool calls** (rather t
 every tool calls the persistent daemon over HTTP, so you **must `serve` first**. The transport is **stdio**
 (the common local approach for opencode / Claude Desktop / Cursor).
 
-> The complete 17-tool reference, agent playbook, error conventions, and sequence diagram are in [`docs/MCP.md`](docs/MCP.md).
+> The complete 18-tool reference, agent playbook, error conventions, and sequence diagram are in [`docs/MCP.md`](docs/MCP.md).
 
 ### 9.1 Launch
 
@@ -588,14 +588,14 @@ The equivalent module form: `"command": ["python", "-m", "serialhub", "mcp", "--
 ```
 
 DSH ships the `@deepseek-ai/dsh-mcp-client` plugin, so no source changes are needed: saving the profile
-patch hot-reloads it and the 17 tools appear as `mcp__serialhub__*` in the running session. Full
+patch hot-reloads it and the 18 tools appear as `mcp__serialhub__*` in the running session. Full
 walkthrough: [`docs/DSH.md`](docs/DSH.md).
 
 > Replace `<path-to-serialhub>` with this repository's absolute path and `<python>` with the interpreter that has `mcp` installed.
 
 Environment variables: `SERIALHUB_URL` (daemon base, default `http://127.0.0.1:8765`), `SERIALHUB_TOKEN` (when the daemon sets a token).
 
-### 9.3 Tool cheat sheet (17)
+### 9.3 Tool cheat sheet (18)
 
 Every tool returns `{"ok": true, ...}` on success and `{"ok": false, "error": "..."}` on failure.
 
@@ -618,6 +618,7 @@ Every tool returns `{"ok": true, ...}` on success and `{"ok": false, "error": ".
 | `set_device` | `port, device=None, match=None, reopen=True` | port dict (remapped `device` / `open`); transient, not persisted |
 | `discover` | - | `devices[]` (`{index, device, description, hwid, vid, pid}`) |
 | `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`, `pin`, `value`, `dtr`, `rts`, `duration_ms`; needs `pins.enabled: true` and an open port, and `reset` ignores `pin` |
+| `switch_config` | `config` | `added`/`removed`/`restarted`/`updated` plus `config` (the now-active absolute path); switches the active config file at runtime (transient, not persisted) |
 
 Loopback demo:
 
@@ -727,7 +728,7 @@ python -m pytest -q
 # MCP protocol self-check (hand-written stdio JSON-RPC client, no daemon needed)
 python tools/mcp_smoke.py
 
-# End-to-end smoke (needs the daemon running): initialize + tools/list(17) + list_ports
+# End-to-end smoke (needs the daemon running): initialize + tools/list(18) + list_ports
 python -m serialhub serve --config examples/config.yaml   # in another terminal
 python tools/mcp_smoke.py --full --tool-timeout 30
 ```
@@ -750,7 +751,7 @@ following methodology (reproducible):
 | `export` | File truly written, `bytes`/`count` match |
 | TCP bridge round trip | A wire round trip TCP write → serial → TCP write-back succeeds |
 | CLI `list` / `read` | Single-line JSON envelope, exit code 0 |
-| MCP `initialize` + `tools/list` | Returns **17** tools |
+| MCP `initialize` + `tools/list` | Returns **18** tools |
 | MCP `send` + `wait_for` | Sentinel hit (`matched:true`) |
 
 Rerun with one command:

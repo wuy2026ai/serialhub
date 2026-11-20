@@ -477,7 +477,7 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
           """返回 REST 的 JSON（已含 ok）。连接失败→{'ok':False,'error':'...'}。
           按需把 params 转 query（None 值省略；bool→'true'/'false'）。"""
   ```
-- 工具（共 **17** 个，名字即 MCP 工具名；返回 `{"ok":true,...}` / `{"ok":false,"error"}`）：
+- 工具（共 **18** 个，名字即 MCP 工具名；返回 `{"ok":true,...}` / `{"ok":false,"error"}`）：
   | 工具 | 参数 | 返回关键字段 |
   |---|---|---|
   | `list_ports` | — | `system[]`,`ports[]` |
@@ -497,6 +497,7 @@ def export_to_file(lines, path, fmt="raw") -> int:   # 返回写入字节数
   | `set_device` | `port, device=None, match=None, reopen=True` | `port` dict（改后的 `device`/`open`；临时不落盘） |
   | `discover` | — | `devices[]`（`{index,device,description,hwid,vid,pid}`） |
   | `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`,`pin`,`value`,`dtr`,`rts`,`duration_ms`（需 `pins.enabled=true` 且端口已打开） |
+  | `switch_config` | `config` | `added/removed/restarted/updated`,`config`（运行时切换配置文件；临时、不落盘） |
 - `wait_for` 用长超时（`timeout_ms/1000 + 10`s）。工具在 worker 线程调用 `Client`（`asyncio.to_thread`），事件循环不阻塞。
 - `tools/mcp_smoke.py`：自写 stdio JSON-RPC 客户端，`initialize`+`tools/list`（默认）；`--full` 再跑 `list_ports`。
 

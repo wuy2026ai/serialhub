@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import pytest
@@ -205,3 +206,45 @@ def test_config_load_roundtrip_sets_absolute_path(tmp_path) -> None:
     loaded = Config.load(target)
     assert loaded.path == target
     assert loaded.to_dict()["path"] == target
+
+
+# --------------------------------------------------------------------------- #
+# AI 侧专用接口：Client.switch_config + MCP switch_config 工具（第 18 个工具）
+# --------------------------------------------------------------------------- #
+def test_client_switch_config_sends_config_body(monkeypatch) -> None:
+    from serialhub.client import Client
+
+    seen: list[dict] = []
+
+    def fake_call(self, method, path, *, params=None, body=None, timeout=None):
+        seen.append(body)
+        return {"ok": True}
+
+    monkeypatch.setattr(Client, "call", fake_call)
+    Client().switch_config("/tmp/profile.yaml")
+    assert seen == [{"config": "/tmp/profile.yaml"}]
+
+
+def test_mcp_switch_config_forwards_absolute_path_and_rejects_empty(monkeypatch) -> None:
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from serialhub import mcp_server
+    from serialhub.client import Client
+
+    seen: list[str] = []
+
+    def fake_switch(self, path):
+        seen.append(path)
+        return {"ok": True, "config": path}
+
+    monkeypatch.setattr(Client, "switch_config", fake_switch)
+
+    out = asyncio.run(mcp_server.switch_config("profiles/b.yaml"))
+    assert out["ok"] is True
+    assert seen and os.path.isabs(seen[0]) and seen[0].endswith("b.yaml")
+
+    empty = asyncio.run(mcp_server.switch_config("   "))
+    assert empty["ok"] is False
+    assert "non-empty" in empty["error"]
+    assert len(seen) == 1  # 空路径不发请求

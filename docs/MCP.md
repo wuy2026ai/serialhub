@@ -3,7 +3,7 @@
 # serialhub MCP guide
 
 This document is for **AI agents that operate serial ports with serialhub** (and for engineers configuring
-MCP for those agents). It exposes the persistent `serialhub serve` daemon as **17 MCP tools**, letting an
+MCP for those agents). It exposes the persistent `serialhub serve` daemon as **18 MCP tools**, letting an
 agent complete the whole flow of "list ports → open → wait/read/search → send → snapshot/export/bridge"
 through tool calls (plus runtime remap: `set_device` / `discover`, and DTR/RTS pin control: `set_pin`).
 
@@ -58,7 +58,7 @@ pip install "mcp>=1.9"               # MCP support (or pip install -r requiremen
 
 # Protocol self-check (hand-written stdio JSON-RPC client, no daemon needed)
 python tools/mcp_smoke.py
-#   initialize + tools/list -> should print 17 tools and end with "# RESULT: PASS"
+#   initialize + tools/list -> should print 18 tools and end with "# RESULT: PASS"
 
 # End-to-end smoke (needs the daemon running)
 python -m serialhub serve --config examples/config.yaml
@@ -174,7 +174,7 @@ HMR). The full walkthrough — locating the profile, verification, pitfalls and 
 
 ---
 
-## 5. Tool reference (17)
+## 5. Tool reference (18)
 
 Convention: the defaults in the "Args" tables below are the tool-signature defaults; "Returns" omits the
 common `ok` / `port` fields.
@@ -623,6 +623,31 @@ configured initial levels — which is the usual way to drop an ESP32/STM32 into
 button. **There is deliberately no read-only pins tool in MCP**: MCP exposes only this mutating tool, so to
 *read* the current levels (or to read them while the port is closed) use REST
 `GET /api/ports/{name}/pins` or CLI `python -m serialhub pins NAME`.
+
+---
+
+### 5.18 `switch_config`
+
+Switch the daemon to **another config file at runtime** — the agent-facing shortcut for "change the active
+configuration" (e.g. one profile per board). Ports are added/removed exactly like `reload`, but the active file
+always changes.
+
+| Args | Type | Required | Notes |
+|---|---|---|---|
+| `config` | str | yes | Path to a YAML/JSON config file; absolute paths recommended (relative ones resolve against the MCP server's cwd) |
+
+Returns: `{added[], removed[], restarted[], updated[], config}` — `config` is the now-active absolute path.
+
+```json
+{ "config": "D:\\projects\\serialhub\\profiles\\board-b.yaml" }
+```
+```json
+{"ok":true,"added":["c6"],"removed":["stm32"],"restarted":[],"updated":[],"config":"D:\\projects\\serialhub\\profiles\\board-b.yaml"}
+```
+
+The switch is **transient**: nothing is written to disk, and a daemon restart goes back to `serve --config`.
+A missing file or an invalid config returns `{"ok":false,"error":...}` and the previous configuration stays
+active. Use `status` / `list_ports` afterwards to see the new port set.
 
 ---
 

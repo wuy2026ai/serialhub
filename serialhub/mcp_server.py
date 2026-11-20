@@ -325,6 +325,34 @@ async def reload(config: Optional[str] = None) -> dict[str, Any]:
     return await asyncio.to_thread(_client().reload, target)
 
 
+@mcp.tool(name="switch_config", annotations=_MUTATING)
+async def switch_config(config: str) -> dict[str, Any]:
+    """Switch the daemon to another config file at runtime (transient)./
+    运行时切换到另一个配置文件（临时，不落盘）。
+
+    The agent-facing shortcut for "change the active configuration": use it when a
+    task needs a different port set (e.g. another board profile) without restarting
+    the daemon. Unlike ``reload`` (which re-reads the active file and only switches
+    when given ``config``), this always changes the active file and then reports the
+    applied port changes.
+
+    Args:
+        config: Path to the config file (YAML/JSON). Absolute paths are recommended;
+            relative paths are resolved against the MCP server's cwd.
+
+    Returns:
+        dict: ``{"ok": true, "added", "removed", "restarted", "updated",
+        "config"}`` — ``config`` is the now-active absolute path. On failure
+        ``{"ok": false, "error": "<message>"}`` (file missing / invalid config) and
+        the previous configuration stays active.
+    """
+    target = str(config or "").strip()
+    if not target:
+        return {"ok": False, "error": "config path must be a non-empty string"}
+    return await asyncio.to_thread(_client().switch_config,
+                                   os.path.abspath(os.path.expanduser(target)))
+
+
 @mcp.tool(name="set_device", annotations=_MUTATING)
 async def set_device(port: str, device: Optional[str] = None,
                      match: Optional[Union[str, dict]] = None,

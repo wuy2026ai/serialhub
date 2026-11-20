@@ -192,6 +192,10 @@ class Client:
         """Hot-reload the daemon config; ``path`` switches the active file at runtime."""
         return self.call("POST", "/api/reload", body={"config": path} if path else None)
 
+    def switch_config(self, path: str) -> dict[str, Any]:
+        """Switch the daemon to another config file at runtime (transient; no disk write)."""
+        return self.call("POST", "/api/reload", body={"config": str(path)})
+
 
 def _read_error_body(exc: urllib.error.HTTPError) -> dict[str, Any]:
     """Best-effort parse of a non-2xx body; never raises."""

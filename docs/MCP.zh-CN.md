@@ -3,7 +3,7 @@
 # serialhub MCP 使用说明
 
 本文件面向**要用 serialhub 操作串口的 AI agent**（以及为 agent 配置 MCP 的工程师）。
-它把常驻守护 `serialhub serve` 暴露为 **17 个 MCP 工具**，让 agent 直接以工具调用完成
+它把常驻守护 `serialhub serve` 暴露为 **18 个 MCP 工具**，让 agent 直接以工具调用完成
 「列口 → 打开 → 等待/读取/搜索 → 发送 → 快照/导出/桥」的全流程（另有运行时改写：`set_device` / `discover`，以及 DTR/RTS 引脚控制：`set_pin`）。
 
 > 契约来源：[`ARCHITECTURE.md`](ARCHITECTURE.md) §11；实现：[`../serialhub/mcp_server.py`](../serialhub/mcp_server.py)。
@@ -57,7 +57,7 @@ pip install "mcp>=1.9"               # MCP 支持（或 pip install -r requireme
 
 # 协议自检（自写 stdio JSON-RPC 客户端，不需要守护）
 python tools/mcp_smoke.py
-#   initialize + tools/list -> 应打印 17 个工具，末尾 "# RESULT: PASS"
+#   initialize + tools/list -> 应打印 18 个工具，末尾 "# RESULT: PASS"
 
 # 端到端冒烟（需先起守护）
 python -m serialhub serve --config examples/config.yaml
@@ -172,7 +172,7 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 
 ---
 
-## 5. 工具参考（17 个）
+## 5. 工具参考（18 个）
 
 约定：下文「参数表」中的默认值即工具签名默认值；「返回」省略公共的 `ok` / `port` 字段。
 
@@ -608,6 +608,29 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 **何时用**：让 agent 不按按钮就复位 / 进 bootloader / 拨动某条控制线。
 **MCP 故意没有只读的引脚工具**：这里只有这个写操作，要*读*当前电平（或端口关闭时读）请用 REST
 `GET /api/ports/{name}/pins` 或 CLI `python -m serialhub pins NAME`。
+
+---
+
+### 5.18 `switch_config`
+
+**运行时切换到另一份配置文件** —— 给 agent 的"换配置"专用入口（例如每块板一份 profile）。端口的增删与
+`reload` 完全一致，但这里**总是**更换生效文件。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `config` | str | 是 | YAML/JSON 配置文件路径；建议绝对路径（相对路径相对 MCP 服务器 cwd 解析） |
+
+返回：`{added[], removed[], restarted[], updated[], config}`——`config` 是生效的绝对路径。
+
+```json
+{ "config": "D:\\projects\\serialhub\\profiles\\board-b.yaml" }
+```
+```json
+{"ok":true,"added":["c6"],"removed":["stm32"],"restarted":[],"updated":[],"config":"D:\\projects\\serialhub\\profiles\\board-b.yaml"}
+```
+
+切换是**临时的**：不写盘，重启守护进程后回到 `serve --config` 指定的文件。文件不存在或配置非法时返回
+`{"ok":false,"error":...}`，且原配置保持生效。切换后用 `status` / `list_ports` 查看新的端口集合。
 
 ---
 
