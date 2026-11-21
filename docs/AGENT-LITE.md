@@ -36,7 +36,10 @@ Of the 8 lite tools, the six serial tools (`ports`, `send`, `read`, `wait`, `sea
   `timeout_ms`. `wait` ignores the first rx line ending with `data` (the device's echo,
   maybe prompt-prefixed: `root@dev:~# uname -a`); it is still shown, and while that echo
   line has not arrived in full a partially-echoed tail is not matched either (a regex that
-  occurs in the command text will not fire on the half echo). A port that closes mid-send
+  occurs in the command text will not fire on the half echo). This deferral is conservative:
+  on a device with **no** echo, a `wait` whose text also occurs in the command can be deferred
+  until the reply's line ending arrives (the tail's last characters overlap the command text);
+  give the `wait` pattern text from the reply that the command does not contain. A port that closes mid-send
   (unplugged, another client closed it) returns `error: port '<name>' is not open`.
   Against a daemon without `/exchange` (older version, HTTP 404) `send` falls back to
   polling `read` (300 ms quiet window).
