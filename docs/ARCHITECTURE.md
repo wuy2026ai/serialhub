@@ -715,3 +715,73 @@ zmodem.js 原样会对设备的下一行抛 “Only thing after ZFIN should be O
 时，攻击者域名解析到本机后，其页面请求的 `Origin` 与 `Host` 都是攻击者域名、比对通过，即可停止服务；对外监听时应设
 `token:` 或 `allow_shutdown: false`。位于会改写 `Host` 的反向代理之后时，浏览器的 `Origin` 与改写后的 `Host` 不一致，
 Exit 按钮得到 `403`（`serialhub shutdown` 等不带 `Origin` 的客户端不受影响）。
+
+## 16. 低延迟路径（2026-11 增补）
+
+目标：设备的输出一到达，浏览器与 agent 立刻拿到；命令立刻写出。只做增补，§1–§15 的语义（行、seq、游标、
+广播事件、ZMODEM、停机）不变。
+
+**读循环（serialport.py `_read_once` / `_read_idle`）**：首字节到达即返回，等待期间**不持** `_io_lock`
+（写入不再排在 0.1 s 的读超时后面）。
+
+| 端口 | 空闲等待（锁外） | 取数据（持 `_io_lock`） |
+|---|---|---|
+| POSIX 串口（有整数 `fd`） | `select([fd], timeout=ser.timeout)` | `read(in_waiting)`；`in_waiting==0` 时 `read(1)`（EOF/拔出照常抛 `SerialException` → 重连） |
+| 无 `fd`（Windows、`loop://`、`rfc2217://` 等） | `read(1)`（至多 `ser.timeout`，首字节即返回） | `read(in_waiting)` 取走其余 |
+| `socket://` | `select([sock])` | 单次 `recv(4096)`（保持 §7 的“对端发完即关不丢尾部”） |
+| ZMODEM 会话中 | 不变：只读 `in_waiting`，空读时锁外睡 `_ACTIVE_POLL_S` | — |
+
+`serial_for_url(..., timeout=0.1)` 不变，它只决定空闲等待上限（`close()` 照常在 ≤ 0.1 s 内让读循环退出）。
+锁顺序不变（`_io_lock` 之后可取 `_zm_lock`，后者是叶子锁）。
+
+**未结束尾巴（pending）**：`framing: line` 下没有 EOL 的残行（提示符 `=> `、`login: `）不入环、无 seq。读循环在残行
+缓冲每次变化后计算其文本（`getstate → decode → setstate`，不消费解码器状态；去 ANSI、去结尾孤立 `\r`、只留最后
+240 字符；残行超过 1 KiB 时只解码末尾 1 KiB），有变化时调 `hub.set_pending(port, text)`；残行清空、EOL 到来、断开、
+`close`、ZMODEM 开始/排空结束时发布空串。EOL 到来后整行照常以新 seq 入环（与今天完全一样）。
+
+- `hub.pending(name) -> str`；`read` / `wait_for` / `status` / `list_ports` 的端口 dict / `exchange` 返回里，
+  有尾巴时多一个 `pending` 字段（没有时**不出现**，旧形状不变）。
+- 广播（§6.2 增补）：`{"type":"partial","port":"<name>","text":"<tail>"}`，无 seq；`text:""` 表示尾巴已消失。
+  WS 转发时同一批次里同一端口只发最新一条（合并）。旧 Web UI 忽略未知事件类型。
+- `wait_for` 的正则同时匹配尾巴：调用时已有的尾巴立即命中；等待中每次 `partial` 重新匹配。尾巴命中时
+  `{"matched":true,"line":null,"seq":null,"ts_ms":null,"pending":"<tail>",...}`。
+- **不要**用 `framing: idle` 实现这件事：它把逐字回显切成多条 seq 行。
+
+**等待不阻塞事件循环**：`api_wait` / `api_send` / `api_exchange`（以及 open/close/device/pins/export/reload）写成普通
+`def`，由 FastAPI 在线程池执行；`hub.wait_for` 本就由读线程的广播唤醒（不轮询，命中后 ≈ 0.1 ms 返回）。
+`wait_for` 不给 `since_seq` 时仍先对全环做一次正则扫描（语义不变：已在环里的匹配行立即返回）。
+
+**`POST /api/ports/{name}/exchange`**（一次请求完成“写出 + 收集回复”）：
+
+请求体 `{"data": str, "eol"?: str, "wait_regex"?: str, "timeout_ms"?: int, "quiet_ms"?: int, "since_seq"?: int}`。
+服务端先订阅、记下游标（`since_seq`，缺省为当前最新 seq），按 `send` 的规则写出（含 tx 入环），再收集，先到者结束：
+
+| 顺序 | 条件 | `reason` |
+|---|---|---|
+| a | `wait_regex` 命中游标之后的新 rx 行（去 ANSI 后匹配），或命中写出后变化过的尾巴 | `regex` |
+| b | 未给 `wait_regex`、该口配了 `prompt`：写出后收到过字节，且 prompt 命中尾巴（无尾巴时命中最后一行新 rx） | `prompt` |
+| c | 未给 `wait_regex`：最后一个**字节**之后静默 `quiet_ms`（缺省 `reply_quiet_ms`=100）；写出后一个字节都没到时等 `min(timeout_ms, reply_first_ms)`（缺省 300） | `quiet` |
+| d | `timeout_ms`（缺省 10000） | `timeout` |
+
+与 lite `send` 一样，第一行以 `data` 结尾的 rx 行（设备回显，可带提示符前缀）不参与匹配，仍在 `lines` 里。响应：
+`{"ok":true,"port","sent","sent_bytes","lines":[rx 行，与 read 同形，至多 500],"count","has_more","pending"?,
+"matched": reason∈{regex,prompt},"reason","next_seq","from_seq"}`；`regex` 命中某行时 `lines` 截到该行。
+非法 `wait_regex` / 端口 `prompt` → 400；未知端口 → 404；ZMODEM 会话中 → 409（同 `send`）。
+`Client.exchange(...)`；旧守护进程无此路由（404 `{"detail":"Not Found"}`）时返回 `{"ok":false,"unsupported":true,...}`，
+lite `send` 据此退回旧的轮询实现。lite 工具 schema 不变。
+
+**配置（§5 增补，每口，`to_dict` 输出）**：`prompt: str|None = None`（正则，加载时编译校验）、
+`reply_quiet_ms: int = 100`（≥ 0）、`reply_first_ms: int = 300`（≥ 0）。非 I/O 字段：热重载不重启 worker。
+
+**WS 转发**：`hub.subscribe(notify=callable)` 在每个事件入队后调用 `notify`；`/ws` 用它经
+`loop.call_soon_threadsafe` 投递**一次**唤醒（已投递未处理时不重复），转发任务醒来后 `get_nowait()` 取走整批、逐条
+（每行一帧，契约不变）连续发送。队列上限 10000 与满则丢弃策略不变（§6）。
+
+**HTTP**：`GZipMiddleware(minimum_size=1024)`（静态资源与 ≥ 1 KiB 的 JSON）；`Cache-Control`：
+`/static/vendor/*` 为 `public, max-age=604800`，`/` 与其余 `/static/*` 为 `no-cache`（ETag/Last-Modified 校验，304）。
+`serialhub serve` 默认关闭 uvicorn 访问日志，`--access-log` 打开。
+
+**RingBuffer.read**：给 `since_seq` 时从尾部倒扫到游标即停（容忍 16 行以内的并发乱序），不再复制整个环。
+
+**断行**：`_emit_complete_lines` 用 `bytearray.find` 定位 `\n`/`\r` 并缓存下一处位置，消费完一次性删前缀
+（规则与 `_find_eol` 完全相同：`\r\n` 为一个结束符，结尾孤立 `\r` 暂缓）。

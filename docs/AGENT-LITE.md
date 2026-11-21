@@ -11,7 +11,7 @@ Compact JSON of name + description + input schema per tool (a test keeps lite �
 | interface | tools | chars |
 |---|---|---|
 | full MCP profile (`mcp_server.py`) | 20 | 18,244 |
-| lite, Anthropic format (`serialhub tools`) | 8 | 4,192 |
+| lite, Anthropic format (`serialhub tools`) | 8 | 4,195 |
 | lite, OpenAI format (`serialhub tools --format openai`) | 8 | 4,424 |
 
 Of the 8 lite tools, the six serial tools (`ports`, `send`, `read`, `wait`, `search`, `control`) are 2,648 chars; `zsend` + `zrecv` add 1,544.
@@ -29,9 +29,14 @@ Of the 8 lite tools, the six serial tools (`ports`, `send`, `read`, `wait`, `sea
 | `zsend` | `port`; `path` (array of local paths; a bare string is accepted) **or** `content` + `name` (`encoding?`: `text` default, or `base64`); `overwrite?` (true); `cmd?` (`rz`; `""` = none); `timeout_ms?` (auto, max 1800000) | one line per file: `sent <name> <bytes>B crc=<CRC32> in <s>s` |
 | `zrecv` | `port`, `remote` (array of device names; a bare string is accepted), `dir?` (cwd if writable, else temp), `inline?` (false), `overwrite?` (false), `cmd?` (`sz {remote}`), `timeout_ms?` (auto) | one line per file: `received <name> <bytes>B crc=<CRC32> -> <absolute path>`; with `inline`, `--- <name>` + content for each text file |
 
-- `send` collects **rx** lines after the write until `wait` matches, or (no `wait`) 300 ms
-  of silence, or `timeout_ms`. `wait` ignores the first rx line ending with `data` (the
-  device's echo, maybe prompt-prefixed: `root@dev:~# uname -a`); it is still shown.
+- `send` is **one** request (`POST /api/ports/{name}/exchange`): the daemon writes, then
+  collects **rx** lines until `wait` matches a line or the unterminated tail, or (no `wait`)
+  the port's `prompt` regex matches, or 100 ms pass after the **last byte**
+  (`reply_quiet_ms`; at most `reply_first_ms` = 300 ms when nothing at all arrives), or
+  `timeout_ms`. `wait` ignores the first rx line ending with `data` (the device's echo,
+  maybe prompt-prefixed: `root@dev:~# uname -a`); it is still shown. Against a daemon
+  without `/exchange` (older version, HTTP 404) `send` falls back to polling `read`
+  (300 ms quiet window).
 - `wait` without `since` only considers lines arriving after the call. On a match it shows
   all lines in (since or call start, match]; `next=` is the matched seq.
 - Regexes: `send`'s `wait` matches ANSI-stripped text; `wait`/`search`/`filter` run in the
@@ -130,6 +135,7 @@ missing file; the same holds for `serialhub call zsend|zrecv`). The full MCP pro
 <seq> ><text>           sent by the host (tx)
 <seq> #<text>           marker
 <seq> <text> (x12)      12 adjacent identical lines collapsed; seq is the first one
+~<text>                 last line only: unterminated tail, e.g. a prompt; no seq
 ```
 
 - Pass `next=` as `since` next time — no line is shown twice. Empty: `<port> empty next=<cursor> more=0`.
@@ -153,11 +159,59 @@ console 11-12 next=12 more=0
 12 Linux dev 6.1.0
 ```
 
-## Prompts are not lines
+## Prompts: the `~` line
 
 Default `framing: line` emits a line only at a line ending, so a bare prompt (`login: `,
-`# `) never appears and a `wait` for it times out. Wait for output lines, or set
-`framing: idle` (with `flush_ms`) on ports that drive interactive shells.
+`=> `) gets no seq. It is still visible: `send`, `read` and `wait` end with one extra line
+`~<text>` while the port has such an unterminated tail (ANSI stripped, at most 240 chars,
+no seq, never counted in `next=`). When the line ending arrives later, the full line gets
+its seq as usual and the `~` line disappears. `wait` (and `send`'s `wait`) also match the
+tail, so `wait {"regex": "login: $"}` returns as soon as the prompt is printed (a tail that
+is already there when `wait` starts matches at once). Do not use
+`framing: idle` for this — it splits typed echo into separate lines.
+
+```
+> send {"port":"uboot","data":"version"}
+sent 9B
+uboot 41-42 next=42 more=0
+41 version
+42 U-Boot 2024.01
+~=> 
+```
+
+**`prompt` config** (per port, regex): set it to the device's prompt and `send` without
+`wait` returns the moment the prompt is printed instead of after 100 ms of silence:
+
+```yaml
+ports:
+  - name: uboot
+    device: /dev/ttyUSB0
+    prompt: "=> $"        # U-Boot; a shell: "[#$] $"; a login: "login: $"
+    reply_quiet_ms: 100   # default; silence after the last byte that ends a reply
+    reply_first_ms: 300   # default; max wait when nothing at all arrives
+```
+
+## Measured latency
+
+PTY simulator (socat pair + a zero-latency fake device), `perf-agent/bench.py`, p50 of 50
+calls, macOS, before → after this change:
+
+| path | before | after |
+|---|---|---|
+| REST `send` (write only) → returns | 105 ms | 0.5 ms |
+| device line → browser (`/ws` event) | 103 ms | 0.3 ms |
+| lite `send` with `wait` (reply immediate) | 205 ms, 5 requests | 0.7 ms, 1 request |
+| lite `send` without `wait` | 518 ms, 11 requests | 106 ms, 1 request |
+| lite `send` without `wait`, port `prompt` matches | — | 0.8 ms |
+| lite `wait`, line arrives after 100 ms: return − arrival | 104 ms | 1.4 ms |
+| another client's request while a `wait` is pending | 1204 ms | 1.7 ms |
+| MCP (lite profile) `send` with `wait` | 207 ms | 2.3 ms |
+
+Daemon harness (`perf-daemon/bench.py`, p50 of 200, 115200-baud PTY simulator): device line
+→ visible to a polling `read` 57 → 1.1 ms; → `/ws` 59 → 0.4 ms; REST `send` → bytes on the
+wire 61 → 0.8 ms; device echo round trip (`send` → `pong` via `wait_regex`) 166 → 1.6 ms.
+A 2000-line burst is still bounded by the daemon's single event loop: the last line reaches
+REST/WS 35–130 ms after the device finished writing (1–3 WebSocket clients; was ~105–310 ms).
 
 ## Three ways to use it
 
@@ -203,7 +257,7 @@ Lines are '<seq> <text>'; '>' = sent by you, '#' = marker.
 Each block header has next=N: pass N as since next time so you never re-read lines;
 more=1 means read again with that since.
 Use send with wait (regex for the reply, not your echoed command); wait for later events.
-Wait for output lines, not a bare prompt (a prompt has no newline).
+A last line '~text' is output without a newline yet (e.g. a prompt); it has no seq.
 Move files with zsend/zrecv (they run rz/sz themselves).
 On 'error:' fix the arguments; do not repeat the call.
 ```
