@@ -103,6 +103,8 @@ class MockDevice:
                 if was_streaming:          # 恢复传输前的 stream 状态
                     self.stream.set()
             self.ser.write(f"{label} done rc={rc}\r\n".encode())
+            # 同时打到 stdout：中止后这行可能落在宿主的排空窗口里被丢弃，测试据此确认退出码
+            print(f"{label} done rc={rc}", flush=True)
 
     def handle(self, line: str) -> None:
         cmd, _, rest = line.strip().partition(" ")

@@ -31,3 +31,6 @@ exports/
 # OS
 .DS_Store
 Thumbs.db
+
+# Node test harness deps (lock committed)
+tests/zmodem_client/node_modules/

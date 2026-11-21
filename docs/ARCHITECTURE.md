@@ -582,3 +582,31 @@ def zmodem_end(self, name, session_id, client_id: Optional[str], *, abort=False,
 **锁**：worker 新增 `_zm_lock`（叶子锁）守护会话指针与会话字段；持有时不做串口 I/O、不调 hub、不阻塞
 （只对无界队列 `put_nowait`，保证数据、认领回放与结束哨兵的先后顺序）。超时判定 / owner 校验与摘除会话
 （`_zm_session = None`）在同一临界区内完成，期间落地的认领或别的客户端的结束不会误杀新会话。
+`_write_raw` 只在 `_io_lock` 下 `write`，`flush()`（tcdrain）在锁外：tcdrain 要等对端读走数据，持锁等会让读循环
+读不了，正在发送的设备（`lsz`）写满缓冲后不再读输入，tcdrain 永不返回（死锁）。
+
+**WebSocket 转发**（`server.py` 的 `/ws`）：每条连接有稳定的 `client_id`（uuid4 hex），会话按端口记在本连接上。
+客户端 → 服务端（JSON 文本帧）：
+- `{"type":"zmodem_claim","port"}` → 回 `{"type":"zmodem_claimed","port","session","direction"}`，随后**只向本连接**推
+  `{"type":"zmodem_data","port","session","b64"}`（会话队列的字节，已到的分片合并，≤ 64 KiB/帧），
+  会话结束（队列 `None`）时推 `{"type":"zmodem_closed","port","session","reason"}`（`reason` 同 end 广播）。
+  同一连接重复认领同一会话只回 `zmodem_claimed`，不另起转发。
+- `{"type":"zmodem_write","port","session","b64"}` → `hub.zmodem_write`（线程里执行，按收到顺序逐条写）。
+- `{"type":"zmodem_end","port","session","abort":bool}` → `hub.zmodem_end(..., abort, reason="abort" if abort else "done")`。
+- 任一失败（无会话、被他人认领、未知端口、base64 非法……）→ `{"type":"zmodem_error","port","error"}`，连接不断。
+- 连接断开时仍持有的会话 → `hub.zmodem_end(..., abort=True, reason="disconnect")`。
+- `{"type":"zmodem","event":"start"|"end",...}` 广播照常经订阅推给所有连接（受 `subscribe` 过滤）。
+- 会话期间 REST `POST /api/ports/{name}/send` → 409 `{"ok":false,"error":"zmodem: session active on port '<name>'"}`。
+
+**已知限制**：`done` 结束靠客户端 `zmodem_end`；设备在 ZMODEM 结束串（`OO`）之后立刻打印的内容（如 `sz done`、
+shell 提示符）若与负载同批到达，会进会话（由 zmodem.js 作为 trailing bytes 交给终端显示），不进环形缓冲；
+非 `done` 结束后这类输出落在排空窗口里被丢弃。
+
+**zmodem.js（0.1.10）与 lrzsz 的兼容垫片**：`lsz` 每个文件的第一个 ZDATA 子包以 ZCRCW 结尾并等 ZACK，
+随后发新的 ZDATA 头；zmodem.js 只对 ZCRCQ 回 ZACK、ZDATA 帧后只接受 ZEOF，下载会在 1024 字节处卡住。
+`tests/zmodem_client/zclient.mjs` 打了补丁（回 ZACK 并接受下一个 ZDATA 头），浏览器 UI 需同样处理。
+
+**测试客户端**：`tests/zmodem_client/zclient.mjs`（Node，依赖锁在 `package-lock.json`，`node_modules/` 不入库；
+`tests/integration/simenv.py` 的 `node_client()` 每个测试会话最多跑一次 `npm ci`）：
+`node zclient.mjs --ws URL --port NAME (--send FILE… | --recv-dir DIR) [--close-after-bytes N]`，
+订阅就绪后往 stderr 打 `{"ready":true}`，结束时 stdout 打一行 `{"ok","files":[{"name","size"}],"error"}`，退出码 0/1。

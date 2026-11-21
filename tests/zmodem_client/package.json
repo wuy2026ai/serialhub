@@ -1,0 +1,10 @@
+{
+  "name": "serialhub-zmodem-client",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Test harness: drives serialhub /ws ZMODEM sessions with zmodem.js",
+  "type": "module",
+  "dependencies": {
+    "zmodem.js": "0.1.10"
+  }
+}

@@ -404,3 +404,24 @@ def test_config_roundtrip_and_validation(make_config) -> None:
         make_config(ports=[_port(zmodem_claim_ms=0)])
     with pytest.raises(ValueError, match=r"ports\[z\]\.zmodem"):
         make_config(ports=[_port(zmodem="yes")])
+
+
+def test_flush_runs_outside_io_lock(zhub) -> None:
+    """flush()=tcdrain 可能要等对端读走数据；若持 _io_lock 等，读循环读不了，
+    设备（如正在发送的 lsz）写满缓冲后不再读输入 → tcdrain 永不返回（死锁）。"""
+    worker = zhub._require_worker("z")
+    _until(lambda: worker.is_open)
+    ser = worker._serial
+    held: list[bool] = []
+    real_flush = ser.flush
+
+    def spy_flush() -> None:
+        held.append(worker._io_lock.locked())
+        real_flush()
+
+    ser.flush = spy_flush  # type: ignore[method-assign]
+    _start(zhub)
+    sid, _ = zhub.zmodem_claim("z", "tab-1")
+    zhub.zmodem_write("z", sid, "tab-1", b"x")
+    zhub.zmodem_end("z", sid, "tab-1", abort=True, reason="abort")
+    assert held and not any(held)

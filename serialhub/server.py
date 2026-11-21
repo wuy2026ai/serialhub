@@ -16,9 +16,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import queue
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Set
 
@@ -413,6 +416,9 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         # 2) 订阅广播
         q = hub.subscribe()
         subscribed: Optional[Set[str]] = None  # None 表示全部端口
+        # ZMODEM：本连接的稳定身份；port -> (session_id, 会话转发任务)
+        client_id = uuid.uuid4().hex
+        zm_sessions: dict[str, tuple[str, asyncio.Task]] = {}
 
         async def _pump() -> None:
             """后台任务：把阻塞队列的事件喂给 WebSocket。"""
@@ -431,6 +437,90 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
                     await websocket.send_json(event)
                 except Exception:  # noqa: BLE001 - 客户端已断开
                     break
+
+        async def _zm_error(port: Any, exc: BaseException) -> None:
+            if isinstance(exc, KeyError):
+                error = t("server.error.unknown_port", name=str(exc))
+            else:
+                error = str(exc)
+            await websocket.send_json({"type": "zmodem_error", "port": port, "error": error})
+
+        async def _zm_pump(port: str, sid: str, zq: "queue.Queue[Optional[bytes]]") -> None:
+            """会话转发任务：负载只发给本连接（base64），遇 None 哨兵发 zmodem_closed。"""
+            try:
+                ended = False
+                while not ended:
+                    try:
+                        chunk = await asyncio.to_thread(zq.get, True, 1.0)
+                    except queue.Empty:
+                        continue
+                    if chunk is None:
+                        break
+                    buf = bytearray(chunk)
+                    while len(buf) < 65536:  # 合并已到的分片，减少帧数
+                        try:
+                            more = zq.get_nowait()
+                        except queue.Empty:
+                            break
+                        if more is None:
+                            ended = True
+                            break
+                        buf.extend(more)
+                    await websocket.send_json({
+                        "type": "zmodem_data", "port": port, "session": sid,
+                        "b64": base64.b64encode(bytes(buf)).decode("ascii"),
+                    })
+                # 会话已摘除：对旧 id 调 end 幂等，取回结束原因
+                summary = hub.zmodem_end(port, sid, client_id)
+                await websocket.send_json({
+                    "type": "zmodem_closed", "port": port, "session": sid,
+                    "reason": summary.get("reason") or "closed",
+                })
+            except Exception:  # noqa: BLE001 - 客户端已断开
+                pass
+            finally:
+                if zm_sessions.get(port, (None,))[0] == sid:
+                    del zm_sessions[port]
+
+        async def _zm_claim(port: Any) -> None:
+            try:
+                sid, zq = hub.zmodem_claim(port, client_id)
+                st = hub.zmodem_status(port)
+            except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
+                await _zm_error(port, exc)
+                return
+            direction = st.get("direction") if st.get("session") == sid else None
+            await websocket.send_json({
+                "type": "zmodem_claimed", "port": port, "session": sid, "direction": direction,
+            })
+            if zm_sessions.get(port, (None,))[0] != sid:  # 重复认领不另起转发任务
+                zm_sessions[port] = (sid, asyncio.create_task(_zm_pump(port, sid, zq)))
+
+        async def _zm_write(port: Any, sid: Any, b64: Any) -> None:
+            try:
+                data = base64.b64decode(str(b64 or ""), validate=True)
+                # 阻塞写放线程里；本循环逐条 await，写入顺序与收到顺序一致
+                await asyncio.to_thread(hub.zmodem_write, port, str(sid), client_id, data)
+            except binascii.Error as exc:
+                await _zm_error(port, ValueError(f"zmodem: bad base64: {exc}"))
+            except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
+                await _zm_error(port, exc)
+
+        async def _zm_end(port: Any, sid: Any, abort: bool) -> None:
+            try:
+                await asyncio.to_thread(
+                    hub.zmodem_end, port, str(sid), client_id,
+                    abort=abort, reason="abort" if abort else "done",
+                )
+            except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
+                await _zm_error(port, exc)
+
+        def _zm_abort_all(owned: list[tuple[str, str]]) -> None:
+            for port, sid in owned:
+                try:
+                    hub.zmodem_end(port, sid, client_id, abort=True, reason="disconnect")
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
 
         async def _handle_client_message(raw: str) -> None:
             nonlocal subscribed
@@ -456,6 +546,12 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
                         hub.mark(port, label)
                     except Exception:  # noqa: BLE001 - best-effort
                         pass
+            elif mtype == "zmodem_claim":
+                await _zm_claim(msg.get("port"))
+            elif mtype == "zmodem_write":
+                await _zm_write(msg.get("port"), msg.get("session"), msg.get("b64"))
+            elif mtype == "zmodem_end":
+                await _zm_end(msg.get("port"), msg.get("session"), bool(msg.get("abort")))
 
         pump_task = asyncio.create_task(_pump())
         try:
@@ -468,10 +564,18 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             pass
         finally:
             pump_task.cancel()
+            # 断开时仍持有的会话一律中止（对已结束的会话调用是幂等的）。写中止串放线程里，
+            # 不阻塞事件循环；即使本协程被取消，线程里的收尾也会跑完。
+            owned = [(port, sid) for port, (sid, _task) in zm_sessions.items()]
+            for _sid, task in zm_sessions.values():
+                task.cancel()
+            zm_sessions.clear()
             try:
                 hub.unsubscribe(q)
             except Exception:  # noqa: BLE001
                 pass
+            if owned:
+                await asyncio.to_thread(_zm_abort_all, owned)
 
     # ---- 静态 UI ----------------------------------------------------------- #
     if STATIC_DIR.is_dir():

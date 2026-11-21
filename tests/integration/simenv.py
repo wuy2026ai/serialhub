@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import signal
@@ -20,6 +21,7 @@ import uvicorn
 
 ROOT = Path(__file__).resolve().parents[2]
 MOCK_DEVICE = ROOT / "tools" / "mock_device.py"
+ZCLIENT_DIR = ROOT / "tests" / "zmodem_client"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -115,15 +117,26 @@ class MockDevice:
                     "--name", name, "--interval", str(interval),
                     "--files-dir", str(files_dir), "--recv-dir", str(recv_dir)]
         self.proc: Optional[subprocess.Popen] = None
+        self.log_path: Optional[str] = None
 
     def start(self) -> "MockDevice":
-        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
+        fd, self.log_path = tempfile.mkstemp(prefix="mockdev-", suffix=".log")
+        with os.fdopen(fd, "wb") as log:
+            self.proc = subprocess.Popen(self.cmd, stdout=log, stderr=subprocess.DEVNULL)
         return self
+
+    def output(self) -> str:
+        """设备 stdout（如 ``sz done rc=N``）。"""
+        if not self.log_path or not os.path.exists(self.log_path):
+            return ""
+        with open(self.log_path, encoding="utf-8", errors="replace") as f:
+            return f.read()
 
     def stop(self) -> None:
         if self.proc:
             _terminate(self.proc)
+        if self.log_path and os.path.exists(self.log_path):
+            os.unlink(self.log_path)
 
     def __enter__(self) -> "MockDevice":
         return self.start()
@@ -190,3 +203,92 @@ class LiveServer:
 
     def __exit__(self, *exc: Any) -> None:
         self.stop()
+
+
+_npm_ready = False
+
+
+def _ensure_node_modules() -> None:
+    """每个测试会话最多一次：node_modules 缺失或比 package-lock 旧时跑 ``npm ci``。"""
+    global _npm_ready
+    if _npm_ready:
+        return
+    need_tools("node", "npm")
+    stamp = ZCLIENT_DIR / "node_modules" / ".package-lock.json"
+    lock = ZCLIENT_DIR / "package-lock.json"
+    if not stamp.exists() or stamp.stat().st_mtime < lock.stat().st_mtime:
+        r = subprocess.run(["npm", "ci", "--no-audit", "--no-fund"], cwd=ZCLIENT_DIR,
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            pytest.fail(f"npm ci failed:\n{r.stdout}\n{r.stderr}")
+    _npm_ready = True
+
+
+class NodeClient:
+    """以子进程运行 tests/zmodem_client/zclient.mjs；stderr 出现 ready 行即已订阅。"""
+
+    def __init__(self, ws_url: str, port: str, *, send: Optional[list[str]] = None,
+                 recv_dir: Optional[str] = None,
+                 close_after_bytes: Optional[int] = None) -> None:
+        self.cmd = ["node", str(ZCLIENT_DIR / "zclient.mjs"), "--ws", ws_url, "--port", port]
+        if send:
+            self.cmd += ["--send", *map(str, send)]
+        if recv_dir is not None:
+            self.cmd += ["--recv-dir", str(recv_dir)]
+        if close_after_bytes is not None:
+            self.cmd += ["--close-after-bytes", str(close_after_bytes)]
+        self.proc: Optional[subprocess.Popen] = None
+        self.stderr: list[str] = []
+        self._ready = threading.Event()
+        self._reader: Optional[threading.Thread] = None
+
+    def start(self, ready_timeout: float = 10.0) -> "NodeClient":
+        _ensure_node_modules()
+        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True, encoding="utf-8")
+        self._reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self._reader.start()
+        if not self._ready.wait(ready_timeout):
+            self.stop()
+            raise RuntimeError(f"zclient not ready: {self.stderr}")
+        return self
+
+    def _read_stderr(self) -> None:
+        assert self.proc and self.proc.stderr
+        for line in self.proc.stderr:
+            self.stderr.append(line.rstrip("\n"))
+            if '"ready":true' in line:
+                self._ready.set()
+
+    def result(self, timeout: float = 25.0) -> dict[str, Any]:
+        """等进程退出并解析 stdout 的 JSON 结果行（附 ``rc``）。"""
+        assert self.proc and self.proc.stdout
+        try:
+            out = self.proc.stdout.read() if self.proc.wait(timeout) is not None else ""
+        except subprocess.TimeoutExpired:
+            self.stop()
+            raise AssertionError(f"zclient timed out; stderr={self.stderr}")
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        res = json.loads(lines[-1]) if lines else {"ok": False, "error": "no output"}
+        res["rc"] = self.proc.returncode
+        return res
+
+    def stop(self) -> None:
+        if self.proc:
+            _terminate(self.proc)
+            if self._reader:
+                self._reader.join(3)  # 进程已退出 → stderr EOF，读线程随之结束
+            for f in (self.proc.stdout, self.proc.stderr):
+                if f:
+                    f.close()
+
+    def __enter__(self) -> "NodeClient":
+        return self.start()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.stop()
+
+
+def node_client(ws_url: str, port: str, **kw: Any) -> NodeClient:
+    """启动 zclient 并等它订阅完成；用作上下文管理器以保证进程被回收。"""
+    return NodeClient(ws_url, port, **kw)

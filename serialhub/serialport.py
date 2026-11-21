@@ -384,11 +384,13 @@ class SerialPortWorker(threading.Thread):
         try:
             with self._io_lock:
                 written = ser.write(data)
-                try:
-                    ser.flush()
-                except Exception as exc:  # flush 失败记录但不致命
-                    with self._state_lock:
-                        self._last_error = f"flush: {type(exc).__name__}: {exc}"
+            # flush（tcdrain）放在 _io_lock 外：它要等对端读走数据，若持锁等，读循环读不了，
+            # 正在发送的设备（lsz）写满缓冲后不再读输入 → tcdrain 永不返回（死锁）。
+            try:
+                ser.flush()
+            except Exception as exc:  # flush 失败记录但不致命
+                with self._state_lock:
+                    self._last_error = f"flush: {type(exc).__name__}: {exc}"
         except Exception as exc:
             with self._state_lock:
                 self._last_error = f"write: {type(exc).__name__}: {exc}"
