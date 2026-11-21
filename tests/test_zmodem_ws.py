@@ -149,3 +149,20 @@ def test_rest_send_during_session_is_json_409(app_hub) -> None:
     assert r.status_code == 409
     body = r.json()
     assert body["ok"] is False and "zmodem: session active" in body["error"]
+
+
+def test_end_with_tail_b64_reinjects_text(app_hub) -> None:
+    tc, hub = app_hub
+    with tc.websocket_connect("/ws") as ws:
+        _start(hub)
+        ws.send_json({"type": "zmodem_claim", "port": "z"})
+        sid = _recv_until(ws, "zmodem_claimed")["session"]
+        _recv_until(ws, "zmodem_data")
+        ws.send_json({"type": "zmodem_end", "port": "z", "session": sid, "abort": False,
+                      "tail_b64": _b64(b"sz done rc=0\r\n")})
+        assert _recv_until(ws, "zmodem_closed")["reason"] == "done"
+        ws.send_json({"type": "zmodem_end", "port": "z", "session": sid, "abort": False,
+                      "tail_b64": "%%%"})
+        assert "base64" in _recv_until(ws, "zmodem_error")["error"]
+    assert _until(lambda: "sz done rc=0" in [
+        ln["text"] for ln in hub.read("z", kinds={"rx"})["lines"]])

@@ -24,6 +24,9 @@ ZMODEM（``pc.zmodem``，默认开）：读到的字节先过 :class:`~serialhub
 不广播。每轮读循环检查认领/空闲超时；会话结束（含超时、关口、断线）后回到行模式。
 非 ``done`` 结束后先“排空”：丢弃读到的字节（检测器也停用），直到连续
 ``DRAIN_SILENCE_MS`` 无数据或总计 ``DRAIN_MAX_MS``，再以干净的行缓冲/解码器恢复。
+``done`` 结束时，客户端交回的会话外尾巴（``tail``，如 lsz 的 ``OO`` 之后设备打印的
+``sz done``/提示符）与会话队列里还没送出的字节按此顺序重新注入读循环，当作 rx 断行，
+再接实时字节；注入只在读循环线程里处理，并在 end 标记写入之后才放行。
 会话进行中读循环只读 ``in_waiting`` 字节、不在 ``_io_lock`` 下阻塞，owner 的写不被饿死。
 会话期间普通 :meth:`SerialPortWorker.write` 被拒绝，只有会话 owner 经
 :meth:`SerialPortWorker.zmodem_write` 写原始字节。``_zm_lock`` 是叶子锁：持有期间
@@ -127,6 +130,10 @@ class SerialPortWorker(threading.Thread):
         # 非 done 结束后的排空状态：开始时刻 / 最近一次读到字节的时刻（None = 不在排空）。
         self._zm_drain_started: Optional[int] = None
         self._zm_drain_last_rx: int = 0
+        # done 结束后回注入行模式的字节（tail → 队列残余 → 期间读到的实时字节），只由读循环取走；
+        # _zm_inject_hold 为真时（end 标记尚未写入）读到的字节也先追加到这里，保证顺序。
+        self._zm_inject = bytearray()
+        self._zm_inject_hold = False
 
     # ---- 属性 ----
     @property
@@ -540,6 +547,8 @@ class SerialPortWorker(threading.Thread):
                         buf.clear()
                         residual_since = None
                         self._decoder.reset()  # (重)连接：丢弃上一个连接的半字符状态
+                        with self._zm_lock:
+                            self._zm_inject.clear()  # 上一个连接的回注字节作废
                     else:
                         with self._state_lock:
                             self._reconnect_count += 1
@@ -561,7 +570,7 @@ class SerialPortWorker(threading.Thread):
                     continue
 
                 now = now_ms()
-                if data:
+                if data or self._zm_inject_ready():
                     text, detection = self._zm_split(data)
                 else:
                     # 读超时（空读）：释放检测器留住的头前缀，普通文本最多迟一轮。
@@ -661,11 +670,14 @@ class SerialPortWorker(threading.Thread):
         *,
         abort: bool = False,
         reason: str = "done",
+        tail: bytes = b"",
     ) -> dict:
         """结束会话（幂等）：返回结束摘要 ``{"port","session","reason","rx_bytes","tx_bytes"}``。
 
         ``client_id`` 非 None 且会话已被别人认领 → RuntimeError。会话已结束：若正是最近
         结束的那个则返回同一摘要，否则返回 ``reason=None`` 的空摘要（不抛）。
+        ``reason="done"`` 且非 ``abort`` 时，``tail``（客户端收到的会话外字节）与队列里尚未
+        送出的字节依次回注行模式（见模块说明）；其余情况忽略 ``tail``。
         """
         if reason not in END_REASONS:
             raise ValueError(
@@ -678,7 +690,26 @@ class SerialPortWorker(threading.Thread):
             if client_id is not None and s.owner is not None and s.owner != client_id:
                 raise RuntimeError("zmodem: claimed by another client")
             summary = self._zm_detach_locked(s, reason)  # 校验与摘除同一临界区
+            if reason == "done" and not abort:
+                self._zm_stage_inject_locked(s, bytes(tail))
         return self._zm_after_end(s, summary, abort=abort)
+
+    def _zm_stage_inject_locked(self, session: ZmodemSession, tail: bytes) -> None:
+        """（持 ``_zm_lock``，会话刚摘除）把 tail + 队列残余放进回注区，并暂扣到 end 标记写入后。
+
+        从队列取走的字节不会再被转发（随后放入的 None 让转发方停止），因此不会重复投递。
+        """
+        self._zm_inject.extend(tail)
+        while True:
+            try:
+                item = session.queue.get_nowait()
+            except queue.Empty:
+                break
+            if item:
+                self._zm_inject.extend(item)
+        self._zm_inject.extend(session.pending)
+        session.pending.clear()
+        self._zm_inject_hold = True
 
     def _zm_require_owner(self, session_id: str, client_id: str) -> None:
         with self._zm_lock:
@@ -689,34 +720,44 @@ class SerialPortWorker(threading.Thread):
                 raise RuntimeError("zmodem: claimed by another client")
 
     def _zm_split(self, data: bytes) -> tuple[bytes, Optional[Detection]]:
-        """读到的字节分流：会话中 → 全部进会话；排空中 → 丢弃；否则过检测器。"""
-        if self._zm_feed_session(data):
-            return b"", None
+        """读到的字节分流：会话中 → 全部进会话；回注暂扣中 → 追加到回注区；排空中 → 丢弃；
+        否则（回注字节在前）过检测器。
+
+        会话判定、回注取用与排空判定在同一 ``_zm_lock`` 临界区：读到的字节与 end 的摘除/回注
+        之间只有一种先后。
+        """
         with self._zm_lock:
+            s = self._zm_session
+            if s is not None:
+                if data:
+                    s.rx_bytes += len(data)
+                    s.last_activity_ms = now_ms()
+                    if s.owner is None:
+                        s.pending.extend(data)
+                    else:
+                        s.queue.put_nowait(bytes(data))  # 无界队列不阻塞；与回放/哨兵保序
+                return b"", None
+            if self._zm_inject_hold:
+                self._zm_inject.extend(data)  # end 标记写入前：先排在回注字节之后
+                return b"", None
+            if self._zm_inject:
+                data = bytes(self._zm_inject) + bytes(data)
+                self._zm_inject.clear()
             if self._zm_drain_started is not None:
-                self._zm_drain_last_rx = now_ms()
+                if data:
+                    self._zm_drain_last_rx = now_ms()
                 return b"", None  # 会话残余负载：绝不进环
             enabled = self._zm_enabled
+        if not data:
+            return b"", None
         if not enabled:
             return data, None
         return self._zm_detector.feed(data)
 
-    def _zm_feed_session(self, data: bytes) -> bool:
-        """会话进行中则把 ``data`` 交给会话（认领前进 pending）并返回 True。
-
-        在 ``_zm_lock`` 下入队（无界队列不阻塞），保证与认领回放、结束哨兵的先后顺序。
-        """
+    def _zm_inject_ready(self) -> bool:
+        """有待回注、且已放行的字节（读循环空读时也要处理）。"""
         with self._zm_lock:
-            s = self._zm_session
-            if s is None:
-                return False
-            s.rx_bytes += len(data)
-            s.last_activity_ms = now_ms()
-            if s.owner is None:
-                s.pending.extend(data)
-            else:
-                s.queue.put_nowait(bytes(data))
-            return True
+            return bool(self._zm_inject) and not self._zm_inject_hold
 
     def _zm_begin(self, detection: Detection) -> None:
         """开启会话：``initial``（头及其后字节）进 pending，写 start 标记并广播 start 事件。"""
@@ -806,12 +847,16 @@ class SerialPortWorker(threading.Thread):
             except Exception:  # noqa: BLE001 - 写失败已由 _write_raw 记入 last_error 并广播
                 pass
         session.queue.put_nowait(None)
-        self._hub.mark(
-            session.port,
-            f"[zmodem] end reason={summary['reason']} "
-            f"rx={summary['rx_bytes']} tx={summary['tx_bytes']}",
-        )
-        self._hub._broadcast({"type": "zmodem", "event": "end", **summary})
+        try:
+            self._hub.mark(
+                session.port,
+                f"[zmodem] end reason={summary['reason']} "
+                f"rx={summary['rx_bytes']} tx={summary['tx_bytes']}",
+            )
+            self._hub._broadcast({"type": "zmodem", "event": "end", **summary})
+        finally:
+            with self._zm_lock:
+                self._zm_inject_hold = False  # end 标记已在环里：放行回注字节
         return dict(summary)
 
     def _drain_residual(self, buf: bytearray) -> None:

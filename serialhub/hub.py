@@ -585,10 +585,15 @@ class Hub:
         *,
         abort: bool = False,
         reason: str = "done",
+        tail: bytes = b"",
     ) -> dict:
-        """结束会话（幂等）；``abort=True`` 先向设备写 ``ABORT_SEQ``。返回结束摘要。"""
+        """结束会话（幂等）；``abort=True`` 先向设备写 ``ABORT_SEQ``。返回结束摘要。
+
+        ``done`` 且非 abort 时，``tail``（客户端收到的会话外字节）→ 队列中未送出的字节 → 实时字节
+        依次回到行模式（作为 rx 断行，排在 end 标记之后）；其余情况忽略 ``tail``。
+        """
         return self._require_worker(name).zmodem_end(
-            session_id, client_id, abort=abort, reason=reason
+            session_id, client_id, abort=abort, reason=reason, tail=tail
         )
 
     # ---- 供 worker / 桥使用 ----

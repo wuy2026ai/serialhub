@@ -506,12 +506,16 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
                 await _zm_error(port, exc)
 
-        async def _zm_end(port: Any, sid: Any, abort: bool) -> None:
+        async def _zm_end(port: Any, sid: Any, abort: bool, tail_b64: Any) -> None:
             try:
+                # tail：客户端收到的会话外字节（lsz 的 OO 之后设备打印的内容），只在非 abort 时回注
+                tail = b"" if abort else base64.b64decode(str(tail_b64 or ""), validate=True)
                 await asyncio.to_thread(
                     hub.zmodem_end, port, str(sid), client_id,
-                    abort=abort, reason="abort" if abort else "done",
+                    abort=abort, reason="abort" if abort else "done", tail=tail,
                 )
+            except binascii.Error as exc:
+                await _zm_error(port, ValueError(f"zmodem: bad base64: {exc}"))
             except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
                 await _zm_error(port, exc)
 
@@ -551,7 +555,8 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             elif mtype == "zmodem_write":
                 await _zm_write(msg.get("port"), msg.get("session"), msg.get("b64"))
             elif mtype == "zmodem_end":
-                await _zm_end(msg.get("port"), msg.get("session"), bool(msg.get("abort")))
+                await _zm_end(msg.get("port"), msg.get("session"), bool(msg.get("abort")),
+                              msg.get("tail_b64"))
 
         pump_task = asyncio.create_task(_pump())
         try:

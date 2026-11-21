@@ -135,6 +135,24 @@ def _lines(srv, port: str) -> list[dict]:
     return r["lines"]
 
 
+def _assert_clean_session(srv, port: str, direction: str, done_line: str) -> list[dict]:
+    """start/end(done) 标记之间没有 rx 行；设备的 ``done_line`` 作为 rx 行出现在 end 标记之后。"""
+    deadline = time.time() + 5
+    while True:
+        lines = _lines(srv, port)
+        marks = [ln for ln in lines if ln["kind"] == "mark"]
+        start = next(m for m in marks if m["text"] == f"[zmodem] start {direction}")
+        end = next(m for m in marks if m["text"].startswith("[zmodem] end reason=done"))
+        after = [ln["text"] for ln in lines if ln["kind"] == "rx" and ln["seq"] > end["seq"]]
+        if done_line in after or time.time() > deadline:
+            break
+        time.sleep(0.1)
+    assert done_line in after, after
+    inside = [ln for ln in lines if ln["kind"] == "rx" and start["seq"] < ln["seq"] < end["seq"]]
+    assert inside == []
+    return lines
+
+
 def test_download_1mib_random(tmp_path):
     with _sim(tmp_path) as env:
         srv, data = env["srv"], _blob(env["files"])
@@ -147,13 +165,7 @@ def test_download_1mib_random(tmp_path):
         assert res["files"] == [{"name": "blob.bin", "size": BLOB}]
         assert (out / "blob.bin").read_bytes() == data
 
-        lines = _lines(srv, "a")
-        marks = [ln for ln in lines if ln["kind"] == "mark"]
-        start = next(m for m in marks if m["text"] == "[zmodem] start download")
-        end = next(m for m in marks if m["text"].startswith("[zmodem] end reason=done"))
-        inside = [ln for ln in lines
-                  if ln["kind"] == "rx" and start["seq"] < ln["seq"] < end["seq"]]
-        assert inside == []
+        lines = _assert_clean_session(srv, "a", "download", "sz done rc=0")
         for ln in lines:  # 没有任何负载字节漏进环形缓冲
             assert "\x18" not in ln["text"] and "�" not in ln["text"], ln
 
@@ -176,7 +188,7 @@ def test_upload_files(tmp_path):
             res = zc.result()
         assert res["ok"] and res["rc"] == 0, res
         assert sorted(f["name"] for f in res["files"]) == sorted(blobs)
-        _wait_line(srv, "a", r"^rz done rc=0$", 5)
+        _assert_clean_session(srv, "a", "upload", "rz done rc=0")
         for name, data in blobs.items():
             assert (env["recv"] / name).read_bytes() == data, name
 

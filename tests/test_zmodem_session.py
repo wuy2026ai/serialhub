@@ -175,10 +175,11 @@ def test_end_is_idempotent_and_resumes_line_mode(zhub) -> None:
     sub = zhub.subscribe()
     _start(zhub)
     sid, q = zhub.zmodem_claim("z", "tab-1")
+    assert q.get(timeout=POLL_TIMEOUT) == ZRQINIT  # 回放的 pending 已送出
     first = zhub.zmodem_end("z", sid, "tab-1")
     assert first["reason"] == "done"
     assert zhub.zmodem_end("z", sid, "tab-1") == first
-    assert _drain(q, timeout=1.0) == ZRQINIT  # 队列以 None 结尾
+    assert _drain(q, timeout=1.0) == b""  # 队列以 None 结尾
     assert zhub.zmodem_status("z")["active"] is False
     ends = [e for e in _until(lambda: _zm_events(sub) or None) if e["event"] == "end"]
     assert ends == [{
@@ -425,3 +426,53 @@ def test_flush_runs_outside_io_lock(zhub) -> None:
     zhub.zmodem_write("z", sid, "tab-1", b"x")
     zhub.zmodem_end("z", sid, "tab-1", abort=True, reason="abort")
     assert held and not any(held)
+
+
+def _rx_after_end_mark(hub) -> list[str]:
+    lines = hub.read("z")["lines"]
+    end = next(i for i, ln in enumerate(lines)
+               if ln["kind"] == "mark" and ln["text"].startswith("[zmodem] end"))
+    return [ln["text"] for ln in lines[end + 1:] if ln["kind"] == "rx"]
+
+
+def test_done_end_reinjects_tail_then_queue_then_live(zhub) -> None:
+    """done：客户端交回的 tail → 队列里未送出的字节 → 实时字节，依次作为 rx 行排在 end 标记之后。"""
+    _start(zhub)
+    sid, q = zhub.zmodem_claim("z", "tab-1")
+    assert q.get(timeout=POLL_TIMEOUT) == ZRQINIT
+    _device_sends(zhub, b"queued\n")  # 进队列但没人取走
+    assert _until(lambda: zhub.zmodem_status("z")["rx_bytes"] > len(ZRQINIT))
+    _until(lambda: q.qsize() > 0)
+    zhub.zmodem_end("z", sid, "tab-1", tail=b"sz done rc=0\r\nprom")  # 半行：与队列字节拼接
+    assert _drain(q, timeout=0.5) == b""  # 已回注的字节不再经队列转发
+    zhub.write_bytes("z", b"live\n")
+    assert _until(lambda: _rx_after_end_mark(zhub) == ["sz done rc=0", "promqueued", "live"])
+    assert _lines(zhub, {"rx"})[:1] == ["rz"]  # 会话前的行不受影响
+
+
+def test_tail_ignored_on_abort(zhub) -> None:
+    _start(zhub)
+    sid, _ = zhub.zmodem_claim("z", "tab-1")
+    zhub.zmodem_end("z", sid, "tab-1", abort=True, reason="abort", tail=b"tail-line\n")
+    assert _drain_over(zhub)
+    zhub.write_bytes("z", b"after\n")
+    assert _until(lambda: "after" in _lines(zhub, {"rx"}))
+    assert "tail-line" not in _lines(zhub, {"rx"})
+
+
+def test_bytes_read_before_end_mark_wait_behind_reinjected(zhub, monkeypatch) -> None:
+    """摘除会话到写入 end 标记之间读到的实时字节：不抢在 end 标记/回注字节之前成行。"""
+    _start(zhub)
+    sid, q = zhub.zmodem_claim("z", "tab-1")
+    assert q.get(timeout=POLL_TIMEOUT) == ZRQINIT
+    real_mark = zhub.mark
+
+    def slow_mark(port, label):
+        if label.startswith("[zmodem] end"):
+            _device_sends(zhub, b"during\n")
+            time.sleep(0.3)  # 读循环此间已读到 during
+        return real_mark(port, label)
+
+    monkeypatch.setattr(zhub, "mark", slow_mark)
+    zhub.zmodem_end("z", sid, "tab-1", tail=b"tail\n")
+    assert _until(lambda: _rx_after_end_mark(zhub) == ["tail", "during"])

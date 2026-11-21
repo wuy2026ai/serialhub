@@ -7,7 +7,8 @@
 // Waits for the {"type":"zmodem","event":"start"} broadcast for NAME, claims the
 // session, feeds the relayed bytes to Zmodem.Sentry, accepts every offer
 // (download, --recv-dir) or sends the given files (upload, --send), then sends
-// zmodem_end and waits for zmodem_closed.
+// zmodem_end (with the post-session bytes as tail_b64) and waits for
+// zmodem_closed.
 //
 // stderr: {"ready":true} once subscribed (start the device transfer after it).
 // stdout: exactly one JSON line {"ok":bool,"files":[{"name","size"}],"error"}.
@@ -18,30 +19,18 @@ import { Buffer } from "node:buffer";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import Zmodem from "zmodem.js";
+import { applyLrzszShim } from "./zmodem-shim.mjs";
 
 const CHUNK = 8192;
 
-// lrzsz compatibility shim for zmodem.js 0.1.10 (receive side).
-// lsz ends the *first* ZDATA subpacket of every file with ZCRCW (frame end, ACK
-// expected) and then waits for ZACK before sending a fresh ZDATA header.
-// zmodem.js only ACKs ZCRCQ and only accepts ZEOF after a ZDATA frame, so the
-// download stalls after 1024 bytes. Send the ZACK and accept the next ZDATA.
-// The browser UI (Task 4) needs the same shim.
-{
-  const Receive = Zmodem.Session.Receive.prototype;
-  const consumeData = Receive._consume_ZDATA_data;
-  Receive._consume_ZDATA_data = function (subpacket) {
-    consumeData.call(this, subpacket);
-    if (!(subpacket.ack_expected() && subpacket.frame_end())) return;
-    this._send_header("ZACK", Zmodem.ENCODELIB.pack_u32_le(this._file_offset));
-    const handlers = this._next_header_handler; // { ZEOF } installed by accept()
-    handlers.ZDATA = function (hdr) {
-      this._consume_ZDATA(hdr);
-      this._next_subpacket_handler = this._consume_ZDATA_data;
-      this._next_header_handler = handlers;
-    };
-  };
-}
+// lsz download fix for zmodem.js 0.1.10; see zmodem-shim.mjs.
+applyLrzszShim(Zmodem);
+
+// After zmodem.js reports session_end, keep feeding the Sentry this long and
+// collect what it hands to to_terminal (device output after lsz's "OO", e.g.
+// "sz done rc=0" or the prompt); it goes back to the hub as zmodem_end.tail_b64
+// so the hub can put it into the ring buffer. The browser UI must do the same.
+const TAIL_MS = 200;
 
 function parseArgs(argv) {
   const opts = { send: [] };
@@ -74,6 +63,7 @@ let sessionId = null;
 let zmEnded = false; // zmodem.js reported session_end
 let finished = false;
 let rxBytes = 0;
+const tail = []; // to_terminal bytes after session_end
 
 const ws = new WebSocket(opts.ws);
 
@@ -91,7 +81,9 @@ function finish(ok, error = null) {
 }
 
 function endSession(abort) {
-  send({ type: "zmodem_end", port: opts.port, session: sessionId, abort });
+  const msg = { type: "zmodem_end", port: opts.port, session: sessionId, abort };
+  if (!abort && tail.length) msg.tail_b64 = Buffer.from(tail).toString("base64");
+  send(msg);
 }
 
 function fail(err) {
@@ -139,7 +131,9 @@ async function upload(zsession) {
 
 function startSentry() {
   return new Zmodem.Sentry({
-    to_terminal: () => {},
+    to_terminal: (octets) => {
+      if (zmEnded) for (const b of octets) tail.push(b);
+    },
     on_retract: () => {},
     sender: (octets) =>
       send({
@@ -149,8 +143,9 @@ function startSentry() {
     on_detect: (detection) => {
       const zsession = detection.confirm();
       zsession.on("session_end", () => {
+        if (zsession.aborted()) return fail("zmodem session aborted");
         zmEnded = true;
-        endSession(false);
+        setTimeout(() => endSession(false), TAIL_MS);
       });
       if (zsession.type === "receive") {
         if (!opts.recvDir) return fail("device offered files but --send was given");
