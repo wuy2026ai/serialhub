@@ -79,6 +79,10 @@ _ABORT_DRAIN_S = 1.0
 PENDING_MAX_CHARS = 240
 #: 计算 pending 时最多看残行缓冲末尾这么多字节（超长残行不必整段解码）。
 _PENDING_WINDOW = 1024
+#: 无 EOL 残行缓冲的字节上限（§16）：超过就按上限切成自己的行吐出，防止一个失控
+#: 设备（如狂打日志不含换行）把残行拖成兆级——每次 read 的 EOL 续扫与 pending 解码
+#: 都随残行线性增长。配置的 ``buffer_bytes`` 更小时用它。
+RESIDUAL_MAX_BYTES = 64 * 1024
 
 #: 允许被引脚 API 操作的引脚（DTR/RTS）。
 _PIN_NAMES = ("dtr", "rts")
@@ -121,6 +125,15 @@ class SerialPortWorker(threading.Thread):
         # 最近一次发布的 pending（未结束尾巴）：(残行长度, 末尾窗口字节) 与文本，只由读循环线程使用。
         self._pending_key: tuple = (0, b"")
         self._pending_text: str = ""
+        # 残行缓冲的 EOL 续扫游标（字节）：buf[:_eol_scanned] 已确认无 EOL（结尾孤立 \r 除外），
+        # 每次 read 只扫新增部分——一条无换行的长残行不再每次全量重扫。
+        self._eol_scanned: int = 0
+        # 无 EOL 残行的字节上限（buffer_bytes 与 64 KiB 的较小者）。
+        self._residual_max: int = min(int(getattr(pc, "buffer_bytes", 0) or 0)
+                                      or RESIDUAL_MAX_BYTES, RESIDUAL_MAX_BYTES)
+        # 本次 read 等待的时间上限（秒，None = 用读超时）：idle 时间片有残行待吐时，
+        # 读循环的 select/阻塞读只睡到"下一次吐出"为止（§16）。
+        self._read_wait_cap: Optional[float] = None
         self._encoding: str = getattr(pc, "encoding", None) or "utf-8"
         self._flush_ms: int = max(0, int(getattr(pc, "flush_ms", 50)))
         # 断帧策略：默认 "line"（只按 EOL 分行）；"idle" 才启用 flush_ms 时间片分帧。
@@ -379,6 +392,8 @@ class SerialPortWorker(threading.Thread):
             self._uses_match = bool(getattr(pc, "match", None))
             self._pins = normalize_pins(getattr(pc, "pins", None), strict=False)
             self._pin_initial = self._resolve_initial(pc)
+            self._residual_max = min(int(getattr(pc, "buffer_bytes", 0) or 0)
+                                     or RESIDUAL_MAX_BYTES, RESIDUAL_MAX_BYTES)
         with self._zm_lock:
             self._zm_enabled = bool(getattr(pc, "zmodem", True))
             self._zm_claim_ms = int(getattr(pc, "zmodem_claim_ms", 5000))
@@ -611,7 +626,7 @@ class SerialPortWorker(threading.Thread):
                 if not self.is_open:
                     if self._try_connect():
                         backoff = max(1, int(self._pc.reconnect_ms))
-                        buf.clear()
+                        self._clear_residual(buf)
                         residual_since = None
                         self._decoder.reset()  # (重)连接：丢弃上一个连接的半字符状态
                     else:
@@ -621,12 +636,20 @@ class SerialPortWorker(threading.Thread):
                         backoff = min(backoff * 2, backoff_max)
                         continue
 
+                # idle 时间片有残行待吐时，读等待只睡到"下一次吐出"为止：残行不再
+                # 等满一个读超时（~100 ms）才被检查（§16，p50 109 ms → ≈ flush_ms）。
+                self._read_wait_cap = None
+                if (self._framing == "idle" and self._flush_ms > 0
+                        and residual_since is not None and buf):
+                    self._read_wait_cap = max(
+                        0.0, (residual_since + self._flush_ms - now_ms()) / 1000.0)
+
                 data = self._read_once()
                 if data is None:
                     self._zm_end_current("closed", abort=False)  # 串口已断，无法再写中止串
                     buf.extend(self._zm_detector.flush())
                     self._flush_line_residual(buf)  # line 模式：断开前吐出残行
-                    buf.clear()
+                    self._clear_residual(buf)
                     residual_since = None
                     self._publish_pending(buf)
                     with self._state_lock:
@@ -651,7 +674,7 @@ class SerialPortWorker(threading.Thread):
                 self._zm_check_deadlines()
                 if self._zm_drain_done():
                     # 排空结束：以干净状态回到行模式（丢弃残行/半字符/留住的前缀）。
-                    buf.clear()
+                    self._clear_residual(buf)
                     residual_since = None
                     self._decoder.reset()
                     self._zm_detector.flush()
@@ -671,8 +694,13 @@ class SerialPortWorker(threading.Thread):
             # close()/stop() 退出循环：line 模式的残行（含检测器留住的字节）作为最后一行吐出。
             buf.extend(self._zm_detector.flush())
             self._flush_line_residual(buf)
-            buf.clear()
+            self._clear_residual(buf)
             self._publish_pending(buf)
+
+    def _clear_residual(self, buf: bytearray) -> None:
+        """丢弃残行缓冲（重连/断开/排空结束/退出），EOL 续扫游标一并归零。"""
+        buf.clear()
+        self._eol_scanned = 0
 
     def _publish_pending(self, buf: bytearray) -> None:
         """残行缓冲有变化时，把未结束尾巴（如提示符 ``=> ``）发布给 hub（§16）。
@@ -994,7 +1022,7 @@ class SerialPortWorker(threading.Thread):
     def _drain_residual(self, buf: bytearray) -> None:
         """把缓冲里的残行立即吐出（idle 时间片 / line 断开都复用它）。"""
         raw = bytes(buf)
-        buf.clear()
+        self._clear_residual(buf)
         if raw.endswith(b"\r"):
             raw = raw[:-1]  # 结尾孤立 \r 只是行结束符残留，不作为内容
         self._emit(raw)
@@ -1021,9 +1049,13 @@ class SerialPortWorker(threading.Thread):
         try:
             sock = getattr(ser, "_socket", None)  # pyserial socket:// 实现才有
             if sock is not None and getattr(ser, "is_open", False):
-                # 会话中不阻塞（timeout=0），否则沿用端口读超时；空闲等待在锁外（§16）。
+                # 会话中不阻塞（timeout=0），否则沿用端口读超时（idle 吐出时间更早则提前醒）；
+                # 空闲等待在锁外（§16）。
+                wait = ser.timeout or 0
+                if self._read_wait_cap is not None:
+                    wait = max(0.0, min(wait, self._read_wait_cap))
                 data: bytes = self._read_socket(
-                    ser, sock, 0 if active else (ser.timeout or 0), self._io_lock
+                    ser, sock, 0 if active else wait, self._io_lock
                 )
             elif active:
                 with self._io_lock:
@@ -1054,10 +1086,14 @@ class SerialPortWorker(threading.Thread):
         - 无 ``fd``（Windows、``loop://``、``rfc2217://`` 等）：锁外阻塞读 1 字节（至多读超时，
           首字节到达即返回），再在锁内取走 ``in_waiting`` 的其余字节。
 
+        两条路的等待上限都会被 :attr:`_read_wait_cap` 进一步压短（idle 时间片到期前醒来吐残行）。
         pyserial 的 ``read(4096)`` 会一直累积到 4096 字节或读超时（0.1 s）才返回，且旧实现
         全程持锁：RX 平均晚 ~50 ms、写入也要排队等它。
         """
         timeout = ser.timeout if ser.timeout is not None else 0.1
+        cap = self._read_wait_cap
+        if cap is not None:
+            timeout = max(0.0, min(timeout, cap))
         fd = getattr(ser, "fd", None)
         if isinstance(fd, int) and not isinstance(fd, bool) and fd >= 0:
             try:
@@ -1069,7 +1105,13 @@ class SerialPortWorker(threading.Thread):
             with self._io_lock:
                 waiting = ser.in_waiting
                 return ser.read(waiting if waiting else 1)
-        first = ser.read(1)
+        base = ser.timeout
+        if timeout < (base if base is not None else 0.1):
+            ser.timeout = timeout  # read(1) 只认 ser.timeout：临时压短，读完即恢复
+        try:
+            first = ser.read(1)
+        finally:
+            ser.timeout = base
         if not first:
             return b""
         with self._io_lock:
@@ -1112,12 +1154,20 @@ class SerialPortWorker(threading.Thread):
         """吐出缓冲里的全部整行（规则同 :func:`_find_eol`），最后一次性删掉已消费的前缀。
 
         用 ``bytearray.find`` 定位 ``\n``/``\r``（C 实现）并缓存下一处位置，一大段突发数据
-        （2000 行）不必逐字节 Python 循环、也不必每行搬动缓冲。
+        （2000 行）不必逐字节 Python 循环、也不必每行搬动缓冲。EOL 搜索从上次已扫过的长度
+        （:attr:`_eol_scanned`）续起：一条没有换行的长残行（MiB 级无换行日志）不再每次
+        read 全量重扫。无 EOL 残行超过 :attr:`_residual_max`（``buffer_bytes`` 与 64 KiB 的
+        较小者）时按上限切成自己的行吐出，残行缓冲有界。
         """
-        pos = 0
         size = len(buf)
-        nl = buf.find(b"\n")
-        nc = buf.find(b"\r")
+        if size <= self._eol_scanned:
+            return  # 没有新字节：上次已扫过（结尾孤立 \r 仍不可判定，维持现状）
+        pos = 0
+        start = self._eol_scanned
+        if start and buf[start - 1] == _CR:
+            start -= 1  # 上次结尾的孤立 \r：可能与新到的 \n 成对，重新考虑
+        nl = buf.find(b"\n", start)
+        nc = buf.find(b"\r", start)
         try:
             while nl >= 0 or nc >= 0:
                 if nc < 0 or 0 <= nl < nc:
@@ -1136,6 +1186,11 @@ class SerialPortWorker(threading.Thread):
         finally:
             if pos:
                 del buf[:pos]
+            self._eol_scanned = len(buf)
+            while len(buf) >= self._residual_max:  # 无 EOL 残行有界：按上限切成自己的行
+                self._emit(bytes(buf[:self._residual_max]))
+                del buf[:self._residual_max]
+                self._eol_scanned = len(buf)
 
     def _emit(self, raw: bytes) -> None:
         """增量解码后入环（kind=rx）。

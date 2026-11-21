@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import queue
 import re
@@ -46,6 +47,90 @@ _IO_FIELDS = (
 _EXCHANGE_TIMEOUT_MS = 10000
 _EXCHANGE_LIMIT = 500
 
+
+class _LoopWake:
+    """事件循环里的等待者被读线程唤醒（§16）：``notify`` 经 ``call_soon_threadsafe``
+    投递**一次**唤醒（已投递未消费时不重复），等待者醒来后先 ``rearm`` 再取事件，
+    期间新入队的事件一定会再投递一次。"""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._event = asyncio.Event()
+        self._armed = threading.Event()
+
+    def notify(self) -> None:
+        if not self._armed.is_set():
+            self._armed.set()
+            try:
+                self._loop.call_soon_threadsafe(self._event.set)
+            except RuntimeError:  # 事件循环已关闭
+                pass
+
+    def rearm(self) -> None:
+        self._event.clear()
+        self._armed.clear()
+
+    async def wait(self, timeout: float) -> bool:
+        """等到下一次唤醒（True）或超时（False）。"""
+        if timeout <= 0:
+            return False
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+
+class _ExchangeState:
+    """``exchange`` 的收集状态（同步 ``queue.get`` 与事件循环两种驱动共用，§16）。"""
+
+    __slots__ = ("pat", "prompt", "text_sent", "echo", "seen", "last_text",
+                 "tail", "tail_fresh", "reason", "match_seq")
+
+    def __init__(self, pat: Any, prompt: Any, text_sent: str, cursor: int) -> None:
+        self.pat = pat
+        self.prompt = prompt
+        self.text_sent = text_sent
+        self.echo = bool(text_sent.strip())
+        self.seen = cursor
+        self.last_text: Optional[str] = None
+        self.tail = ""
+        self.tail_fresh = False
+        self.reason: Optional[str] = None
+        self.match_seq: Optional[int] = None
+
+    def on_line(self, line: dict) -> None:
+        if line.get("kind") != "rx" or line["seq"] <= self.seen:
+            return
+        self.seen = line["seq"]
+        text = str(line.get("text") or "")
+        if self.echo and _is_echo(text, self.text_sent):
+            self.echo = False  # 回显行：不参与匹配（仍会出现在 lines 里）
+            return
+        self.last_text = text
+        if self.pat is not None and self.pat.search(strip_ansi(text)) is not None:
+            self.reason, self.match_seq = "regex", line["seq"]
+
+    def on_partial(self, text: str) -> None:
+        self.tail = text
+        self.tail_fresh = True
+        # 半截回显不是回复：回显行整行见到之前，回显样的尾巴不参与匹配
+        if (self.pat is not None and self.tail
+                and not self._echo_like() and self.pat.search(self.tail)):
+            self.reason = "regex"
+
+    def _echo_like(self) -> bool:
+        return self.echo and _echo_pending_tail(self.tail, self.text_sent)
+
+    def check_prompt(self) -> None:
+        """未给 wait_regex 且配了 prompt：尾巴（无尾巴时最后一行新 rx）命中提示符。"""
+        if self.prompt is None or self.reason is not None:
+            return
+        target = self.tail if (self.tail_fresh and self.tail) else self.last_text
+        if (target and self.prompt.search(strip_ansi(target)) is not None
+                and not (self.echo and _echo_pending_tail(target, self.text_sent))):
+            self.reason = "prompt"
+
 #: ``hub.set_pin`` 允许的动作。
 _PIN_ACTIONS = ("set", "pulse", "reset")
 
@@ -69,6 +154,33 @@ def _compile_user(pattern: Any, what: str) -> "re.Pattern[str]":
 def _is_echo(text: str, data: str) -> bool:
     """设备回显的命令本身（可带提示符前缀，如 ``root@x:~# cmd``）；与 lite send 同一规则。"""
     return bool(data) and strip_ansi(text).rstrip().endswith(data.rstrip())
+
+
+def _echo_pending_tail(tail: str, data: str) -> bool:
+    """未结束尾巴像是"设备正在回显 data"（§16）：可带提示符前缀、可能只到一半。
+
+    串口按字节到达，回显行经常分片：先 ``=> cat /proc/ver``、几毫秒后才是 ``sion\\r\\n``。
+    在回显行还没整行见到之前，这样的尾巴不参与 ``wait_regex``/``prompt`` 匹配，否则
+    出现在命令文本里的正则会在半截回显上提前命中。判据（与 :func:`_is_echo` 同源）：
+
+    a) 尾巴（去 ANSI）以 ``data`` 的一个非空前缀结尾——命令已回显到一半；
+    b) 去掉可选提示符前缀后的尾段（≥2 字符）被 ``data`` 开头/包含——回显被上一行的
+       EOL 切开，尾巴里是命令的中段。
+    """
+    if not data or not tail:
+        return False
+    t = strip_ansi(tail).rstrip()
+    d = data.rstrip()
+    if not t or not d:
+        return False
+    for n in range(min(len(t), len(d)), 0, -1):
+        if t.endswith(d[:n]):
+            return True
+    for i in range(len(t) - 1):
+        rest = t[i:]
+        if len(rest) >= 2 and (d.startswith(rest) or rest in d):
+            return True
+    return False
 
 
 def _parse_range(rng: Any) -> tuple[Optional[int], Optional[int]]:
@@ -461,6 +573,39 @@ class Hub:
         result["port"] = name
         return result
 
+    def _wait_feed(
+        self, name: str, event: dict, pat: "re.Pattern[str]", cursor: int
+    ) -> Optional[tuple[str, Any]]:
+        """一个广播事件过 ``wait_for`` 匹配器；命中返回 ``("line", line)``/``("pending", tail)``。"""
+        if event.get("port") != name:
+            return None
+        etype = event.get("type")
+        if etype == "partial":
+            tail = str(event.get("text") or "")
+            if tail and pat.search(tail) is not None:
+                return ("pending", tail)
+            return None
+        if etype != "line":
+            return None
+        line = event["line"]
+        if line["seq"] <= cursor:
+            return None
+        if pat.search(line["text"]) is not None:
+            return ("line", line)
+        return None
+
+    @staticmethod
+    def _closed_event(name: str, event: dict) -> bool:
+        """该事件是否宣告 ``name`` 口已关闭（close/拔出都会广播 ``open:false`` 的 status）。"""
+        return (event.get("type") == "status" and event.get("port") == name
+                and event.get("open") is False)
+
+    def _wait_miss(self, name: str, cursor: int) -> dict:
+        return self._add_pending(name, {
+            "port": name, "matched": False, "line": None, "seq": None, "ts_ms": None,
+            "from_seq": cursor,
+        })
+
     def wait_for(
         self,
         name: str,
@@ -475,6 +620,7 @@ class Hub:
         正则同时匹配该口的未结束尾巴（pending，§16，如无换行的 ``login: ``）：调用时已在的
         尾巴立即命中，等待中尾巴每次变化（``partial`` 事件）都重新匹配；尾巴命中时
         ``line``/``seq`` 为 None、``pending`` 为命中的文本。唤醒由读线程的广播驱动，不轮询。
+        口在等待途中被关闭/拔出时立即按未命中返回（不等到超时）。
         """
         buf = self._require_buffer(name)
         pat = _compile(regex)
@@ -488,6 +634,8 @@ class Hub:
             tail = self.pending(name)
             if tail and pat.search(tail) is not None:
                 return self._wait_pending_hit(name, tail, cursor)
+            if not self._require_worker(name).is_open:
+                return self._wait_miss(name, cursor)
             deadline = now_ms() + max(0, int(timeout_ms))
             while True:
                 remaining = deadline - now_ms()
@@ -497,27 +645,68 @@ class Hub:
                     event = q.get(timeout=remaining / 1000.0)
                 except queue.Empty:
                     break
-                if event.get("port") != name:
-                    continue
-                etype = event.get("type")
-                if etype == "partial":
-                    tail = str(event.get("text") or "")
-                    if tail and pat.search(tail) is not None:
-                        return self._wait_pending_hit(name, tail, cursor)
-                    continue
-                if etype != "line":
-                    continue
-                line = event["line"]
-                if line["seq"] <= cursor:
-                    continue
-                if pat.search(line["text"]) is not None:
-                    return self._wait_hit(name, line, cursor)
+                if self._closed_event(name, event):
+                    break
+                hit = self._wait_feed(name, event, pat, cursor)
+                if hit is not None:
+                    return self._wait_result(name, hit, cursor)
         finally:
             self.unsubscribe(q)
-        return self._add_pending(name, {
-            "port": name, "matched": False, "line": None, "seq": None, "ts_ms": None,
-            "from_seq": cursor,
-        })
+        return self._wait_miss(name, cursor)
+
+    async def wait_for_async(
+        self,
+        name: str,
+        regex: str,
+        *,
+        timeout_ms: int = 10000,
+        since_seq: Optional[int] = None,
+    ) -> dict:
+        """:meth:`wait_for` 的可等待版（§16）：等待挂在事件循环上（``_LoopWake``），
+        不占线程池；语义与阻塞版一致。"""
+        buf = self._require_buffer(name)
+        pat = _compile(regex)
+        cursor = since_seq if since_seq is not None else 0
+
+        wake = _LoopWake()
+        q = self.subscribe(notify=wake.notify)
+        try:
+            existing = buf.read(since_seq=cursor, regex=pat, limit=1)
+            if existing["lines"]:
+                return self._wait_hit(name, existing["lines"][0], cursor)
+            tail = self.pending(name)
+            if tail and pat.search(tail) is not None:
+                return self._wait_pending_hit(name, tail, cursor)
+            if not self._require_worker(name).is_open:
+                return self._wait_miss(name, cursor)
+            deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                woke = await wake.wait(remaining)
+                wake.rearm()
+                while True:  # 一次唤醒处理完已到的全部事件
+                    try:
+                        event = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if self._closed_event(name, event):
+                        return self._wait_miss(name, cursor)
+                    hit = self._wait_feed(name, event, pat, cursor)
+                    if hit is not None:
+                        return self._wait_result(name, hit, cursor)
+                if not woke:
+                    break  # 到点（已顺手取走期间到达的事件）
+        finally:
+            self.unsubscribe(q)
+        return self._wait_miss(name, cursor)
+
+    def _wait_result(self, name: str, hit: tuple[str, Any], cursor: int) -> dict:
+        kind, payload = hit
+        if kind == "line":
+            return self._wait_hit(name, payload, cursor)
+        return self._wait_pending_hit(name, payload, cursor)
 
     def exchange(
         self,
@@ -539,8 +728,11 @@ class Hub:
            → ``quiet``；写出后一个字节都没到时最多等 ``min(timeout_ms, reply_first_ms)``，再按 ``quiet``；
         d) ``timeout_ms``（缺省 10000）→ ``timeout``。
 
-        与 lite send 一样跳过命令回显的第一行（不参与匹配，仍在 ``lines`` 里）。返回
-        ``{"port","sent","sent_bytes","lines","count","has_more","pending","matched","reason",
+        与 lite send 一样跳过命令回显的第一行（不参与匹配，仍在 ``lines`` 里）；回显行整行
+        见到之前，像是"回显到一半"的未结束尾巴同样不参与 a)/b) 的匹配（:func:`_echo_pending_tail`），
+        否则出现在命令文本里的正则/提示符会在半截回显上提前命中。无回显设备不受影响。
+        口在收集途中被关闭/拔出 → 立即以 ``reason="closed"`` 返回（不再等到超时）。
+        返回 ``{"port","sent","sent_bytes","lines","count","has_more","pending","matched","reason",
         "next_seq","from_seq"}``；``lines`` 与 ``read`` 同形（只含 rx），至多 500 行。
         """
         worker = self._require_worker(name)
@@ -563,74 +755,140 @@ class Hub:
             sent = self.send(name, data, eol=eol)
             start = time.monotonic()
             deadline = start + timeout / 1000.0
-            state = {"echo": bool(text_sent.strip()), "seen": cursor, "last_text": None,
-                     "tail": "", "tail_fresh": False, "reason": None, "match_seq": None}
-
-            def on_line(line: dict) -> None:
-                if line.get("kind") != "rx" or line["seq"] <= state["seen"]:
-                    return
-                state["seen"] = line["seq"]
-                text = str(line.get("text") or "")
-                state["last_text"] = text
-                if state["echo"] and _is_echo(text, text_sent):
-                    state["echo"] = False
-                    return
-                if pat is not None and pat.search(strip_ansi(text)) is not None:
-                    state["reason"], state["match_seq"] = "regex", line["seq"]
+            state = _ExchangeState(pat, prompt, text_sent, cursor)
 
             # 给了更早的 since_seq：游标与写出之间已入环的行先过一遍（之后的行走事件）
             if since_seq is not None:
                 for line in buf.read(since_seq=cursor, kinds={"rx"})["lines"]:
-                    on_line(line)
-                    if state["reason"]:
+                    state.on_line(line)
+                    if state.reason:
                         break
-            while state["reason"] is None:
+            while state.reason is None:
                 now = time.monotonic()
-                wake = deadline
+                wake_at = deadline
                 if pat is None:  # 静默先于超时判定：首字节窗口 min(timeout, first) 到期按 quiet
                     rx, last = worker.rx_activity()
                     quiet_at = start + first if rx == rx0 else last + quiet
                     if now >= quiet_at:
-                        state["reason"] = "quiet"
+                        state.reason = "quiet"
                         break
-                    wake = min(wake, quiet_at)
+                    wake_at = min(wake_at, quiet_at)
                 if now >= deadline:
-                    state["reason"] = "timeout"
+                    state.reason = "timeout"
                     break
-                try:
-                    batch = [q.get(timeout=max(0.0, wake - now))]
+                try:  # 阻塞到下一个事件/判定点（该事件也要喂给收集状态）
+                    head = q.get(timeout=max(0.0, wake_at - now))
                 except queue.Empty:
                     continue
-                while True:  # 一次唤醒处理完已到的全部事件
-                    try:
-                        batch.append(q.get_nowait())
-                    except queue.Empty:
-                        break
-                for event in batch:
-                    if event.get("port") != name:
-                        continue
-                    if event.get("type") == "line":
-                        on_line(event["line"])
-                    elif event.get("type") == "partial":
-                        state["tail"] = str(event.get("text") or "")
-                        state["tail_fresh"] = True
-                        if pat is not None and state["tail"] and pat.search(state["tail"]):
-                            state["reason"] = "regex"
-                    if state["reason"]:
-                        break
-                if state["reason"] is None and prompt is not None:
-                    target = state["tail"] if (state["tail_fresh"] and state["tail"]) \
-                        else state["last_text"]
-                    if target and prompt.search(strip_ansi(target)) is not None:
-                        state["reason"] = "prompt"
+                self._exchange_drain(name, q, state, worker, head)
         finally:
             self.unsubscribe(q)
+        return self._exchange_result(name, buf, sent, cursor, state)
 
+    async def exchange_async(
+        self,
+        name: str,
+        data: Any,
+        *,
+        eol: Optional[str] = None,
+        wait_regex: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        quiet_ms: Optional[int] = None,
+        since_seq: Optional[int] = None,
+    ) -> dict:
+        """:meth:`exchange` 的可等待版（§16）：收集挂在事件循环上（``_LoopWake``），一个挂起的
+        exchange/wait 不占线程池；写出（短阻塞）放线程里。语义与阻塞版一致。"""
+        worker = self._require_worker(name)
+        pc = self._port_config(name)
+        buf = self._require_buffer(name)
+        pat = _compile_user(wait_regex, "wait") if wait_regex else None
+        prompt_src = getattr(pc, "prompt", None)
+        prompt = _compile_user(prompt_src, "prompt") if (prompt_src and pat is None) else None
+        timeout = _EXCHANGE_TIMEOUT_MS if timeout_ms is None else max(0, int(timeout_ms))
+        quiet = (int(getattr(pc, "reply_quiet_ms", 100)) if quiet_ms is None
+                 else max(0, int(quiet_ms))) / 1000.0
+        first = min(timeout, max(0, int(getattr(pc, "reply_first_ms", 300)))) / 1000.0
+        text_sent = data if isinstance(data, str) else bytes(data).decode(pc.encoding, "replace")
+
+        wake = _LoopWake()
+        q = self.subscribe(notify=wake.notify)
+        try:
+            newest = buf.newest_seq()
+            cursor = int(since_seq) if since_seq is not None else (newest or 0)
+            rx0, _ = worker.rx_activity()
+            sent = await asyncio.to_thread(self.send, name, data, eol=eol)
+            start = time.monotonic()
+            deadline = start + timeout / 1000.0
+            state = _ExchangeState(pat, prompt, text_sent, cursor)
+
+            # 给了更早的 since_seq：游标与写出之间已入环的行先过一遍（之后的行走事件）
+            if since_seq is not None:
+                for line in buf.read(since_seq=cursor, kinds={"rx"})["lines"]:
+                    state.on_line(line)
+                    if state.reason:
+                        break
+            while state.reason is None:
+                now = time.monotonic()
+                wake_at = deadline
+                if pat is None:
+                    rx, last = worker.rx_activity()
+                    quiet_at = start + first if rx == rx0 else last + quiet
+                    if now >= quiet_at:
+                        state.reason = "quiet"
+                        break
+                    wake_at = min(wake_at, quiet_at)
+                if now >= deadline:
+                    state.reason = "timeout"
+                    break
+                woke = await wake.wait(max(0.0, wake_at - now))
+                wake.rearm()
+                self._exchange_drain(name, q, state, worker)
+                if not woke and state.reason is None:
+                    continue  # 到点：条件判定在下一轮循环顶部
+        finally:
+            self.unsubscribe(q)
+        return self._exchange_result(name, buf, sent, cursor, state)
+
+    def _exchange_drain(
+        self,
+        name: str,
+        q: "queue.Queue[dict]",
+        state: _ExchangeState,
+        worker: SerialPortWorker,
+        head: Optional[dict] = None,
+    ) -> None:
+        """取走已到的全部广播事件喂给收集状态；口关了 → ``reason="closed"``。"""
+        while True:
+            if head is not None:
+                event, head = head, None
+            else:
+                try:
+                    event = q.get_nowait()
+                except queue.Empty:
+                    break
+            if event.get("port") != name:
+                continue
+            if self._closed_event(name, event):
+                state.reason = "closed"
+                return
+            if event.get("type") == "line":
+                state.on_line(event["line"])
+            elif event.get("type") == "partial":
+                state.on_partial(str(event.get("text") or ""))
+            if state.reason:
+                return
+        state.check_prompt()
+        if state.reason is None and not worker.is_open:
+            state.reason = "closed"
+
+    def _exchange_result(
+        self, name: str, buf: RingBuffer, sent: dict, cursor: int, state: _ExchangeState
+    ) -> dict:
         got = buf.read(since_seq=cursor, kinds={"rx"})["lines"]
-        if state["match_seq"] is not None:
-            got = [ln for ln in got if ln["seq"] <= state["match_seq"]]
+        if state.match_seq is not None:
+            got = [ln for ln in got if ln["seq"] <= state.match_seq]
         lines = got[:_EXCHANGE_LIMIT]
-        reason = state["reason"]
+        reason = state.reason
         return {
             "port": name,
             "sent": sent["sent"],
@@ -725,6 +983,33 @@ class Hub:
             result["matched"] = waited["matched"]
             result["line"] = waited["line"]
             result["seq"] = waited["seq"]
+        return result
+
+    async def send_async(
+        self,
+        name: str,
+        data: Any,
+        *,
+        eol: Optional[str] = None,
+        wait_regex: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> dict:
+        """:meth:`send` 的可等待版（§16）：短阻塞写出放线程池，等待挂事件循环，不占线程池。"""
+        from_seq: Optional[int] = None
+        if wait_regex is not None:
+            newest = self._require_buffer(name).newest_seq()
+            from_seq = newest if newest is not None else 0
+        result = await asyncio.to_thread(self.send, name, data, eol=eol)
+        if wait_regex is None:
+            return result
+        waited = await self.wait_for_async(
+            name, wait_regex,
+            timeout_ms=timeout_ms if timeout_ms is not None else 10000,
+            since_seq=from_seq,
+        )
+        result["matched"] = waited["matched"]
+        result["line"] = waited["line"]
+        result["seq"] = waited["seq"]
         return result
 
     # ---- ZMODEM（rz/sz raw 会话）----

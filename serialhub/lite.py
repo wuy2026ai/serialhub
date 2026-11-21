@@ -418,6 +418,9 @@ def _tool_send(client: Client, a: dict[str, Any]) -> str:
     if env.get("unsupported"):
         return _send_polling(client, a)
     env = _ok(env)
+    if env.get("reason") == "closed":
+        # the port closed mid-exchange (unplugged / another client closed it)
+        raise LiteError(f"port '{port}' is not open")
     head = f"sent {env.get('sent_bytes', 0)}B"
     if "wait" in a:
         head += " matched" if env.get("reason") == "regex" else " timeout"

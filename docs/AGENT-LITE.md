@@ -34,9 +34,12 @@ Of the 8 lite tools, the six serial tools (`ports`, `send`, `read`, `wait`, `sea
   the port's `prompt` regex matches, or 100 ms pass after the **last byte**
   (`reply_quiet_ms`; at most `reply_first_ms` = 300 ms when nothing at all arrives), or
   `timeout_ms`. `wait` ignores the first rx line ending with `data` (the device's echo,
-  maybe prompt-prefixed: `root@dev:~# uname -a`); it is still shown. Against a daemon
-  without `/exchange` (older version, HTTP 404) `send` falls back to polling `read`
-  (300 ms quiet window).
+  maybe prompt-prefixed: `root@dev:~# uname -a`); it is still shown, and while that echo
+  line has not arrived in full a partially-echoed tail is not matched either (a regex that
+  occurs in the command text will not fire on the half echo). A port that closes mid-send
+  (unplugged, another client closed it) returns `error: port '<name>' is not open`.
+  Against a daemon without `/exchange` (older version, HTTP 404) `send` falls back to
+  polling `read` (300 ms quiet window).
 - `wait` without `since` only considers lines arriving after the call. On a match it shows
   all lines in (since or call start, match]; `next=` is the matched seq.
 - Regexes: `send`'s `wait` matches ANSI-stripped text; `wait`/`search`/`filter` run in the

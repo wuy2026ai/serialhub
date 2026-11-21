@@ -720,14 +720,23 @@ def test_emit_complete_lines_matches_find_eol_reference() -> None:
         return out, bytes(b)
 
     rng = random.Random(7)
-    worker = SerialPortWorker(PortConfig(name="x", device="loop://"), _StubHub())
+    # 与读循环同一调用形态：一个 worker 一个持久残行缓冲，字节分片到达；
+    # _emit_complete_lines 的 EOL 续扫游标就是跨这些调用记在 worker 上的。
     for _ in range(3000):
         raw = bytes(rng.choice(b"ab\r\n") for _ in range(rng.randint(0, 14)))
+        worker = SerialPortWorker(PortConfig(name="x", device="loop://"), _StubHub())
         got: list = []
         worker._emit = got.append  # type: ignore[method-assign]
-        buf = bytearray(raw)
-        worker._emit_complete_lines(buf)
-        assert (got, bytes(buf)) == reference(raw), raw
+        buf = bytearray()
+        chunks, i = [], 0
+        while i < len(raw):
+            step = rng.randint(1, 4)
+            chunks.append(raw[i:i + step])
+            i += step
+        for chunk in chunks or [b""]:
+            buf.extend(chunk)
+            worker._emit_complete_lines(buf)
+        assert (got, bytes(buf)) == reference(raw), (raw, chunks)
 
 
 # --------------------------------------------------------------------------- #

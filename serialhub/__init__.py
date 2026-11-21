@@ -37,4 +37,9 @@ def __getattr__(name: str) -> Any:
     return value
 
 
+def __dir__() -> list[str]:
+    """``dir(serialhub)`` 也列出懒加载的名字（否则只看得见已导入过的）。"""
+    return sorted(set(globals()) | set(_LAZY))
+
+
 __all__ = ["__version__", "Line", "RingBuffer", "Config", "PortConfig", "Hub"]

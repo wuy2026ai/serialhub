@@ -727,10 +727,17 @@ Exit 按钮得到 `403`（`serialhub shutdown` 等不带 `Origin` 的客户端�
 | 端口 | 空闲等待（锁外） | 取数据（持 `_io_lock`） |
 |---|---|---|
 | POSIX 串口（有整数 `fd`） | `select([fd], timeout=ser.timeout)` | `read(in_waiting)`；`in_waiting==0` 时 `read(1)`（EOF/拔出照常抛 `SerialException` → 重连） |
-| 无 `fd`（Windows、`loop://`、`rfc2217://` 等） | `read(1)`（至多 `ser.timeout`，首字节即返回） | `read(in_waiting)` 取走其余 |
+| 无 `fd`（Windows、`loop://` 等） | `read(1)`（至多 `ser.timeout`，首字节即返回） | `read(in_waiting)` 取走其余 |
 | `socket://` | `select([sock])` | 单次 `recv(4096)`（保持 §7 的“对端发完即关不丢尾部”） |
 | ZMODEM 会话中 | 不变：只读 `in_waiting`，空读时锁外睡 `_ACTIVE_POLL_S` | — |
 
+注意：pyserial 的 `rfc2217://` 对象带 `_socket`，因此走的是上表 `socket://` 的原始 socket 读路径
+（select + 单次 recv）；这条路径未对真实 RFC 2217 服务器验证过，不承诺支持。
+
+**idle 时间片的读等待**：`framing: idle` 且有残行待吐时，读循环把空闲等待上限压短到
+“下一次时间片到期”（`residual_since + flush_ms`），不再等满一个读超时——否则残行平均迟
+约 `ser.timeout`（p50 ≈ 109 ms）才吐出。三条读路径（fd 的 `select`、无 `fd` 的 `read(1)`、
+socket 的 `select`）都遵守这个上限。
 `serial_for_url(..., timeout=0.1)` 不变，它只决定空闲等待上限（`close()` 照常在 ≤ 0.1 s 内让读循环退出）。
 锁顺序不变（`_io_lock` 之后可取 `_zm_lock`，后者是叶子锁）。
 
@@ -747,9 +754,27 @@ Exit 按钮得到 `403`（`serialhub shutdown` 等不带 `Origin` 的客户端�
   `{"matched":true,"line":null,"seq":null,"ts_ms":null,"pending":"<tail>",...}`。
 - **不要**用 `framing: idle` 实现这件事：它把逐字回显切成多条 seq 行。
 
-**等待不阻塞事件循环**：`api_wait` / `api_send` / `api_exchange`（以及 open/close/device/pins/export/reload）写成普通
-`def`，由 FastAPI 在线程池执行；`hub.wait_for` 本就由读线程的广播唤醒（不轮询，命中后 ≈ 0.1 ms 返回）。
-`wait_for` 不给 `since_seq` 时仍先对全环做一次正则扫描（语义不变：已在环里的匹配行立即返回）。
+**等待不占线程**：`api_wait` / `api_send` / `api_exchange` 是 `async def`——长等待挂在事件循环上
+（`hub.wait_for_async` / `send_async` / `exchange_async`，订阅经 `subscribe(notify=...)`，读线程每个事件
+入队后用 `loop.call_soon_threadsafe` 投递一次唤醒），短阻塞的串口写出放线程池（`asyncio.to_thread`）。
+一个挂起的 wait/exchange 因此不占线程池的线程（旧实现把 40 线程的池吃满后，别的客户端一次 `send`
+要等 4 s+）。其余短阻塞端点（open/close 的线程 join、引脚脉冲的睡眠、导出/重载的磁盘 I/O）仍是普通
+`def`，由 FastAPI 的线程池执行；纯内存端点保持 `async def`。`hub.wait_for`（阻塞版）本就由读线程的
+广播唤醒（不轮询，命中后 ≈ 0.1 ms 返回）。`wait_for` 不给 `since_seq` 时仍先对全环做一次正则扫描
+（语义不变：已在环里的匹配行立即返回）。
+
+- REST `timeout_ms` 上限（钳制，不报错）：`wait` 120 000，`send`/`exchange` 60 000——与 lite
+  （`WAIT_TIMEOUT_MAX` / `SEND_TIMEOUT_MAX`）相同的上限。
+- 客户端断开时挂起的 wait/send/exchange 随请求一起结束（等待协程被取消；断线探测为
+  `request.is_disconnected()` 轮询，粒度 ~250 ms）。
+- 口在等待/收集中途被关闭或拔出（`close`、读错误都会广播 `open:false` 的 status）→ 立即结束：
+  `wait_for` 按未命中返回（与"已关闭的口"语义一致，环里已有的匹配行仍立即命中），`exchange`
+  以新增的 `reason:"closed"` 返回（`matched:false`）；口在请求时已关 → `send`/`exchange` 仍是
+  409 `port '...' is not open`。
+
+**守护进程身份（boot）**：`GET /health` 与 `/ws` `hello` 事件都带 `"boot": "<opaque id>"`
+（启动毫秒时间戳 + 随机后缀，进程生命周期内不变，重启即变）。UI 用它识别“守护进程重启过”，
+重置各口的行游标并重载历史；旧守护进程没有该字段，UI 保持旧行为。
 
 **`POST /api/ports/{name}/exchange`**（一次请求完成“写出 + 收集回复”）：
 
@@ -763,7 +788,10 @@ Exit 按钮得到 `403`（`serialhub shutdown` 等不带 `Origin` 的客户端�
 | c | 未给 `wait_regex`：最后一个**字节**之后静默 `quiet_ms`（缺省 `reply_quiet_ms`=100）；写出后一个字节都没到时等 `min(timeout_ms, reply_first_ms)`（缺省 300） | `quiet` |
 | d | `timeout_ms`（缺省 10000） | `timeout` |
 
-与 lite `send` 一样，第一行以 `data` 结尾的 rx 行（设备回显，可带提示符前缀）不参与匹配，仍在 `lines` 里。响应：
+与 lite `send` 一样，第一行以 `data` 结尾的 rx 行（设备回显，可带提示符前缀）不参与匹配，仍在 `lines` 里；在回显行
+整行见到之前，像“回显到一半”的未结束尾巴（尾巴以 `data` 的非空前缀结尾，或去掉可选提示符前缀后的尾段被 `data`
+开头/包含）同样不参与 a)/b) 的匹配——串口按字节到达，回显经常分片（先 `=> cat /proc/ver`、几毫秒后才是
+`sion\r\n`），否则出现在命令文本里的正则/提示符会在半截回显上提前命中。无回显设备不受影响。响应：
 `{"ok":true,"port","sent","sent_bytes","lines":[rx 行，与 read 同形，至多 500],"count","has_more","pending"?,
 "matched": reason∈{regex,prompt},"reason","next_seq","from_seq"}`；`regex` 命中某行时 `lines` 截到该行。
 非法 `wait_regex` / 端口 `prompt` → 400；未知端口 → 404；ZMODEM 会话中 → 409（同 `send`）。
@@ -778,10 +806,14 @@ lite `send` 据此退回旧的轮询实现。lite 工具 schema 不变。
 （每行一帧，契约不变）连续发送。队列上限 10000 与满则丢弃策略不变（§6）。
 
 **HTTP**：`GZipMiddleware(minimum_size=1024)`（静态资源与 ≥ 1 KiB 的 JSON）；`Cache-Control`：
-`/static/vendor/*` 为 `public, max-age=604800`，`/` 与其余 `/static/*` 为 `no-cache`（ETag/Last-Modified 校验，304）。
-`serialhub serve` 默认关闭 uvicorn 访问日志，`--access-log` 打开。
+第三方 `/static/vendor/*` 为 `public, max-age=604800`，`/`、其余 `/static/*`、以及 `vendor/` 下**我们自己**
+发布的文件（`zmodem-shim.js`）为 `no-cache`（ETag/Last-Modified 校验，304）——升级后浏览器必须重新取 shim，
+不能吃 7 天长缓存。`serialhub serve` 默认关闭 uvicorn 访问日志，`--access-log` 打开。
 
 **RingBuffer.read**：给 `since_seq` 时从尾部倒扫到游标即停（容忍 16 行以内的并发乱序），不再复制整个环。
 
 **断行**：`_emit_complete_lines` 用 `bytearray.find` 定位 `\n`/`\r` 并缓存下一处位置，消费完一次性删前缀
-（规则与 `_find_eol` 完全相同：`\r\n` 为一个结束符，结尾孤立 `\r` 暂缓）。
+（规则与 `_find_eol` 完全相同：`\r\n` 为一个结束符，结尾孤立 `\r` 暂缓）。EOL 搜索从上次已扫过的长度续起
+（worker 记 `_eol_scanned`，残行缓冲清空时归零）：一条没有换行的长残行不再每次 read 全量重扫。无 EOL 的
+残行有界：超过 `min(buffer_bytes, 64 KiB)` 时按该上限切成自己的行吐出（防一个不含换行的失控输出把残行
+拖成 MiB 级——每次 read 的重扫与 pending 解码都随残行线性增长）。

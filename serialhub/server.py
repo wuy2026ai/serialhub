@@ -26,6 +26,7 @@ import queue
 import threading
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Set
 from urllib.parse import urlsplit
@@ -52,14 +53,28 @@ except Exception:  # noqa: BLE001 - 包初始化期间允许缺失
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+#: 进程身份（§16）：启动毫秒时间戳 + 随机后缀，进程生命周期内不变。/health 与 /ws hello
+#: 都带 ``boot``；UI 据此识别"守护进程重启过"并重置行游标（旧值缺省时 UI 保持旧行为）。
+BOOT_ID = f"{int(time.time() * 1000):013d}-{uuid.uuid4().hex[:6]}"
+
 #: 第三方 vendor 资源（xterm/zmodem.js）的缓存时长：长缓存（文件名无版本号，取 7 天）。
 VENDOR_MAX_AGE_S = 7 * 24 * 3600
+#: ``/static/vendor/`` 下**不是**第三方、随 serialhub 一起发布的文件：升级后必须重新取，
+#: 不能吃 7 天长缓存（否则浏览器一直用旧 shim）。
+VENDOR_OWN_FILES = {"zmodem-shim.js"}
 #: 不小于这么多字节的响应才 gzip（静态资源与大 JSON，§16）。
 GZIP_MIN_BYTES = 1024
 
 #: ``POST /api/shutdown`` 先回响应、再等这么久才真正停机（让响应与 WS 广播送达）。
 SHUTDOWN_DELAY_S = 0.2
 
+#: REST ``timeout_ms`` 上限（§16，钳制不报错；与 lite 已有的上限一致）：
+#: wait 120 s，send/exchange 60 s——不让一个忘掉客户端的请求占住等待者到永远。
+WAIT_TIMEOUT_MAX_MS = 120000
+SEND_TIMEOUT_MAX_MS = 60000
+
+#: 断线探测轮询间隔（秒）：挂起的 wait/exchange 随请求断开一起结束。
+_DISCONNECT_POLL_S = 0.25
 
 class I18nMiddleware:
     """Pure-ASGI middleware: pick the request locale from ``Accept-Language``.
@@ -92,10 +107,11 @@ class I18nMiddleware:
 class CacheControlMiddleware:
     """Pure-ASGI: ``Cache-Control`` for the Web UI (§16).
 
-    ``/static/vendor/*`` gets a long ``max-age``; the app's own html/js/css (``/`` and the
-    rest of ``/static/*``) get ``no-cache`` — the browser keeps them but revalidates with
-    ``ETag``/``Last-Modified`` (a cheap 304), so a new version shows up on the next load.
-    API and WebSocket responses are untouched.
+    Third-party files under ``/static/vendor/`` get a long ``max-age``. Everything we ship
+    ourselves — ``/``, the rest of ``/static/*`` and our own files inside ``vendor/``
+    (:data:`VENDOR_OWN_FILES`, e.g. the lrzsz shim) — gets ``no-cache``: the browser keeps
+    them but revalidates with ``ETag``/``Last-Modified`` (a cheap 304), so a new version
+    shows up on the next load. API and WebSocket responses are untouched.
     """
 
     def __init__(self, app: Any) -> None:
@@ -106,8 +122,9 @@ class CacheControlMiddleware:
         if scope.get("type") != "http" or not (path == "/" or path.startswith("/static/")):
             await self.app(scope, receive, send)
             return
+        own = path.rsplit("/", 1)[-1] in VENDOR_OWN_FILES
         value = (f"public, max-age={VENDOR_MAX_AGE_S}".encode("latin-1")
-                 if path.startswith("/static/vendor/") else b"no-cache")
+                 if path.startswith("/static/vendor/") and not own else b"no-cache")
 
         async def _send(message: dict[str, Any]) -> None:
             if message.get("type") == "http.response.start":
@@ -245,6 +262,28 @@ def _ws_token(websocket: WebSocket) -> Optional[str]:
     return websocket.query_params.get("token")
 
 
+async def _await_or_disconnect(request: Request, coro: Any) -> Any:
+    """跑完 ``coro``；客户端先挂断则取消它（挂起的 wait/exchange 不再等到超时）。
+
+    返回 ``None`` 表示客户端已断开（响应本来就送不出去）。断线探测只能轮询
+    ``request.is_disconnected()``（非阻塞探测），粒度 :data:`_DISCONNECT_POLL_S`。
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_S)
+            if done:
+                return task.result()
+            if await request.is_disconnected():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                return None
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 # --------------------------------------------------------------------------- #
 # 工厂
 # --------------------------------------------------------------------------- #
@@ -312,14 +351,17 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             "ok": True,
             "status": "ok",
             "version": VERSION,
+            "boot": BOOT_ID,
             "uptime_ms": uptime_ms(app),
             "allow_shutdown": _allow_shutdown(),
         }
 
     # ---- 端口列表 / 状态 ---------------------------------------------------- #
-    # 约定（§16）：可能阻塞的端点（wait/send 的等待、open/close 的线程 join、引脚脉冲的睡眠、
-    # 导出/重载的磁盘 I/O）写成普通 ``def``，由 FastAPI 放进线程池执行，绝不阻塞事件循环
-    # （否则一个 wait 会让所有其它 REST/WS 客户端一起卡住）；其余纯内存端点保持 ``async def``。
+    # 约定（§16）：可能长阻塞的等待绝不占线程——wait/send/exchange 是 ``async def``，等待挂在
+    # 事件循环上（读线程经 ``subscribe(notify=...)`` 的 ``call_soon_threadsafe`` 唤醒），
+    # 短阻塞的串口写出放线程池（``asyncio.to_thread``），事件循环永不被一个请求卡住。
+    # 其余短阻塞端点（open/close 的线程 join、引脚脉冲的睡眠、导出/重载的磁盘 I/O）仍是
+    # 普通 ``def``，由 FastAPI 的线程池执行。
     @app.get("/api/ports")
     async def api_ports() -> dict[str, Any]:
         return {"ok": True, **hub.list_ports()}
@@ -405,45 +447,66 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         }
 
     @app.get("/api/ports/{name}/wait")
-    def api_wait(
+    async def api_wait(
+        request: Request,
         name: str,
         regex: str,
         timeout_ms: int = 10000,
         since_seq: Optional[int] = None,
-    ) -> dict[str, Any]:
-        return {
-            "ok": True,
-            **hub.wait_for(name, regex, timeout_ms=timeout_ms, since_seq=since_seq),
-        }
+    ) -> Any:
+        timeout = max(0, min(int(timeout_ms), WAIT_TIMEOUT_MAX_MS))
+        result = await _await_or_disconnect(
+            request,
+            hub.wait_for_async(name, regex, timeout_ms=timeout, since_seq=since_seq),
+        )
+        if result is None:  # 客户端已挂断：响应送不出去，等待已随请求结束
+            return JSONResponse(
+                status_code=499, content={"ok": False, "error": "client disconnected"}
+            )
+        return {"ok": True, **result}
 
     # ---- 数据：send / snapshot / export / clear / mark --------------------- #
     @app.post("/api/ports/{name}/send")
-    def api_send(name: str, body: SendBody) -> dict[str, Any]:
-        return {
-            "ok": True,
-            **hub.send(
+    async def api_send(request: Request, name: str, body: SendBody) -> Any:
+        timeout = None if body.timeout_ms is None else max(
+            0, min(int(body.timeout_ms), SEND_TIMEOUT_MAX_MS))
+        result = await _await_or_disconnect(
+            request,
+            hub.send_async(
                 name,
                 body.data,
                 eol=body.eol,
                 wait_regex=body.wait_regex,
-                timeout_ms=body.timeout_ms,
+                timeout_ms=timeout,
             ),
-        }
+        )
+        if result is None:
+            return JSONResponse(
+                status_code=499, content={"ok": False, "error": "client disconnected"}
+            )
+        return {"ok": True, **result}
 
     @app.post("/api/ports/{name}/exchange")
-    def api_exchange(name: str, body: ExchangeBody) -> dict[str, Any]:
-        return {
-            "ok": True,
-            **hub.exchange(
+    async def api_exchange(request: Request, name: str, body: ExchangeBody) -> Any:
+        timeout = None if body.timeout_ms is None else max(
+            0, min(int(body.timeout_ms), SEND_TIMEOUT_MAX_MS))
+        result = await _await_or_disconnect(
+            request,
+            hub.exchange_async(
                 name,
                 body.data,
                 eol=body.eol,
                 wait_regex=body.wait_regex,
-                timeout_ms=body.timeout_ms,
+                timeout_ms=timeout,
                 quiet_ms=body.quiet_ms,
                 since_seq=body.since_seq,
             ),
-        }
+        )
+        if result is None:
+            return JSONResponse(
+                status_code=499, content={"ok": False, "error": "client disconnected"}
+            )
+        return {"ok": True, **result}
 
     @app.get("/api/ports/{name}/snapshot")
     async def api_snapshot(name: str, tail_lines: int = 200) -> dict[str, Any]:
@@ -554,7 +617,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             ports = listing.get("ports", []) if isinstance(listing, dict) else []
         except Exception:  # noqa: BLE001 - 问候失败不应中断连接
             ports = []
-        await websocket.send_json({"type": "hello", "ports": ports})
+        await websocket.send_json({"type": "hello", "ports": ports, "boot": BOOT_ID})
 
         # 2) 订阅广播：读线程每入队一个事件就调 _notify；同一批次只投递一次唤醒到事件循环，
         #    _pump 醒来后一次取走全部已到事件（不再每个事件占一次线程跳转，§16）。
