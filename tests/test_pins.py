@@ -681,4 +681,4 @@ def test_mcp_exposes_set_pin_tool() -> None:
     else:
         names = {tool.name for tool in asyncio.run(server.list_tools())}
     assert "set_pin" in names
-    assert len(names) == 18
+    assert len(names) == 20

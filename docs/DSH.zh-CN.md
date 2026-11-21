@@ -6,7 +6,7 @@
 >
 > **结论先行：不需要修改 serialhub 或 DSH 的任何源码。** DSH 自带 `@deepseek-ai/dsh-mcp-client`
 > 插件，接入 = 在 DSH profile 的**用户 patch 层**加一条 stdio MCP 服务器记录；DSH 默认开启的配置热重载
-> （HMR）会让 18 个工具在**保存后立即出现**，无需重启。
+> （HMR）会让 20 个工具在**保存后立即出现**，无需重启。
 >
 > 适用范围：自带 `@deepseek-ai/dsh-mcp-client` 插件的 DSH 版本（桌面版与 CLI profile 通用）。
 
@@ -25,7 +25,7 @@ DSH 模型
   ▼
 dsh-mcp-client（DSH 插件；按配置 spawn 子进程，JSON-RPC over stdio）
   ▼
-serialhub/mcp_server.py（18 个工具；每个工具转成一次 HTTP 调用）
+serialhub/mcp_server.py（20 个工具；每个工具转成一次 HTTP 调用）
   ▼
 serialhub serve（常驻 daemon，默认 127.0.0.1:8765，持有串口 + 环形缓冲）
   ▼
@@ -61,7 +61,7 @@ COMx / /dev/ttyUSB0 / loop:// / ...
 python tools/mcp_smoke.py
 ```
 
-预期：`initialize` 返回 `serverInfo.name = serialhub`，`tools/list` 列出 **18** 个工具，最后打印
+预期：`initialize` 返回 `serverInfo.name = serialhub`，`tools/list` 列出 **20** 个工具，最后打印
 `# RESULT: PASS`。这一步**不需要 daemon**。
 
 ### 3.2 找到 DSH 要改的配置文件
@@ -83,7 +83,7 @@ Copy-Item "$env:DSH_HOME\profiles\<profile>\cordis.patch.yml" `
 在 `cordis.patch.yml` 末尾追加（`insert` 是 loader 的“插入列表”补丁语义）：
 
 ```yaml
-# serialhub MCP —— 常驻串口中枢的 18 个工具，模型侧名称为 mcp__serialhub__*
+# serialhub MCP —— 常驻串口中枢的 20 个工具，模型侧名称为 mcp__serialhub__*
 # 前置：先启动 daemon（本 MCP server 只是 HTTP 瘦客户端）：
 #   python -m serialhub serve --config config.yaml
 - insert:
@@ -134,8 +134,8 @@ Copy-Item "$env:DSH_HOME\profiles\<profile>\cordis.patch.yml" `
 
 ## 5. 验证（三层）
 
-1. **协议层**：`python tools/mcp_smoke.py` → 18 tools / `PASS`。
-2. **DSH 加载层**：保存配置后，新会话（或热重载后的当前会话）工具列表出现 18 个
+1. **协议层**：`python tools/mcp_smoke.py` → 20 tools / `PASS`。
+2. **DSH 加载层**：保存配置后，新会话（或热重载后的当前会话）工具列表出现 20 个
    `mcp__serialhub__*`；MCP 资源服务器列表也会出现 `serialhub`（本服务器不提供资源，
    `resources: []` 属正常）。
 3. **业务层**：真的调一次串口工具（`<port>` 换成自己配置里的口名，`<N>` 用上次读到的 `next_seq`）：
@@ -219,10 +219,10 @@ DSH 与前三者的差异在于：它是**插件配置树的一层 patch**，而
 
 ## 9. 接入检查清单
 
-- [ ] `python tools/mcp_smoke.py` 通过，`tools/list` 返回 18 个工具
+- [ ] `python tools/mcp_smoke.py` 通过，`tools/list` 返回 20 个工具
 - [ ] daemon 已运行，且 `SERIALHUB_URL` 指向它
 - [ ] profile patch 已保存；HMR 生效（或已重启 DSH）
-- [ ] 会话工具列表出现 18 个 `mcp__serialhub__*`
+- [ ] 会话工具列表出现 20 个 `mcp__serialhub__*`
 - [ ] `list_ports` 返回 `ok:true`，能看到已配置端口
 - [ ] `read(port, since_seq=...)` 能续读到新行，且不重复消费
 - [ ] `wait_for(port, regex, since_seq=...)` 能命中**新**行
@@ -232,7 +232,7 @@ DSH 与前三者的差异在于：它是**插件配置树的一层 patch**，而
 
 ## 10. 参考
 
-- [`MCP.zh-CN.md`](MCP.zh-CN.md)：18 工具参考与 agent 操作手册
+- [`MCP.zh-CN.md`](MCP.zh-CN.md)：20 工具参考与 agent 操作手册
 - [`ARCHITECTURE.md`](ARCHITECTURE.md)：冻结契约（含 MCP / REST / CLI）
 - DSH 插件 `@deepseek-ai/dsh-mcp-client` 的 README：config 字段的完整说明（随 DSH 安装包分发）
 - DSH `@deepseek-ai/dsh` 的 README：profile 组合、patch 层顺序与 HMR 行为（随 DSH 安装包分发）

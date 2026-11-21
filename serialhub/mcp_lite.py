@@ -1,8 +1,8 @@
-"""serialhub MCP server, "lite" profile (stdio): six compact tools.
+"""serialhub MCP server, "lite" profile (stdio): eight compact tools.
 
-``serialhub mcp --profile lite`` 运行本模块：注册 ``lite.TOOLS`` 中的六个工具（名称、
+``serialhub mcp --profile lite`` 运行本模块：注册 ``lite.TOOLS`` 中的八个工具（名称、
 描述、JSON Schema 与 ``lite.TOOLS`` 完全一致），每个工具返回 ``lite.call()`` 的纯文本。
-与完整 profile（``mcp_server.py``，18 个工具）并存，互不影响；同样是瘦客户端，
+与完整 profile（``mcp_server.py``，20 个工具）并存，互不影响；同样是瘦客户端，
 守护进程须已运行。URL/token 取自参数或环境变量 ``SERIALHUB_URL`` / ``SERIALHUB_TOKEN``。
 """
 from __future__ import annotations

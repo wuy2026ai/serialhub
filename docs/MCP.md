@@ -3,7 +3,7 @@
 # serialhub MCP guide
 
 This document is for **AI agents that operate serial ports with serialhub** (and for engineers configuring
-MCP for those agents). It exposes the persistent `serialhub serve` daemon as **18 MCP tools**, letting an
+MCP for those agents). It exposes the persistent `serialhub serve` daemon as **20 MCP tools**, letting an
 agent complete the whole flow of "list ports → open → wait/read/search → send → snapshot/export/bridge"
 through tool calls (plus runtime remap: `set_device` / `discover`, and DTR/RTS pin control: `set_pin`).
 
@@ -58,7 +58,7 @@ pip install "mcp>=1.9"               # MCP support (or pip install -r requiremen
 
 # Protocol self-check (hand-written stdio JSON-RPC client, no daemon needed)
 python tools/mcp_smoke.py
-#   initialize + tools/list -> should print 18 tools and end with "# RESULT: PASS"
+#   initialize + tools/list -> should print 20 tools and end with "# RESULT: PASS"
 
 # End-to-end smoke (needs the daemon running)
 python -m serialhub serve --config examples/config.yaml
@@ -174,7 +174,7 @@ HMR). The full walkthrough — locating the profile, verification, pitfalls and 
 
 ---
 
-## 5. Tool reference (18)
+## 5. Tool reference (20)
 
 Convention: the defaults in the "Args" tables below are the tool-signature defaults; "Returns" omits the
 common `ok` / `port` fields.
@@ -649,6 +649,46 @@ The switch is **transient**: nothing is written to disk, and a daemon restart go
 A missing file or an invalid config returns `{"ok":false,"error":...}` and the previous configuration stays
 active. Use `status` / `list_ports` afterwards to see the new port set.
 
+### 5.19 `zmodem_send`
+
+Upload file(s) to the device by **ZMODEM**. The tool sends the `rz` command itself (do not `send` it), waits
+for the daemon's ZMODEM session, claims it over `/ws` and runs a pure-Python ZMODEM engine **in the MCP server
+process** — so `paths` are files on the machine running the MCP server, and the daemon may be remote.
+
+| Args | Type | Required | Notes |
+|---|---|---|---|
+| `port` | str | yes | Logical port name |
+| `paths` | list[str] | one of | Local file paths |
+| `content` | str | one of | File body instead of `paths` (≤ 1 MiB decoded) |
+| `name` | str | with `content` | Device file name (reduced to a basename) |
+| `encoding` | str | no | `text` (UTF-8, default) or `base64` for `content` |
+| `cmd` | str | no | Device command, default `rz`; `""` = the device is already waiting |
+| `timeout_ms` | int | no | Overall timeout, default 120000, max 1800000 |
+
+Returns: `{files: [{name, bytes, crc32, seconds, skipped}], text}` — `crc32` is CRC-32 of the file bytes
+(8 upper-case hex), `text` the lite one-line-per-file summary (`sent <name> <bytes>B crc=<CRC32> in <s>s`).
+
+### 5.20 `zmodem_receive`
+
+Download file(s) from the device by **ZMODEM** into a local directory. Sends `sz {remote}` itself.
+
+| Args | Type | Required | Notes |
+|---|---|---|---|
+| `port` | str | yes | Logical port name |
+| `remote` | list[str] | yes | Device file name(s); `{remote}` in `cmd` = these joined by spaces |
+| `dir` | str | no | Local directory (created if missing), default `.` |
+| `inline` | bool | no | Also put text-file content into `text` (capped at 4000 chars) |
+| `cmd` | str | no | Device command, default `sz {remote}`; `""` = none |
+| `overwrite` | bool | no | Replace existing files instead of saving `name.1`, `name.2`, … |
+| `timeout_ms` | int | no | Overall timeout, default 120000, max 1800000 |
+
+Returns: `{files: [{name, bytes, crc32, path}], missing[], refused[], text}`. Only the basename of a
+device-supplied name is used and files never leave `dir`; a file is written under a temporary name and
+renamed when complete, partial files are removed on failure. No session within 10 s →
+`error: device did not start ZMODEM; device said: <last lines>`; lrzsz's `sz` for a missing file →
+`error: device sent no file; device said: sz done rc=…`; a browser already holding the session → a clear
+`claimed by another client` error.
+
 ---
 
 ## 6. Agent playbook
@@ -815,6 +855,8 @@ Every MCP tool maps to a CLI subcommand / REST endpoint, making cross-verificati
 | `set_device` | `set-device` | `POST /api/ports/{n}/device` |
 | `discover` | `discover` | `GET /api/devices` |
 | `set_pin` | `pins` | `GET/POST /api/ports/{n}/pins` |
+| `zmodem_send` | `zsend` | `/ws` (`zmodem_claim` / `zmodem_write` / `zmodem_end`) + `POST /api/ports/{n}/send` for `rz` |
+| `zmodem_receive` | `zrecv` | `/ws` (same) + `POST /api/ports/{n}/send` for `sz` |
 
 Difference note: MCP `read` has **no** `kinds` argument (REST/CLI do); when you need to filter by kind, go through
 REST/CLI, or approximate it with MCP `read`'s `filter` regex.

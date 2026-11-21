@@ -1,20 +1,22 @@
 # serialhub lite — a compact agent interface
 
 **lite** is a compact second interface for small local models (Qwen-class) using the
-Anthropic Messages tool format: six tools, plain-text results, one cursor habit. A thin
+Anthropic Messages tool format: eight tools, plain-text results, one cursor habit. A thin
 client (`serialhub/lite.py`); `serialhub serve` must be running. Nothing else changes.
 
 ## Measured schema sizes
 
-Compact JSON of name + description + input schema per tool (a test keeps lite ≤ 3,000):
+Compact JSON of name + description + input schema per tool (a test keeps lite ≤ 4,200):
 
 | interface | tools | chars |
 |---|---|---|
-| full MCP profile (`mcp_server.py`) | 18 | 14,957 (18,432 as the raw `tools/list` payload) |
-| lite, Anthropic format (`serialhub tools`) | 6 | 2,648 |
-| lite, OpenAI format (`serialhub tools --format openai`) | 6 | 2,822 |
+| full MCP profile (`mcp_server.py`) | 20 | 18,244 |
+| lite, Anthropic format (`serialhub tools`) | 8 | 4,107 |
+| lite, OpenAI format (`serialhub tools --format openai`) | 8 | 4,339 |
 
-## The six tools
+The six serial tools alone are 2,648 chars; `zsend` + `zrecv` add 1,459.
+
+## The eight tools
 
 | tool | args | result |
 |---|---|---|
@@ -24,6 +26,8 @@ Compact JSON of name + description + input schema per tool (a test keeps lite �
 | `wait` | `port`, `regex`, `timeout_ms?` (10000, max 120000), `since?` | `matched` + every line up to the match, or `timeout` |
 | `search` | `port`, `regex`, `limit?` (20, max 100), `context?` (0-5) | hits over the whole buffer; windows separated by `--`; **does not move the cursor** |
 | `control` | `port`, `action` (`open`\|`close`\|`clear`\|`mark`), `baud?`, `label?` | `open 115200` / `closed` / `cleared 12` / `mark 345` |
+| `zsend` | `port`; `path` (local path or array) **or** `content` + `name` (`encoding?`: `text` default, or `base64`); `cmd?` (`rz`; `""` = none); `timeout_ms?` (120000, max 1800000) | one line per file: `sent <name> <bytes>B crc=<CRC32> in <s>s` |
+| `zrecv` | `port`, `remote` (device name or array), `dir?` (`.`), `inline?` (false), `cmd?` (`sz {remote}`), `timeout_ms?` (same) | one line per file: `received <name> <bytes>B crc=<CRC32> -> <saved path>`; with `inline`, `--- <name>` + content for each text file |
 
 - `send` collects **rx** lines after the write until `wait` matches, or (no `wait`) 300 ms
   of silence, or `timeout_ms`. `wait` ignores the first rx line ending with `data` (the
@@ -33,6 +37,48 @@ Compact JSON of name + description + input schema per tool (a test keeps lite �
 - Regexes: `send`'s `wait` matches ANSI-stripped text; `wait`/`search`/`filter` run in the
   daemon on raw text (ANSI escapes included). Output is always stripped.
 - Out-of-range values are clamped; `"50"` counts as 50; failures are text `error: ...`.
+
+## File transfer (zsend / zrecv)
+
+ZMODEM through the daemon's `/ws` relay, with a pure-Python engine running **in the tool's
+own process** (`serialhub/zmodem_proto.py` + `zmodem_client.py`): no browser, no Node, no
+host lrzsz, and local paths are on the machine where the agent runs (the daemon may be
+remote). The tools send `rz` / `sz <remote>` themselves — do not `send` them first.
+
+- `zsend`: exactly one of `path` / `content`. `content` is the file body written by the
+  model (UTF-8 text, or `encoding: "base64"`), at most 1 MiB decoded; `name` is reduced to a
+  basename. `cmd: ""` when the device is already waiting in `rz`.
+- `zrecv` always saves into `dir` (created if missing), only under the basename the device
+  sent; an existing file is kept and the new one saved as `name.1`, `name.2`, … Files land
+  under a temporary name and are renamed when complete; partial files are removed on failure.
+  `{remote}` in `cmd` is the names joined by spaces (quoted when they contain spaces).
+- `inline: true` appends the content of files that are UTF-8 text without NUL bytes; binary
+  files get ` (binary, not shown)` on their line. Inline content is capped at 4000 chars per
+  reply; a cut file ends with `…+<n> chars, full file at <saved path>`.
+- `crc=` is CRC-32 (zlib) of the file bytes, so the agent can check a transfer end to end.
+- Errors: `error: device did not start ZMODEM; device said: <last device lines>` (nothing
+  started within 10 s), `error: device sent no file; device said: sz done rc=128` (lrzsz's
+  `sz` starts a session even for a missing file, then cancels), `error: ZMODEM session on
+  'a' was claimed by another client (a browser tab?)…`, `error: zmodem: session active on
+  port 'a'` (HTTP 409), wrong direction, daemon unreachable, timeout.
+- After a transfer the device's own output (`rz done rc=0`, the prompt) is returned to the
+  ring buffer as normal lines, so `read` shows it.
+
+```
+> zsend {"port":"console","content":"mode=fast\n","name":"agent.cfg"}
+sent agent.cfg 10B crc=195BE1DD in 0.1s
+> zrecv {"port":"console","remote":["agent.cfg","fw.bin"],"dir":"pulled","inline":true}
+received agent.cfg 10B crc=195BE1DD -> pulled/agent.cfg
+received fw.bin 262144B crc=0C61F2A4 -> pulled/fw.bin (binary, not shown)
+--- agent.cfg
+mode=fast
+```
+
+CLI: `serialhub zsend <port> <file>... [--content TEXT|- --name NAME] [--cmd CMD]
+[--timeout-ms N]` and `serialhub zrecv <port> <remote>... [--dir DIR] [--cmd CMD]
+[--overwrite] [--inline] [--timeout-ms N]` print the same text (progress on stderr only when
+it is a TTY; exit 1 on `error:`). The full MCP profile has the same operations as
+`zmodem_send` / `zmodem_receive` with the usual `{"ok": ...}` envelope.
 
 ## Line format (send / read / wait)
 
@@ -75,7 +121,7 @@ Default `framing: line` emits a line only at a line ending, so a bare prompt (`l
 
 ### 1. MCP, lite profile
 
-`serialhub mcp --profile lite`: the same six tools and text (`error:` results flagged
+`serialhub mcp --profile lite`: the same eight tools and text (`error:` results flagged
 `isError` where the SDK keeps the text identical). `--url`/`--token`, else `SERIALHUB_URL`/`SERIALHUB_TOKEN`:
 
 ```json
@@ -116,5 +162,6 @@ Each block header has next=N: pass N as since next time so you never re-read lin
 more=1 means read again with that since.
 Use send with wait (regex for the reply, not your echoed command); wait for later events.
 Wait for output lines, not a bare prompt (a prompt has no newline).
+Move files with zsend/zrecv (they run rz/sz themselves).
 On 'error:' fix the arguments; do not repeat the call.
 ```

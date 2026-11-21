@@ -644,3 +644,13 @@ zmodem.js 原样会对设备的下一行抛 “Only thing after ZFIN should be O
 `tests/integration/simenv.py` 的 `node_client()` 每个测试会话最多跑一次 `npm ci --prefer-offline`，失败/超时（120 s）则 skip 并记住）：
 `node zclient.mjs --ws URL --port NAME (--send FILE… | --recv-dir DIR) [--close-after-bytes N] [--timeout-ms MS]`，
 订阅就绪后往 stderr 打 `{"ready":true}`，结束时 stdout 打一行 `{"ok","files":[{"name","size"}],"error"}`，退出码 0/1。
+
+**非浏览器客户端（agent / 脚本，2026-11 增补）**：`serialhub/zmodem_proto.py`（纯协议，无 I/O：CRC-16/32、ZDLE、
+十六进制/二进制头、1 KiB 子包、服从 ZRPOS/ZACK/ZSKIP、ZEOF/ZFIN/可选 `OO`、对端 5×CAN、自身失败写 `ABORT_SEQ`、
+每帧超时 + 有界重试 + 总截止时间）+ `serialhub/zmodem_client.py`（`websockets.sync.client`）在**调用方进程**里
+跑完整个会话，协议与 zclient.mjs 相同：先连 `/ws` 并 `subscribe`/`ping`，记 REST 游标，REST send `rz` / `sz {remote}`，
+等本口 `start`（方向须匹配；10 s 没有 → `device did not start ZMODEM` + 设备最后几行），`zmodem_claim`，
+`zmodem_data`/`zmodem_write` 跑引擎；成功后再收 200 ms，`zmodem_end` 带 `tail_b64`（先去掉 0x18，免得设备回显的
+我方帧头在回注时被当成新会话），失败 `abort:true`；设备自己发 CAN 取消（lsz 找不到文件时如此）则收 0.5 s 文本后以
+`done` 结束，文本照常进环。守护进程行为不变、不增加文件访问面（可在远端）。对外：lite 工具 `zsend`/`zrecv`、
+CLI `serialhub zsend|zrecv`、完整 MCP profile `zmodem_send`/`zmodem_receive`（见 `docs/AGENT-LITE.md`）。

@@ -5,7 +5,9 @@ daemon: every non-``serve`` subcommand prints exactly one line of JSON —
 ``{"ok": true, "data": <result>}`` or ``{"ok": false, "error": "<message>"}`` —
 and exits 0 on success / 1 on failure. ``serve`` runs the daemon in-process.
 The lite-interface commands are deliberately different: ``tools`` prints a raw
-JSON array of tool definitions and ``call`` prints plain text (``serialhub.lite``).
+JSON array of tool definitions and ``call`` prints plain text (``serialhub.lite``);
+so do ``zsend`` / ``zrecv`` (ZMODEM file transfer, ``serialhub.zmodem_client``),
+which print the same one-line-per-file text as the lite tools.
 
 ``hub``/``server``/``tcp_bridge`` (and uvicorn) are imported lazily inside the
 ``serve`` handler only, so ``serialhub list`` and the MCP server start with
@@ -17,6 +19,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any, Optional
 
 from .client import DEFAULT_URL, Client
@@ -283,6 +286,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("tool", help=t("cli.arg.call_tool"))
     p.add_argument("args", nargs="?", default=None, help=t("cli.arg.call_args"))
 
+    # ZMODEM：同样输出纯文本（每个文件一行），出错以 "error:" 开头、退出码 1。
+    p = add("zsend", help=t("cli.cmd.zsend"), description=t("cli.desc.zsend"))
+    p.add_argument("port")
+    p.add_argument("files", nargs="*", help=t("cli.arg.zsend_files"))
+    p.add_argument("--content", default=None, help=t("cli.arg.zsend_content"))
+    p.add_argument("--name", dest="content_name", default=None, help=t("cli.arg.zsend_name"))
+    p.add_argument("--encoding", default="text", choices=["text", "base64"],
+                   help=t("cli.arg.zsend_encoding"))
+    p.add_argument("--cmd", default="rz", help=t("cli.arg.zsend_cmd"))
+    p.add_argument("--timeout-ms", type=int, default=None, help=t("cli.arg.zm_timeout"))
+
+    p = add("zrecv", help=t("cli.cmd.zrecv"), description=t("cli.desc.zrecv"))
+    p.add_argument("port")
+    p.add_argument("remote", nargs="+", help=t("cli.arg.zrecv_remote"))
+    p.add_argument("--dir", default=".", help=t("cli.arg.zrecv_dir"))
+    p.add_argument("--cmd", default=None, help=t("cli.arg.zrecv_cmd"))
+    p.add_argument("--overwrite", action="store_true", help=t("cli.arg.zrecv_overwrite"))
+    p.add_argument("--inline", action="store_true", help=t("cli.arg.zrecv_inline"))
+    p.add_argument("--timeout-ms", type=int, default=None, help=t("cli.arg.zm_timeout"))
+
     return parser
 
 
@@ -426,6 +449,63 @@ def _cmd_call(args: argparse.Namespace) -> int:
     return 1 if text.startswith("error:") else 0
 
 
+def _progress() -> Any:
+    """stderr progress for zsend/zrecv, only when stderr is a TTY (else ``None``)."""
+    if not sys.stderr.isatty():
+        return None
+    last = [0.0]
+
+    def show(name: str, done: int, total: Optional[int]) -> None:
+        now = time.monotonic()
+        if now - last[0] < 0.2 and done != total:
+            return
+        last[0] = now
+        pct = f" {done * 100 // total}%" if total else ""
+        sys.stderr.write(f"\r{name} {done}/{total if total is not None else '?'}B{pct}\033[K")
+        if done == total:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+
+    return show
+
+
+def _cmd_zmodem(args: argparse.Namespace) -> int:
+    """``zsend`` / ``zrecv``: print the plain-text result; exit 1 on ``error:``."""
+    from . import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
+
+    url, token = _global_options(args)
+    if getattr(args, "url", None) is None:
+        url = os.environ.get("SERIALHUB_URL") or url
+    if args.command == "zsend":
+        contents: list[tuple[str, bytes]] = []
+        if args.content is not None:
+            if args.files:
+                text = f"error: {t('cli.error.zsend_one')}"
+            elif not args.content_name:
+                text = f"error: {t('cli.error.zsend_name')}"
+            else:
+                body = sys.stdin.read() if args.content == "-" else args.content
+                try:
+                    contents.append(zc.inline_content(body, args.content_name, args.encoding))
+                    text = ""
+                except ValueError as exc:
+                    text = f"error: {exc}"
+        elif not args.files:
+            text = f"error: {t('cli.error.zsend_one')}"
+        else:
+            text = ""
+        if not text:
+            text = zc.zsend(url, token, args.port, args.files, contents=contents,
+                            cmd=args.cmd, timeout_ms=zc.clamp_timeout(args.timeout_ms),
+                            progress=_progress())
+    else:
+        text = zc.zrecv(url, token, args.port, args.remote, os.path.expanduser(args.dir),
+                        cmd=args.cmd, timeout_ms=zc.clamp_timeout(args.timeout_ms),
+                        overwrite=args.overwrite, inline=args.inline, progress=_progress())
+    print(text)
+    return 1 if text.startswith("error:") or "\nnot received " in "\n" + text else 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """CLI entry point. Returns the process exit code."""
     args = _build_parser().parse_args(argv)
@@ -438,6 +518,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "call":
         try:
             return _cmd_call(args)
+        except BrokenPipeError:
+            return 1
+    if args.command in ("zsend", "zrecv"):
+        try:
+            return _cmd_zmodem(args)
         except BrokenPipeError:
             return 1
     try:

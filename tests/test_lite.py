@@ -16,7 +16,7 @@ import pytest
 from serialhub import lite
 from serialhub.client import Client
 
-NAMES = ["ports", "send", "read", "wait", "search", "control"]
+NAMES = ["ports", "send", "read", "wait", "search", "control", "zsend", "zrecv"]
 
 
 @pytest.fixture
@@ -77,7 +77,7 @@ def _block_header(text: str) -> str:
 def test_budget_and_names() -> None:
     tools = lite.to_anthropic()
     assert [t["name"] for t in tools] == NAMES
-    assert len(json.dumps(tools, ensure_ascii=False, separators=(",", ":"))) <= 3000
+    assert len(json.dumps(tools, ensure_ascii=False, separators=(",", ":"))) <= 4200
     for spec in tools:
         assert set(spec) == {"name", "description", "input_schema"}
         schema = spec["input_schema"]
@@ -91,7 +91,7 @@ def test_budget_and_names() -> None:
 
 def test_openai_shape() -> None:
     tools = lite.to_openai()
-    assert len(tools) == 6
+    assert len(tools) == 8
     for spec, src in zip(tools, lite.TOOLS):
         assert spec["type"] == "function"
         fn = spec["function"]
@@ -492,7 +492,7 @@ def _mcp_tools(server) -> dict:
     return {t.name: t for t in asyncio.run(server.list_tools())}
 
 
-def test_mcp_lite_lists_exactly_six_tools() -> None:
+def test_mcp_lite_lists_exactly_eight_tools() -> None:
     pytest.importorskip("mcp")
     from serialhub import mcp_lite
 
@@ -531,7 +531,7 @@ def test_mcp_full_profile_unchanged() -> None:
     pytest.importorskip("mcp")
     from serialhub import mcp_server
 
-    assert len(_mcp_tools(mcp_server.mcp)) == 18
+    assert len(_mcp_tools(mcp_server.mcp)) == 20
 
 
 # --------------------------------------------------------------------------- #

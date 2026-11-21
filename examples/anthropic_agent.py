@@ -29,6 +29,7 @@ SYSTEM = (
     "more=1 means read again with that since. "
     "Use send with wait (regex for the reply, not your echoed command); wait for later events. "
     "Wait for output lines, not a bare prompt (a prompt has no newline). "
+    "Move files with zsend/zrecv (they run rz/sz themselves). "
     "On 'error:' fix the arguments; do not repeat the call."
 )
 MAX_TURNS = 30

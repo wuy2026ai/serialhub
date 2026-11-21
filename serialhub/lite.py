@@ -1,7 +1,7 @@
-"""serialhub "lite" agent interface: six compact tools, plain-text results.
+"""serialhub "lite" agent interface: eight compact tools, plain-text results.
 
 面向小模型的精简工具集（单一事实来源）：``TOOLS`` 是 Anthropic Messages 格式的
-六个工具定义，``call()`` 经瘦客户端 ``Client`` 调用守护进程并**总是**返回纯文本
+八个工具定义，``call()`` 经瘦客户端 ``Client`` 调用守护进程并**总是**返回纯文本
 （用户错误返回 ``error: <message>``，绝不抛异常）。MCP lite profile
 （``mcp_lite.py``）与 CLI ``serialhub tools`` / ``serialhub call`` 都复用这里。
 
@@ -14,10 +14,16 @@ Compact line format (send/read/wait/search)::
     <seq> <text> (x12)    12 consecutive identical lines collapsed; seq = first
 
 Empty result: ``<port> empty next=<cursor> more=0``. Pass ``next`` back as ``since``.
+
+File transfer (``zsend`` / ``zrecv``, ZMODEM via ``serialhub.zmodem_client``)::
+
+    sent <name> <bytes>B crc=<CRC32> in <s>s
+    received <name> <bytes>B crc=<CRC32> -> <saved path>
 """
 from __future__ import annotations
 
 import copy
+import os
 import re
 import time
 from typing import Any, Callable, Optional
@@ -54,6 +60,11 @@ def _s(desc: str, **extra: Any) -> dict[str, Any]:
 
 def _i(desc: str) -> dict[str, Any]:
     return {"type": "integer", "description": desc}
+
+
+def _names(desc: str) -> dict[str, Any]:
+    """One string or an array of strings."""
+    return {"type": ["string", "array"], "items": {"type": "string"}, "description": desc}
 
 
 _PORT = _s("Port name")
@@ -104,6 +115,28 @@ TOOLS: list[dict[str, Any]] = [
          "baud": _i("Baud rate (open only)"),
          "label": _s("Marker text (mark only)"),
      }, ["port", "action"])},
+    {"name": "zsend",
+     "description": "Upload file(s) to the device by ZMODEM; runs rz there itself (don't send rz).",
+     "input_schema": _obj({
+         "port": _PORT,
+         "path": _names("Local file path(s); or use content+name"),
+         "content": _s("File body to upload instead of path"),
+         "name": _s("Device file name for content"),
+         "encoding": _s("content encoding, default text", enum=["text", "base64"]),
+         "cmd": _s('Device command, default "rz"; "" = none'),
+         "timeout_ms": _i("Max ms, default 120000"),
+     }, ["port"])},
+    {"name": "zrecv",
+     "description": "Download file(s) from the device by ZMODEM; runs sz there itself "
+                    "(don't send sz). Saves to dir.",
+     "input_schema": _obj({
+         "port": _PORT,
+         "remote": _names("Device file name(s)"),
+         "dir": _s("Local directory, default ."),
+         "inline": {"type": "boolean", "description": "Also return text file content"},
+         "cmd": _s('Device command, default "sz {remote}"'),
+         "timeout_ms": _i("Max ms, default 120000"),
+     }, ["port", "remote"])},
 ]
 
 _BY_NAME = {tool["name"]: tool for tool in TOOLS}
@@ -148,7 +181,22 @@ def _validate(name: str, args: Any) -> dict[str, Any]:
         if value is None:
             continue
         spec = props[key]
-        if spec["type"] == "integer":
+        if isinstance(spec["type"], list):  # ["string", "array"]: one name or a list
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                value = str(value)
+            if isinstance(value, str):
+                value = [value]
+            if not (isinstance(value, list) and value
+                    and all(isinstance(v, str) and v for v in value)):
+                raise LiteError(f"{key} must be a string or an array of strings")
+        elif spec["type"] == "boolean":
+            if isinstance(value, str) and value.strip().lower() in ("true", "false", "1", "0"):
+                value = value.strip().lower() in ("true", "1")
+            elif isinstance(value, int) and not isinstance(value, bool) and value in (0, 1):
+                value = bool(value)
+            if not isinstance(value, bool):
+                raise LiteError(f"{key} must be true or false")
+        elif spec["type"] == "integer":
             if isinstance(value, bool):
                 raise LiteError(f"{key} must be an integer")
             if isinstance(value, float) and value.is_integer():
@@ -455,6 +503,35 @@ def _tool_control(client: Client, a: dict[str, Any]) -> str:
     return f"mark {env.get('seq')}"
 
 
+def _tool_zsend(client: Client, a: dict[str, Any]) -> str:
+    from . import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
+
+    if ("path" in a) == ("content" in a):
+        raise LiteError("give exactly one of path or content")
+    contents: list[tuple[str, bytes]] = []
+    if "content" in a:
+        if "name" not in a:
+            raise LiteError("content needs name (the device file name)")
+        try:
+            contents.append(zc.inline_content(a["content"], a["name"], a.get("encoding")))
+        except ValueError as exc:
+            raise LiteError(str(exc)) from None
+    elif "name" in a:
+        raise LiteError("name goes with content; with path the local file name is used")
+    return zc.zsend(client.base_url, client.token, a["port"], a.get("path") or [],
+                    contents=contents, cmd=a.get("cmd", "rz"),
+                    timeout_ms=zc.clamp_timeout(a.get("timeout_ms")))
+
+
+def _tool_zrecv(client: Client, a: dict[str, Any]) -> str:
+    from . import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
+
+    return zc.zrecv(client.base_url, client.token, a["port"], a["remote"],
+                    os.path.expanduser(a.get("dir") or "."), cmd=a.get("cmd"),
+                    timeout_ms=zc.clamp_timeout(a.get("timeout_ms")),
+                    inline=bool(a.get("inline")), cap=MAX_BLOCK_CHARS)
+
+
 _HANDLERS: dict[str, Callable[[Client, dict[str, Any]], str]] = {
     "ports": _tool_ports,
     "send": _tool_send,
@@ -462,6 +539,8 @@ _HANDLERS: dict[str, Callable[[Client, dict[str, Any]], str]] = {
     "wait": _tool_wait,
     "search": _tool_search,
     "control": _tool_control,
+    "zsend": _tool_zsend,
+    "zrecv": _tool_zrecv,
 }
 
 

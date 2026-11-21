@@ -18,6 +18,7 @@ EXPECTED_TOOLS = {
     "list_ports", "open", "close", "status", "read", "search", "wait_for",
     "send", "snapshot", "export", "tcp_bridge", "mark", "clear", "reload",
     "set_device", "discover", "set_pin", "switch_config",
+    "zmodem_send", "zmodem_receive",
 }
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,7 +43,7 @@ def test_mcp_compat_exports_shim_symbols() -> None:
 def test_mcp_exposes_exactly_the_expected_tools() -> None:
     names = _tool_names()
     assert names == EXPECTED_TOOLS
-    assert len(names) == 18
+    assert len(names) == 20
 
 
 # ---- client error handling ------------------------------------------------- #

@@ -3,7 +3,7 @@
 # serialhub MCP 使用说明
 
 本文件面向**要用 serialhub 操作串口的 AI agent**（以及为 agent 配置 MCP 的工程师）。
-它把常驻守护 `serialhub serve` 暴露为 **18 个 MCP 工具**，让 agent 直接以工具调用完成
+它把常驻守护 `serialhub serve` 暴露为 **20 个 MCP 工具**，让 agent 直接以工具调用完成
 「列口 → 打开 → 等待/读取/搜索 → 发送 → 快照/导出/桥」的全流程（另有运行时改写：`set_device` / `discover`，以及 DTR/RTS 引脚控制：`set_pin`）。
 
 > 契约来源：[`ARCHITECTURE.md`](ARCHITECTURE.md) §11；实现：[`../serialhub/mcp_server.py`](../serialhub/mcp_server.py)。
@@ -57,7 +57,7 @@ pip install "mcp>=1.9"               # MCP 支持（或 pip install -r requireme
 
 # 协议自检（自写 stdio JSON-RPC 客户端，不需要守护）
 python tools/mcp_smoke.py
-#   initialize + tools/list -> 应打印 18 个工具，末尾 "# RESULT: PASS"
+#   initialize + tools/list -> 应打印 20 个工具，末尾 "# RESULT: PASS"
 
 # 端到端冒烟（需先起守护）
 python -m serialhub serve --config examples/config.yaml
@@ -172,7 +172,7 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 
 ---
 
-## 5. 工具参考（18 个）
+## 5. 工具参考（20 个）
 
 约定：下文「参数表」中的默认值即工具签名默认值；「返回」省略公共的 `ok` / `port` 字段。
 
@@ -632,6 +632,44 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 切换是**临时的**：不写盘，重启守护进程后回到 `serve --config` 指定的文件。文件不存在或配置非法时返回
 `{"ok":false,"error":...}`，且原配置保持生效。切换后用 `status` / `list_ports` 查看新的端口集合。
 
+### 5.19 `zmodem_send`
+
+经 **ZMODEM** 向设备上传文件。工具会自己发送 `rz`（不要另外 `send`），等守护识别出 ZMODEM 会话后经 `/ws`
+认领，并在 **MCP 服务器进程里**运行纯 Python 的 ZMODEM 引擎——因此 `paths` 是运行 MCP 服务器的那台机器上的
+文件，守护可以在远端。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `port` | str | 是 | 逻辑端口名 |
+| `paths` | list[str] | 二选一 | 本地文件路径 |
+| `content` | str | 二选一 | 代替 `paths` 的文件内容（解码后 ≤ 1 MiB） |
+| `name` | str | 配合 `content` | 设备上的文件名（只取 basename） |
+| `encoding` | str | 否 | `content` 的编码：`text`（UTF-8，默认）或 `base64` |
+| `cmd` | str | 否 | 设备命令，默认 `rz`；`""` = 设备已在等待 |
+| `timeout_ms` | int | 否 | 总超时，默认 120000，最大 1800000 |
+
+返回：`{files: [{name, bytes, crc32, seconds, skipped}], text}`——`crc32` 是文件字节的 CRC-32（8 位大写十六进制），
+`text` 是 lite 风格的每文件一行摘要（`sent <name> <bytes>B crc=<CRC32> in <s>s`）。
+
+### 5.20 `zmodem_receive`
+
+经 **ZMODEM** 从设备下载文件到本地目录。会自己发送 `sz {remote}`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `port` | str | 是 | 逻辑端口名 |
+| `remote` | list[str] | 是 | 设备上的文件名；`cmd` 里的 `{remote}` = 这些名字以空格连接 |
+| `dir` | str | 否 | 本地目录（不存在则创建），默认 `.` |
+| `inline` | bool | 否 | 同时把文本文件内容放进 `text`（上限 4000 字符） |
+| `cmd` | str | 否 | 设备命令，默认 `sz {remote}`；`""` = 不发 |
+| `overwrite` | bool | 否 | 覆盖已存在的文件，而不是另存为 `name.1`、`name.2`…… |
+| `timeout_ms` | int | 否 | 总超时，默认 120000，最大 1800000 |
+
+返回：`{files: [{name, bytes, crc32, path}], missing[], refused[], text}`。设备给出的文件名只取 basename，
+文件绝不会落到 `dir` 之外；先写临时名、完整后再改名，失败时删除残缺文件。10 秒内没有会话 →
+`error: device did not start ZMODEM; device said: <最后几行>`；lrzsz 的 `sz` 遇到不存在的文件 →
+`error: device sent no file; device said: sz done rc=…`；会话已被浏览器占用 → 明确的 `claimed by another client` 错误。
+
 ---
 
 ## 6. Agent 操作手册（playbook）
@@ -793,6 +831,8 @@ MCP 的每个工具都对应 CLI 子命令 / REST 端点，便于交叉验证：
 | `set_device` | `set-device` | `POST /api/ports/{n}/device` |
 | `discover` | `discover` | `GET /api/devices` |
 | `set_pin` | `pins` | `GET/POST /api/ports/{n}/pins` |
+| `zmodem_send` | `zsend` | `/ws`（`zmodem_claim` / `zmodem_write` / `zmodem_end`）+ 发 `rz` 的 `POST /api/ports/{n}/send` |
+| `zmodem_receive` | `zrecv` | `/ws`（同上）+ 发 `sz` 的 `POST /api/ports/{n}/send` |
 
 差异提示：MCP `read` **没有** `kinds` 参数（REST/CLI 有）；需要按 kind 过滤时走 REST/CLI，
 或用 MCP `read` 的 `filter` 正则近似。
