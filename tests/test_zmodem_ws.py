@@ -166,3 +166,61 @@ def test_end_with_tail_b64_reinjects_text(app_hub) -> None:
         assert "base64" in _recv_until(ws, "zmodem_error")["error"]
     assert _until(lambda: "sz done rc=0" in [
         ln["text"] for ln in hub.read("z", kinds={"rx"})["lines"]])
+
+
+def _fail_send_of(monkeypatch, mtype: str) -> None:
+    """让服务端发送某类消息时抛错（模拟客户端在这一刻断开）。"""
+    from starlette.websockets import WebSocket
+
+    real = WebSocket.send_json
+
+    async def send_json(self, data, mode="text"):
+        if isinstance(data, dict) and data.get("type") == mtype:
+            raise RuntimeError("simulated send failure")
+        return await real(self, data, mode)
+
+    monkeypatch.setattr(WebSocket, "send_json", send_json)
+
+
+def _end_reasons(sub) -> list[str]:
+    out = []
+    while not sub.empty():
+        ev = sub.get_nowait()
+        if ev.get("type") == "zmodem" and ev.get("event") == "end":
+            out.append(ev["reason"])
+    return out
+
+
+def test_pump_send_failure_still_aborts_on_disconnect(app_hub, monkeypatch) -> None:
+    tc, hub = app_hub
+    _fail_send_of(monkeypatch, "zmodem_data")
+    sub = hub.subscribe()
+    with tc.websocket_connect("/ws") as ws:
+        _start(hub)
+        ws.send_json({"type": "zmodem_claim", "port": "z"})
+        _recv_until(ws, "zmodem_claimed")
+        time.sleep(0.3)  # 转发任务发送 zmodem_data 失败并退出
+        assert hub.zmodem_status("z")["active"] is True
+    assert _until(lambda: not hub.zmodem_status("z")["active"])
+    assert _end_reasons(sub) == ["disconnect"]
+
+
+def test_claim_reply_failure_still_aborts(app_hub, monkeypatch) -> None:
+    tc, hub = app_hub
+    _fail_send_of(monkeypatch, "zmodem_claimed")
+    sub = hub.subscribe()
+    with tc.websocket_connect("/ws") as ws:
+        _start(hub)
+        ws.send_json({"type": "zmodem_claim", "port": "z"})
+        assert _until(lambda: not hub.zmodem_status("z")["active"])
+    assert _end_reasons(sub) == ["disconnect"]
+
+
+def test_abort_must_be_literal_true(app_hub) -> None:
+    tc, hub = app_hub
+    with tc.websocket_connect("/ws") as ws:
+        _start(hub)
+        ws.send_json({"type": "zmodem_claim", "port": "z"})
+        sid = _recv_until(ws, "zmodem_claimed")["session"]
+        ws.send_json({"type": "zmodem_end", "port": "z", "session": sid, "abort": "false"})
+        assert _recv_until(ws, "zmodem_closed")["reason"] == "done"

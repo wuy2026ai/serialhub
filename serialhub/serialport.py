@@ -697,6 +697,8 @@ class SerialPortWorker(threading.Thread):
     def _zm_stage_inject_locked(self, session: ZmodemSession, tail: bytes) -> None:
         """（持 ``_zm_lock``，会话刚摘除）把 tail + 队列残余放进回注区，并暂扣到 end 标记写入后。
 
+        队列残余原样当文本回注：客户端若在协议中途发 ``done``，没取走的帧也会进环（客户端的责任）。
+
         从队列取走的字节不会再被转发（随后放入的 None 让转发方停止），因此不会重复投递。
         """
         self._zm_inject.extend(tail)
@@ -707,7 +709,8 @@ class SerialPortWorker(threading.Thread):
                 break
             if item:
                 self._zm_inject.extend(item)
-        self._zm_inject.extend(session.pending)
+        if session.owner is not None:  # 未认领的 pending 是没人看过的协议帧，不当文本回注
+            self._zm_inject.extend(session.pending)
         session.pending.clear()
         self._zm_inject_hold = True
 

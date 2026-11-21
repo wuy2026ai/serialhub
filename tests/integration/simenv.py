@@ -206,21 +206,32 @@ class LiveServer:
 
 
 _npm_ready = False
+_npm_error: Optional[str] = None  # npm ci 失败的原因：本会话后续测试直接 skip，不再重试
 
 
 def _ensure_node_modules() -> None:
-    """每个测试会话最多一次：node_modules 缺失或比 package-lock 旧时跑 ``npm ci``。"""
-    global _npm_ready
+    """每个测试会话最多一次：node_modules 缺失或比 package-lock 旧时跑 ``npm ci``。
+
+    npm ci 失败或超时（如离线）→ skip（并记住，后续测试立即 skip），不算测试失败。
+    """
+    global _npm_ready, _npm_error
     if _npm_ready:
         return
+    if _npm_error:
+        pytest.skip(_npm_error)
     need_tools("node", "npm")
     stamp = ZCLIENT_DIR / "node_modules" / ".package-lock.json"
     lock = ZCLIENT_DIR / "package-lock.json"
     if not stamp.exists() or stamp.stat().st_mtime < lock.stat().st_mtime:
-        r = subprocess.run(["npm", "ci", "--no-audit", "--no-fund"], cwd=ZCLIENT_DIR,
-                           capture_output=True, text=True, timeout=300)
+        cmd = ["npm", "ci", "--no-audit", "--no-fund", "--prefer-offline"]
+        try:
+            r = subprocess.run(cmd, cwd=ZCLIENT_DIR, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            _npm_error = "npm ci timed out after 120 s"
+            pytest.skip(_npm_error)
         if r.returncode != 0:
-            pytest.fail(f"npm ci failed:\n{r.stdout}\n{r.stderr}")
+            _npm_error = f"npm ci failed (rc={r.returncode}): {r.stderr.strip()[-500:]}"
+            pytest.skip(_npm_error)
     _npm_ready = True
 
 

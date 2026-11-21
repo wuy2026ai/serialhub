@@ -476,3 +476,14 @@ def test_bytes_read_before_end_mark_wait_behind_reinjected(zhub, monkeypatch) ->
     monkeypatch.setattr(zhub, "mark", slow_mark)
     zhub.zmodem_end("z", sid, "tab-1", tail=b"tail\n")
     assert _until(lambda: _rx_after_end_mark(zhub) == ["tail", "during"])
+
+
+def test_done_end_of_unclaimed_session_drops_pending(zhub) -> None:
+    """从未认领的会话：pending 里是没人看过的协议帧，done 结束也不当文本回注。"""
+    _start(zhub)
+    _device_sends(zhub, b"frame-bytes\n")
+    assert _until(lambda: zhub.zmodem_status("z")["rx_bytes"] > len(ZRQINIT))
+    sid = zhub.zmodem_status("z")["session"]
+    zhub.zmodem_end("z", sid, None)
+    zhub.write_bytes("z", b"live\n")
+    assert _until(lambda: _rx_after_end_mark(zhub) == ["live"])

@@ -2,7 +2,7 @@
 // Test harness: drive one serialhub /ws ZMODEM session with zmodem.js.
 //
 //   node zclient.mjs --ws URL --port NAME (--send FILE... | --recv-dir DIR)
-//                    [--close-after-bytes N]
+//                    [--close-after-bytes N] [--timeout-ms MS]
 //
 // Waits for the {"type":"zmodem","event":"start"} broadcast for NAME, claims the
 // session, feeds the relayed bytes to Zmodem.Sentry, accepts every offer
@@ -14,6 +14,7 @@
 // stdout: exactly one JSON line {"ok":bool,"files":[{"name","size"}],"error"}.
 // Exit 0 when ok, 1 otherwise. --close-after-bytes drops the socket once that
 // many session bytes have been received (simulates a tab closing mid-transfer).
+// --timeout-ms (default 20000) fails the run if it has not finished by then.
 
 import { Buffer } from "node:buffer";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
@@ -33,13 +34,14 @@ applyLrzszShim(Zmodem);
 const TAIL_MS = 200;
 
 function parseArgs(argv) {
-  const opts = { send: [] };
+  const opts = { send: [], timeoutMs: 20000 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--ws") opts.ws = argv[++i];
     else if (a === "--port") opts.port = argv[++i];
     else if (a === "--recv-dir") opts.recvDir = argv[++i];
     else if (a === "--close-after-bytes") opts.closeAfter = Number(argv[++i]);
+    else if (a === "--timeout-ms") opts.timeoutMs = Number(argv[++i]);
     else if (a === "--send") {
       while (i + 1 < argv.length && !argv[i + 1].startsWith("--")) opts.send.push(argv[++i]);
     } else throw new Error(`unknown argument: ${a}`);
@@ -186,9 +188,11 @@ ws.addEventListener("message", (ev) => {
     if (!zmEnded || msg.reason !== "done") return fail(`session closed: ${msg.reason}`);
     Promise.all(pendingWrites).then(() => finish(true), fail);
   } else if (msg.type === "zmodem_error") {
-    if (!zmEnded) fail(msg.error);
+    fail(msg.error);
   }
 });
+
+setTimeout(() => fail(`timed out after ${opts.timeoutMs} ms`), opts.timeoutMs).unref();
 
 ws.addEventListener("error", () => fail("websocket error"));
 ws.addEventListener("close", () => fail("websocket closed"));

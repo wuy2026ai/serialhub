@@ -598,15 +598,19 @@ def zmodem_end(self, name, session_id, client_id: Optional[str], *, abort=False,
   `tail_b64`（可选，仅非 abort 时生效）= 客户端收到、但不属于 ZMODEM 会话的字节：zmodem.js 会话结束后
   Sentry 经 `to_terminal` 交出的内容（lsz 的 `OO` 之后设备打印的 `sz done`、提示符等）。
 - 任一失败（无会话、被他人认领、未知端口、base64 非法……）→ `{"type":"zmodem_error","port","error"}`，连接不断。
-- 连接断开时仍持有的会话 → `hub.zmodem_end(..., abort=True, reason="disconnect")`。
+- 连接断开时 → 对本连接认领过的**每个**会话调用 `hub.zmodem_end(..., abort=True, reason="disconnect")`（已结束的是幂等空操作）。
+  认领一返回就记账（在发 `zmodem_claimed` 之前），转发任务因发送失败退出也不会抹掉记录，故中止不会被漏掉。
+- `abort` 只有字面量 `true` 才算中止（字符串 `"false"` 等按 `done` 处理）。
 - `{"type":"zmodem","event":"start"|"end",...}` 广播照常经订阅推给所有连接（受 `subscribe` 过滤）。
 - 会话期间 REST `POST /api/ports/{name}/send` → 409 `{"ok":false,"error":"zmodem: session active on port '<name>'"}`。
 
 **`done` 结束后的文本回注**：会话只在客户端发 `zmodem_end` 时结束，设备在 `OO` 之后打印的内容可能已经进了会话。
-worker 在摘除会话的同一 `_zm_lock` 临界区里把 `tail` + 队列中尚未送出的字节（及未认领的 `pending`）放进回注区，
+worker 在摘除会话的同一 `_zm_lock` 临界区里把 `tail` + 队列中尚未送出的字节（会话已认领时还有 `pending`；
+从未认领的会话的 `pending` 是没人看过的协议帧，直接丢弃）放进回注区，
 取走的队列项不会再被转发（随后的 `None` 让转发任务停止，不重复投递），并置“暂扣”；end 标记写入并广播后才放行。
 暂扣期间读到的实时字节追加在回注区之后。回注区只由读循环线程取走：与新读到的字节拼接（回注在前）后照常过检测器、
 增量解码与断行，作为 rx 行——因此顺序恒为 end 标记 → tail → 队列残余 → 实时字节。重连时回注区清空。
+队列残余原样当文本回注：客户端若在协议中途就发 `done`，没取走的 ZMODEM 帧也会进环——只有确认会话已结束才发 `done`，否则发 `abort`。
 非 `done` 结束忽略 `tail`，其后的设备输出照旧落在排空窗口里被丢弃（如中止后的 `sz done rc=…`）。
 
 **zmodem.js（0.1.10）与 lrzsz 的兼容垫片**：`lsz` 每个文件的第一个 ZDATA 子包以 ZCRCW 结尾并等 ZACK，
@@ -616,6 +620,6 @@ ZDATA 头），zclient 与浏览器 UI 共用。浏览器 UI 还须像 zclient �
 约 200 ms，收集 `to_terminal` 字节，随 `zmodem_end` 的 `tail_b64` 交回。
 
 **测试客户端**：`tests/zmodem_client/zclient.mjs`（Node，依赖锁在 `package-lock.json`，`node_modules/` 不入库；
-`tests/integration/simenv.py` 的 `node_client()` 每个测试会话最多跑一次 `npm ci`）：
-`node zclient.mjs --ws URL --port NAME (--send FILE… | --recv-dir DIR) [--close-after-bytes N]`，
+`tests/integration/simenv.py` 的 `node_client()` 每个测试会话最多跑一次 `npm ci --prefer-offline`，失败/超时（120 s）则 skip 并记住）：
+`node zclient.mjs --ws URL --port NAME (--send FILE… | --recv-dir DIR) [--close-after-bytes N] [--timeout-ms MS]`，
 订阅就绪后往 stderr 打 `{"ready":true}`，结束时 stdout 打一行 `{"ok","files":[{"name","size"}],"error"}`，退出码 0/1。

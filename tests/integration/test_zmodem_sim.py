@@ -48,7 +48,8 @@ def _sim(tmp_path, names=("a",), interval: float = 0.2) -> Iterator[dict[str, An
                 MockDevice(pair.dev_path, n, files, recv, interval=interval))
             ports.append({"name": n, "device": pair.host_path, "autostart": True})
         srv = st.enter_context(LiveServer(ports))
-        time.sleep(0.5)
+        for n in names:  # 就绪 = 服务已打开该口且设备在发包
+            _wait_line(srv, n, r"^PKT name=", 5)
         yield {"srv": srv, "files": files, "recv": recv, "dev": devices}
 
 

@@ -416,9 +416,11 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         # 2) 订阅广播
         q = hub.subscribe()
         subscribed: Optional[Set[str]] = None  # None 表示全部端口
-        # ZMODEM：本连接的稳定身份；port -> (session_id, 会话转发任务)
+        # ZMODEM：本连接的稳定身份；port -> (session_id, 会话转发任务)；
+        # zm_claimed 记下本连接认领过的每个会话（从不删除），断开时逐个幂等 end。
         client_id = uuid.uuid4().hex
         zm_sessions: dict[str, tuple[str, asyncio.Task]] = {}
+        zm_claimed: list[tuple[str, str]] = []
 
         async def _pump() -> None:
             """后台任务：把阻塞队列的事件喂给 WebSocket。"""
@@ -447,6 +449,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
 
         async def _zm_pump(port: str, sid: str, zq: "queue.Queue[Optional[bytes]]") -> None:
             """会话转发任务：负载只发给本连接（base64），遇 None 哨兵发 zmodem_closed。"""
+            sentinel_seen = False
             try:
                 ended = False
                 while not ended:
@@ -470,6 +473,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
                         "type": "zmodem_data", "port": port, "session": sid,
                         "b64": base64.b64encode(bytes(buf)).decode("ascii"),
                     })
+                sentinel_seen = True
                 # 会话已摘除：对旧 id 调 end 幂等，取回结束原因
                 summary = hub.zmodem_end(port, sid, client_id)
                 await websocket.send_json({
@@ -479,7 +483,8 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             except Exception:  # noqa: BLE001 - 客户端已断开
                 pass
             finally:
-                if zm_sessions.get(port, (None,))[0] == sid:
+                # 只有真正看到结束哨兵才摘记录；发送失败（客户端已断）时留着，交给断开路径中止
+                if sentinel_seen and zm_sessions.get(port, (None,))[0] == sid:
                     del zm_sessions[port]
 
         async def _zm_claim(port: Any) -> None:
@@ -489,12 +494,15 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
                 await _zm_error(port, exc)
                 return
+            # 先记账再 await：回复发送失败时断开路径也能中止这个已认领的会话
+            if (port, sid) not in zm_claimed:
+                zm_claimed.append((port, sid))
+            if zm_sessions.get(port, (None,))[0] != sid:  # 重复认领不另起转发任务
+                zm_sessions[port] = (sid, asyncio.create_task(_zm_pump(port, sid, zq)))
             direction = st.get("direction") if st.get("session") == sid else None
             await websocket.send_json({
                 "type": "zmodem_claimed", "port": port, "session": sid, "direction": direction,
             })
-            if zm_sessions.get(port, (None,))[0] != sid:  # 重复认领不另起转发任务
-                zm_sessions[port] = (sid, asyncio.create_task(_zm_pump(port, sid, zq)))
 
         async def _zm_write(port: Any, sid: Any, b64: Any) -> None:
             try:
@@ -555,7 +563,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             elif mtype == "zmodem_write":
                 await _zm_write(msg.get("port"), msg.get("session"), msg.get("b64"))
             elif mtype == "zmodem_end":
-                await _zm_end(msg.get("port"), msg.get("session"), bool(msg.get("abort")),
+                await _zm_end(msg.get("port"), msg.get("session"), msg.get("abort") is True,
                               msg.get("tail_b64"))
 
         pump_task = asyncio.create_task(_pump())
@@ -571,7 +579,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             pump_task.cancel()
             # 断开时仍持有的会话一律中止（对已结束的会话调用是幂等的）。写中止串放线程里，
             # 不阻塞事件循环；即使本协程被取消，线程里的收尾也会跑完。
-            owned = [(port, sid) for port, (sid, _task) in zm_sessions.items()]
+            owned = list(zm_claimed)  # 已结束的会话再 end 是幂等的空操作
             for _sid, task in zm_sessions.values():
                 task.cancel()
             zm_sessions.clear()
