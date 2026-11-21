@@ -20,7 +20,7 @@
 
 (function () {
   const TAIL_MS = 200;          // keep feeding the Sentry after session_end (see zclient.mjs)
-  const CHUNK = 8192;           // upload subpacket payload per zmodem_write
+  const CHUNK = 1024;           // upload subpacket payload per zmodem_write (standard 1 KiB subpacket)
   const MAX_BUFFERED = 256 * 1024; // upload pacing: wait while the socket holds more than this
   const START_WAIT_MS = 6000;   // after sending rz/sz: give up waiting for the device's start
   const DONE_LINGER_MS = 1200;  // keep the finished dialog visible briefly

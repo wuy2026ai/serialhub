@@ -499,3 +499,73 @@ def test_done_end_of_unclaimed_session_drops_pending(zhub) -> None:
     zhub.zmodem_end("z", sid, None)
     zhub.write_bytes("z", b"live\n")
     assert _until(lambda: _rx_after_end_mark(zhub) == ["live"])
+
+
+def test_reopen_after_closed_session_ingests_first_output(zhub, monkeypatch) -> None:
+    """会话以 closed 结束（关口/拔线）后重连：新连接的第一段输出（开机横幅）照常成行，
+    不被上一个连接残留的排空状态吞掉。"""
+    monkeypatch.setattr(zmodem, "DRAIN_SILENCE_MS", 10_000)  # 若排空残留，横幅必被丢弃
+    monkeypatch.setattr(zmodem, "DRAIN_MAX_MS", 20_000)
+    _start(zhub)
+    zhub.zmodem_claim("z", "tab-1")
+    zhub.close("z")
+    zhub.open("z")
+    worker = zhub._require_worker("z")
+    assert _until(lambda: worker.is_open)
+    zhub.write_bytes("z", b"boot banner\n")
+    assert _until(lambda: "boot banner" in _lines(zhub, {"rx"}))
+
+
+@pytest.mark.parametrize("baud,limit", [(9600, 480), (115200, 5760)])
+def test_session_write_split_into_wire_time_bounded_pieces(
+    hub_factory, make_config, baud, limit
+) -> None:
+    """单次 ser.write 不超过约 0.5 s 线上时间（max(64, baud//20) 字节），按序拼回原数据。"""
+    hub = hub_factory(make_config(ports=[_port(baud=baud)]))
+    _start(hub)
+    sid, _ = hub.zmodem_claim("z", "tab-1")
+    worker = hub._require_worker("z")
+    ser = worker._serial
+    sizes: list[bytes] = []
+
+    def spy_write(data):  # 只记录、不回读：loop:// 的 4 KiB 回读缓冲与本测试无关
+        sizes.append(bytes(data))
+        return len(data)
+
+    ser.write = spy_write  # type: ignore[method-assign]
+    data = bytes(range(256)) * 19 + bytes(136)  # 5000 字节
+    assert len(data) == 5000
+    assert hub.zmodem_write("z", sid, "tab-1", data) == 5000
+    assert all(len(p) <= limit for p in sizes), [len(p) for p in sizes]
+    assert b"".join(sizes) == data
+    assert hub.zmodem_status("z")["tx_bytes"] == 5000
+
+
+def test_queue_high_water_aborts_stalled_claimer(zhub, monkeypatch) -> None:
+    """已认领但不取数据的客户端：队列里未送出的字节超过上限 → 以 abort 结束会话并写中止串。"""
+    monkeypatch.setattr(zmodem, "QUEUE_MAX_BYTES", 1000)
+    sub = zhub.subscribe()
+    _start(zhub)
+    sid, q = zhub.zmodem_claim("z", "tab-1")
+    written = _spy_writes(zhub)
+    _device_sends(zhub, b"\x18" * 600)
+    time.sleep(0.2)
+    assert zhub.zmodem_status("z")["active"] is True  # 未超上限：继续
+    _device_sends(zhub, b"\x18" * 600)
+    ends = _until(lambda: [e for e in _zm_events(sub) if e["event"] == "end"] or None)
+    assert [(e["session"], e["reason"]) for e in ends] == [(sid, "abort")]
+    assert ABORT_SEQ in written
+
+
+def test_queue_bytes_consumed_by_reader_do_not_count(zhub, monkeypatch) -> None:
+    """取走的字节不再计入上限：持续消费的客户端可以收远超上限的数据。"""
+    monkeypatch.setattr(zmodem, "QUEUE_MAX_BYTES", 1000)
+    _start(zhub)
+    sid, q = zhub.zmodem_claim("z", "tab-1")
+    got = bytearray(q.get(timeout=POLL_TIMEOUT))
+    for _ in range(5):
+        _device_sends(zhub, b"\x18" * 600)
+        got.extend(_drain(q, timeout=0.3))
+    assert zhub.zmodem_status("z")["active"] is True
+    assert q.queued_bytes == 0
+    assert len(got) == len(ZRQINIT) + 3000

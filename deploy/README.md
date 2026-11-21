@@ -25,3 +25,4 @@ Tip: use stable names like `/dev/serial/by-id/usb-...` for `device:`. For start 
 - CLI against one instance: `serialhub --url http://127.0.0.1:8766 read com-b --limit 20`
 - `demo/` has `loop://` versions (no hardware) for a quick test.
 - File transfer: install lrzsz on the device, then use **Upload (rz)** / **Download (sz)…** in the Web UI toolbar.
+  Stopping the daemon normally aborts a running transfer on the device; a force-stop (`stop.ps1`, or `stop.sh`'s `kill -9` fallback) skips that abort, so the device's `rz`/`sz` only exits on lrzsz's own timeout.

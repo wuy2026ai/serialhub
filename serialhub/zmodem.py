@@ -5,8 +5,10 @@
   ``**`` ZDLE(0x18) ``B0`` + ``0``/``1``。``0`` = ZRQINIT（设备跑 ``sz`` → 浏览器
   ``download``），``1`` = ZRINIT（设备跑 ``rz`` → 浏览器 ``upload``）。头之前的字节
   原样还给调用方当文本；跨读分片的头靠“留住结尾的头前缀”拼接。
-- :class:`ZmodemSession`：一次传输的状态。负载字节只进本会话的**无界**队列
-  （``None`` 为结束哨兵），绝不进 ``Hub.ingest`` / 环形缓冲 / ``Hub._broadcast``。
+- :class:`ZmodemSession`：一次传输的状态。负载字节只进本会话的队列
+  （:class:`PayloadQueue`，``None`` 为结束哨兵），绝不进 ``Hub.ingest`` / 环形缓冲 /
+  ``Hub._broadcast``。队列本身不设 maxsize（读循环绝不阻塞），未取走的字节数超过
+  :data:`QUEUE_MAX_BYTES` 时由 worker 以 abort 结束会话。
 
 会话的开启/路由/超时/结束由 ``SerialPortWorker`` 驱动，对外经 ``Hub.zmodem_*``。
 """
@@ -23,7 +25,8 @@ from .models import now_ms
 
 __all__ = [
     "ABORT_SEQ", "DRAIN_MAX_MS", "DRAIN_SILENCE_MS", "END_REASONS", "HEADER_RE",
-    "Detection", "ZmodemDetector", "ZmodemSession",
+    "QUEUE_MAX_BYTES", "TAIL_MAX_BYTES",
+    "Detection", "PayloadQueue", "ZmodemDetector", "ZmodemSession",
 ]
 
 #: 写给设备的中止序列：8×CAN + 8×BS（lrzsz 的标准取消串）。
@@ -45,6 +48,13 @@ END_REASONS = frozenset({"done", "abort", "timeout", "unclaimed", "closed", "dis
 DRAIN_SILENCE_MS = 300
 #: ……或排空总时长达到上限，再回到行模式。
 DRAIN_MAX_MS = 3000
+
+#: 已认领会话的队列里“放入但未被转发方取走”的字节上限；超过 → 以 abort 结束会话
+#: （客户端连着却不取数据时，避免整个文件堆在 daemon 内存里）。
+QUEUE_MAX_BYTES = 64 * 1024 * 1024
+
+#: ``zmodem_end`` 的 ``tail``（回注为 rx 行）解码后的上限；超过则整条 end 消息被拒。
+TAIL_MAX_BYTES = 16 * 1024
 
 
 @dataclass
@@ -95,6 +105,28 @@ def _held_suffix_len(buf: bytes) -> int:
     return 0
 
 
+class PayloadQueue(queue.Queue):
+    """会话负载队列：额外记录 ``queued_bytes`` = 已放入、尚未被取走的负载字节数。
+
+    计数在 ``Queue`` 自身的互斥锁下随 put/get 增减；转发方每 ``get`` 一个分片即视为已消费。
+    """
+
+    def _init(self, maxsize: int) -> None:
+        super()._init(maxsize)
+        self.queued_bytes = 0
+
+    def _put(self, item: Optional[bytes]) -> None:
+        super()._put(item)
+        if item:
+            self.queued_bytes += len(item)
+
+    def _get(self) -> Optional[bytes]:
+        item = super()._get()
+        if item:
+            self.queued_bytes -= len(item)
+        return item
+
+
 @dataclass
 class ZmodemSession:
     """一次 ZMODEM 传输的状态；字段由所属 worker 在其 ``_zm_lock`` 下读写。"""
@@ -109,5 +141,5 @@ class ZmodemSession:
     last_activity_ms: int = field(default_factory=now_ms)
     #: 认领前收到的字节；认领时整块回放进 ``queue``。
     pending: bytearray = field(default_factory=bytearray)
-    #: 无界队列：``bytes`` 为负载分片，``None`` 为结束哨兵。
-    queue: "queue.Queue[Optional[bytes]]" = field(default_factory=queue.Queue)
+    #: 负载队列（不设 maxsize）：``bytes`` 为负载分片，``None`` 为结束哨兵。
+    queue: PayloadQueue = field(default_factory=PayloadQueue)

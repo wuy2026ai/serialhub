@@ -23,7 +23,7 @@ import Zmodem from "zmodem.js";
 // Same file the browser UI loads (single source of truth); CommonJS → default import.
 import lrzszShim from "../../serialhub/static/vendor/zmodem-shim.js";
 
-const CHUNK = 8192;
+const CHUNK = 1024; // standard 1 KiB ZMODEM subpacket (same as zmodem-ui.js)
 
 // lsz download fix for zmodem.js 0.1.10; see serialhub/static/vendor/zmodem-shim.js.
 lrzszShim.applyLrzszShim(Zmodem);

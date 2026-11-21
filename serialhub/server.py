@@ -33,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .i18n import resolve_locale, set_locale, t
+from .zmodem import TAIL_MAX_BYTES
 
 if TYPE_CHECKING:  # 仅供类型检查；运行时不需要 hub.py / config.py 存在
     from .config import Config
@@ -531,6 +532,10 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             try:
                 # tail：客户端收到的会话外字节（lsz 的 OO 之后设备打印的内容），只在非 abort 时回注
                 tail = b"" if abort else base64.b64decode(str(tail_b64 or ""), validate=True)
+                if len(tail) > TAIL_MAX_BYTES:  # 拒收整条 end，会话保留，客户端可重发
+                    raise ValueError(
+                        f"zmodem: tail too large ({len(tail)} > {TAIL_MAX_BYTES} bytes)"
+                    )
                 await asyncio.to_thread(
                     hub.zmodem_end, port, str(sid), client_id,
                     abort=abort, reason="abort" if abort else "done", tail=tail,

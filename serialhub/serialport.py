@@ -42,6 +42,7 @@ ZMODEM（``pc.zmodem``，默认开）：读到的字节先过 :class:`~serialhub
 from __future__ import annotations
 
 import codecs
+import logging
 import queue
 import threading
 from typing import TYPE_CHECKING, Optional
@@ -52,13 +53,15 @@ from . import discovery
 from .config import DEFAULT_PULSE_MS, normalize_pins
 from .i18n import t
 from .models import now_ms
-from . import zmodem as _zmodem  # 排空常量按模块属性读取（便于测试调小）
+from . import zmodem as _zmodem  # 排空/队列上限常量按模块属性读取（便于测试调小）
 from .zmodem import ABORT_SEQ, END_REASONS, Detection, ZmodemDetector, ZmodemSession
 
 if TYPE_CHECKING:  # 仅类型标注，避免与 hub 形成运行期循环导入
     from .hub import Hub
 
 __all__ = ["SerialPortWorker"]
+
+_log = logging.getLogger(__name__)
 
 _CR = 0x0D
 _LF = 0x0A
@@ -473,6 +476,11 @@ class SerialPortWorker(threading.Thread):
             self._serial = None
             self._broadcast_status()
             return False
+        # 新连接（读循环重连或 open() 直接打开）：上一个连接的回注字节作废、没有残余负载
+        # 可排空——否则 closed 结束后的排空会吞掉设备的第一段输出（开机横幅）。
+        with self._zm_lock:
+            self._zm_inject.clear()
+            self._zm_drain_started = None
         self._serial = ser
         self._open = True
         self._pin_state = {"dtr": None, "rts": None}
@@ -547,8 +555,6 @@ class SerialPortWorker(threading.Thread):
                         buf.clear()
                         residual_since = None
                         self._decoder.reset()  # (重)连接：丢弃上一个连接的半字符状态
-                        with self._zm_lock:
-                            self._zm_inject.clear()  # 上一个连接的回注字节作废
                     else:
                         with self._state_lock:
                             self._reconnect_count += 1
@@ -660,9 +666,18 @@ class SerialPortWorker(threading.Thread):
         return s.id, s.queue
 
     def zmodem_write(self, session_id: str, client_id: str, data: bytes) -> int:
-        """会话 owner 写原始字节到设备；计入 ``tx_bytes`` 并刷新活动时间。"""
+        """会话 owner 写原始字节到设备；计入 ``tx_bytes`` 并刷新活动时间。
+
+        按 ``max(64, baud // 20)`` 字节（8N1 下约 0.5 s 线上时间）切片依次写，片间释放
+        ``_io_lock``：单次 ``ser.write`` 不会超过 ``write_timeout=1``（低波特率下一整块
+        8 KiB 会触发 ``SerialTimeoutException``）。某片失败照常抛出。
+        """
         self._zm_require_owner(session_id, client_id)
-        n = self._write_raw(bytes(data))
+        data = bytes(data)
+        piece = max(64, int(self._pc.baud) // 20)
+        n = 0
+        for off in range(0, len(data), piece):
+            n += self._write_raw(data[off:off + piece])
         with self._zm_lock:
             s = self._zm_session
             if s is not None and s.id == session_id:
@@ -783,7 +798,8 @@ class SerialPortWorker(threading.Thread):
         })
 
     def _zm_check_deadlines(self) -> None:
-        """每轮读循环调用：认领超时 → ``unclaimed``，双向空闲超时 → ``timeout``（均中止）。
+        """每轮读循环调用：认领超时 → ``unclaimed``，双向空闲超时 → ``timeout``，队列里未被
+        取走的字节超过 ``QUEUE_MAX_BYTES``（客户端连着却不取）→ ``abort``（均中止）。
 
         判定与摘除会话在同一 ``_zm_lock`` 临界区内，期间落地的认领/写入不会被误杀。
         """
@@ -797,9 +813,17 @@ class SerialPortWorker(threading.Thread):
                 reason = "unclaimed"
             elif now - s.last_activity_ms >= self._zm_idle_ms:
                 reason = "timeout"
+            elif s.queue.queued_bytes > _zmodem.QUEUE_MAX_BYTES:
+                reason = "abort"
             if reason is None:
                 return
+            queued = s.queue.queued_bytes
             summary = self._zm_detach_locked(s, reason)
+        if reason == "abort":
+            _log.warning(
+                "zmodem: port %s session %s aborted: %d undelivered bytes queued (limit %d)",
+                s.port, s.id, queued, _zmodem.QUEUE_MAX_BYTES,
+            )
         self._zm_after_end(s, summary, abort=True)
 
     def _zm_end_current(self, reason: str, *, abort: bool) -> None:

@@ -3,7 +3,11 @@
 # Usage: ./start.sh [--host 0.0.0.0]
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/../.." && pwd)"
-HOST_ARGS=(); [ "${1:-}" = "--host" ] && HOST_ARGS=(--host "$2")
+HOST_ARGS=()
+if [ "${1:-}" = "--host" ]; then
+  if [ -z "${2:-}" ]; then echo "usage: $0 [--host ADDRESS]   (e.g. --host 0.0.0.0)" >&2; exit 2; fi
+  HOST_ARGS=(--host "$2")
+fi
 mkdir -p "$HERE/run"; cd "$ROOT"
 for cfg in "$HERE"/com-*.yaml; do
   n="$(basename "$cfg" .yaml)"; pidf="$HERE/run/$n.pid"

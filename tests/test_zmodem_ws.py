@@ -265,3 +265,24 @@ def test_claim_broadcasts_claimed_to_every_socket(app_hub) -> None:
                 break
         else:
             raise AssertionError("no claimed broadcast")
+
+
+def test_oversized_tail_rejected_session_kept(app_hub) -> None:
+    """tail 解码后超过 16 KiB → bad_request，消息被拒、会话保留，客户端可重发合规的 end。"""
+    tc, hub = app_hub
+    with tc.websocket_connect("/ws") as ws:
+        _start(hub)
+        ws.send_json({"type": "zmodem_claim", "port": "z"})
+        sid = _recv_until(ws, "zmodem_claimed")["session"]
+        ws.send_json({"type": "zmodem_end", "port": "z", "session": sid, "abort": False,
+                      "tail_b64": _b64(b"x" * (16 * 1024 + 1))})
+        err = ws.receive_json()
+        while err.get("type") not in ("zmodem_error", "zmodem_closed"):
+            err = ws.receive_json()
+        assert err["code"] == "bad_request" and err["session"] == sid
+        assert hub.zmodem_status("z")["active"] is True
+        ws.send_json({"type": "zmodem_end", "port": "z", "session": sid, "abort": False,
+                      "tail_b64": _b64(b"y" * (16 * 1024 - 1) + b"\n")})
+        assert _recv_until(ws, "zmodem_closed")["reason"] == "done"
+    assert _until(lambda: "y" * (16 * 1024 - 1) in [
+        ln["text"] for ln in hub.read("z", kinds={"rx"})["lines"]])

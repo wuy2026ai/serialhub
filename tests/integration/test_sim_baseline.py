@@ -48,7 +48,7 @@ def test_send_roundtrip(tmp_path):
         httpx.post(f"{srv.base_url}/api/ports/a/send", json={"data": "echo hello-42"}, timeout=5)
         r = httpx.get(f"{srv.base_url}/api/ports/a/wait",
                       params={"regex": r"^hello-42$", "timeout_ms": 2000}, timeout=5).json()
-        assert r["ok"] and r.get("matched", True)
+        assert r["ok"] is True and r["matched"] is True
         assert "hello-42" in _lines(srv.base_url, "a")
 
 

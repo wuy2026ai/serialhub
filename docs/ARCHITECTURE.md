@@ -551,17 +551,21 @@ class TcpBridge:
 - 命中 → 头前残行立即作为一行吐出（lrzsz `sz` 先打印 `rz\r`）→ 新建 `ZmodemSession`（`id` = uuid4 hex 前 8 位），
   `initial` 进 `pending` → `hub.mark(port, "[zmodem] start <direction>")` → 广播
   `{"type":"zmodem","event":"start","port","session","direction"}`。
-- 会话中读到的**全部**字节只进会话：未认领进 `pending`，认领后进会话的**无界** `queue.Queue`（`None` = 结束哨兵）。
+- 会话中读到的**全部**字节只进会话：未认领进 `pending`，认领后进会话的 `PayloadQueue`（`queue.Queue` 子类，不设 maxsize，
+  读循环从不阻塞；`None` = 结束哨兵；`queued_bytes` = 已放入、尚未被转发任务 `get` 走的负载字节数）。
   不断行、不解码、不经 `Hub.ingest`/环形缓冲/`Hub._broadcast`；检测器停用。
 - 会话中普通 `worker.write`（因此 `hub.send`/`hub.write_bytes`/TCP 桥写入）→ `RuntimeError("zmodem: session active on port '<name>'")`。
-- 每轮读循环检查：未认领超过 `zmodem_claim_ms` → `unclaimed`；双向都无字节超过 `zmodem_idle_ms` → `timeout`；二者都先写 `ABORT_SEQ`。
+- 每轮读循环检查：未认领超过 `zmodem_claim_ms` → `unclaimed`；双向都无字节超过 `zmodem_idle_ms` → `timeout`；
+  `queued_bytes > QUEUE_MAX_BYTES`（64 MiB，`zmodem.py` 模块常量；客户端连着却不取数据——收到的字节仍在刷新活动时间，
+  空闲超时管不到）→ `abort` 并记一条 warning 日志；三者都先写 `ABORT_SEQ`。
 - `close()`/`Hub.stop()` → `closed`（尽力写 `ABORT_SEQ` 后关口）；串口读错误断线 → `closed`（不写）。
 - 结束：队列放 `None` → `hub.mark(port, "[zmodem] end reason=<r> rx=<n> tx=<n>")` → 广播
   `{"type":"zmodem","event":"end","port","session","reason","rx_bytes","tx_bytes"}`，
   `reason ∈ done|abort|timeout|unclaimed|closed|disconnect`（`END_REASONS`）；`done` 立即回到行模式。
 - 非 `done` 结束 → **排空**：读到的字节一律丢弃（检测器停用），直到连续 `DRAIN_SILENCE_MS = 300` 无数据
   或总计 `DRAIN_MAX_MS = 3000`（`zmodem.py` 模块常量），再以清空的行缓冲/重置的解码器回到行模式——
-  设备处理 CAN 之前还在发的负载、OS/USB 缓冲里的残余都不会进环。
+  设备处理 CAN 之前还在发的负载、OS/USB 缓冲里的残余都不会进环。排空状态只属于当前连接：每次成功打开串口
+  （`open()` 直接打开或读循环重连）都清掉它，`closed` 结束后重连时设备的第一段输出（开机横幅）照常成行。
 - 会话中读循环只读 `in_waiting` 字节（无数据时在 `_io_lock` 外等 5 ms），不在锁下阻塞 0.1 s，owner 的写不被饿死。
 - TCP 桥：`write_bytes` 失败（如会话进行中）时不再 `ingest` tx 行。
 
@@ -572,7 +576,10 @@ def zmodem_claim(self, name, client_id: str) -> tuple[str, queue.Queue]
     # 先把 pending 回放进队列；同一 client 重复认领返回同一会话；
     # RuntimeError("zmodem: no active session") / RuntimeError("zmodem: claimed by another client")
 def zmodem_write(self, name, session_id, client_id, data: bytes) -> int
-    # 仅 owner；原始写，tx_bytes += n，刷新活动时间；会话不符 → 上述两种 RuntimeError
+    # 仅 owner；原始写，tx_bytes += n，刷新活动时间；会话不符 → 上述两种 RuntimeError。
+    # 按 max(64, baud // 20) 字节（8N1 约 0.5 s 线上时间）切片依次写、片间释放 _io_lock：单次 ser.write
+    # 不会超过 write_timeout=1（否则低波特率下抛 SerialTimeoutException）；某片失败照常抛出。
+    # 客户端每条 zmodem_write 为 1 KiB 子包（zmodem-ui.js / zclient.mjs 的 CHUNK = 1024）。
 def zmodem_end(self, name, session_id, client_id: Optional[str], *, abort=False, reason="done",
                tail: bytes = b"") -> dict
     # 幂等；返回 {"port","session","reason","rx_bytes","tx_bytes"}；abort 先写 ABORT_SEQ。
@@ -597,6 +604,8 @@ def zmodem_end(self, name, session_id, client_id: Optional[str], *, abort=False,
 - `{"type":"zmodem_end","port","session","abort":bool,"tail_b64"?}` → `hub.zmodem_end(..., abort, reason="abort" if abort else "done", tail=…)`。
   `tail_b64`（可选，仅非 abort 时生效）= 客户端收到、但不属于 ZMODEM 会话的字节：zmodem.js 会话结束后
   Sentry 经 `to_terminal` 交出的内容（lsz 的 `OO` 之后设备打印的 `sz done`、提示符等）。
+  解码后超过 `TAIL_MAX_BYTES`（16 KiB，`zmodem.py`）→ 整条 end 被拒（`zmodem_error`，`code: "bad_request"`），
+  会话**保持不变**，由客户端重发合规的 end（或 abort）；不重发则照常由空闲超时中止。
 - 任一失败（无会话、被他人认领、未知端口、base64 非法……）→ `{"type":"zmodem_error","port","code","error","session"?}`，连接不断。
   `code` 稳定可判：`no_session`（无会话/会话已结束）| `claimed_by_other`（认领时被他人占用）| `not_owner`（write/end 不是 owner）|
   `bad_request`（未知端口、base64 非法等）| `error`（其他）；`error` 是给人看的文本。客户端消息带了 `session`（write/end）时原样回显，
@@ -605,6 +614,9 @@ def zmodem_end(self, name, session_id, client_id: Optional[str], *, abort=False,
   认领一返回就记账（在发 `zmodem_claimed` 之前），转发任务因发送失败退出也不会抹掉记录，故中止不会被漏掉。
 - `abort` 只有字面量 `true` 才算中止（字符串 `"false"` 等按 `done` 处理）。
 - `{"type":"zmodem","event":"start"|"end",...}` 广播照常经订阅推给所有连接（受 `subscribe` 过滤）。
+  `start`/`claimed`/`end` 走的是**有损**的广播队列（与 line/status 同一条，订阅方积压时会丢）：丢了 `start`，
+  该标签页不弹窗，会话最终以 `unclaimed` 中止；丢了 `claimed`/`end`，旁观的标签页停在“已被占用”直到下一个 `start`。
+  负载不受影响（只走认领方自己的会话队列），不会丢数据。
 - 首次认领成功（worker `zmodem_claim`，同一客户端重复认领不再发）→ 广播 `{"type":"zmodem","event":"claimed","port","session"}`
   （只有元数据，不含 owner）；其他浏览器据此在点击前就显示“已被另一个浏览器占用”。认领方自己也会收到它，以 `zmodem_claimed` 回复为准。
 - 会话期间 REST `POST /api/ports/{name}/send` → 409 `{"ok":false,"error":"zmodem: session active on port '<name>'"}`。
