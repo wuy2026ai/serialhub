@@ -46,3 +46,7 @@ serialhub = ["static/*", "static/vendor/*", "static/i18n/*", "i18n/*.json"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "sim: 需要 socat/lrzsz 的串口仿真集成测试（缺工具则 skip）",
+    "e2e: 需要 node 的端到端测试（缺工具则 skip）",
+]
