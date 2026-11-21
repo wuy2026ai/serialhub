@@ -637,6 +637,8 @@ class SerialPortWorker(threading.Thread):
         """认领当前会话：先把 ``pending`` 回放进队列，返回 ``(session_id, queue)``。
 
         同一 ``client_id`` 重复认领返回同一会话；无会话 / 已被他人认领 → RuntimeError。
+        首次认领成功后广播 ``{"type":"zmodem","event":"claimed","port","session"}``（只有元数据，
+        不含 owner），其他浏览器据此在点击前就显示“已被占用”。
         """
         with self._zm_lock:
             s = self._zm_session
@@ -644,13 +646,18 @@ class SerialPortWorker(threading.Thread):
                 raise RuntimeError("zmodem: no active session")
             if s.owner is not None and s.owner != client_id:
                 raise RuntimeError("zmodem: claimed by another client")
-            if s.owner is None:
+            newly = s.owner is None
+            if newly:
                 s.owner = client_id
                 if s.pending:
                     s.queue.put_nowait(bytes(s.pending))
                     s.pending.clear()
                 s.last_activity_ms = now_ms()
-            return s.id, s.queue
+        if newly:  # 锁外广播（_zm_lock 是叶子锁）
+            self._hub._broadcast({
+                "type": "zmodem", "event": "claimed", "port": s.port, "session": s.id,
+            })
+        return s.id, s.queue
 
     def zmodem_write(self, session_id: str, client_id: str, data: bytes) -> int:
         """会话 owner 写原始字节到设备；计入 ``tx_bytes`` 并刷新活动时间。"""

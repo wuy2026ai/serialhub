@@ -197,7 +197,7 @@ def test_browser_cancel_second_tab_and_reload(browser, tmp_path):
             _page(browser, env["srv"].base_url) as other:
         (env["files"] / "big.bin").write_bytes(os.urandom(16 << 20))
 
-        # 1) 第二个标签页：本页认领后，另一页点 Receive → “被另一个浏览器占用”，按钮禁用
+        # 1) 第二个标签页：本页认领后，另一页不用点击就显示“被另一个浏览器占用”（claimed 广播），按钮禁用
         page.click("#btnSz")
         page.fill(".pane:not([hidden]) [data-zm-path]", "big.bin")
         page.press(".pane:not([hidden]) [data-zm-path]", "Enter")
@@ -207,11 +207,18 @@ def test_browser_cancel_second_tab_and_reload(browser, tmp_path):
         page.wait_for_function(
             "() => [...document.querySelectorAll('.pane:not([hidden]) .zm-file')]"
             ".some(e => Number(e.dataset.bytes) > 65536)", timeout=15000)
-        _dialog(other).locator("[data-zm-primary]").click()
-        other.wait_for_selector(".pane:not([hidden]) [data-zm][data-phase='inuse']")
+        other.wait_for_selector(".pane:not([hidden]) [data-zm][data-phase='inuse']", timeout=5000)
         assert "in use by another browser" in _dialog(other).inner_text()
         assert _dialog(other).locator("[data-zm-primary]").is_disabled()
         assert _dialog(other).locator("[data-zm-cancel]").is_disabled()
+
+        # 会话期间从发送栏发命令：REST 409 以普通 toast 显示，页面不坏
+        other.fill("#sendInput", "ping")
+        other.click("#sendBtn")
+        other.wait_for_function(
+            "() => document.querySelector('#toasts').innerText.includes('session active')",
+            timeout=5000)
+        assert other.input_value("#sendInput") == "ping"  # 发送失败不清空输入
 
         # 2) 传输中点 Cancel → zmodem_end abort:true；两页的对话框都关闭，文本恢复
         _dialog(page).locator("[data-zm-cancel]").click()
@@ -252,3 +259,76 @@ def _wait_line_after_now(srv, timeout: float = 10.0) -> None:
                           "since_seq": end_seq + 1},
                   timeout=timeout + 5).json()
     assert r["ok"] and r["matched"], "device text did not resume"
+
+
+def test_browser_back_to_back_transfers(browser, tmp_path):
+    """设备连着开会话（sz a; sz b; rz）：后一个 start 落在前一个对话框的收尾/停留窗口里，仍要弹框并完成。"""
+    with _sim(tmp_path) as env, _page(browser, env["srv"].base_url) as page:
+        one, two = os.urandom(40_000), os.urandom(70_000)
+        (env["files"] / "one.bin").write_bytes(one)
+        (env["files"] / "two.bin").write_bytes(two)
+        up = tmp_path / "three.bin"
+        up_data = os.urandom(30_000)
+        up.write_bytes(up_data)
+        got: list[tuple[str, bytes]] = []
+        page.on("download", lambda d: got.append((d.suggested_filename, Path(d.path()).read_bytes())))
+
+        # mock 设备一次读到三行命令，lsz/lrz 一个接一个（间隔只有几毫秒）
+        r = httpx.post(f"{env['srv'].base_url}/api/ports/{PORT}/send",
+                       json={"data": "sz one.bin\r\nsz two.bin\r\nrz", "eol": "crlf"}, timeout=5)
+        assert r.json()["ok"]
+        offer = ".pane:not([hidden]) [data-zm][data-phase='offer']"
+        for n in (1, 2):
+            page.wait_for_selector(offer + "[data-direction='download']")
+            _dialog(page).locator("[data-zm-primary]").click()
+            _wait_until(page, lambda n=n: len(got) >= n, 15)
+        page.wait_for_selector(offer + "[data-direction='upload']")
+        with page.expect_file_chooser() as fc:
+            _dialog(page).locator("[data-zm-primary]").click()
+        fc.value.set_files(str(up))
+        _wait_dialog_closed(page, 20)
+        assert got == [("one.bin", one), ("two.bin", two)]
+        _wait_file(env["recv"] / "three.bin", up_data)
+        _wait_rows(page, "rz done rc=0")
+        rows = _rows(page)
+        assert rows.count("[zmodem] end reason=done") == 3
+        assert "\ufffd" not in rows
+
+
+def _wait_until(page, pred, timeout: float) -> None:
+    """轮询 ``pred``；用 page.wait_for_timeout 让 Playwright 分发事件（如 download）。"""
+    deadline = time.time() + timeout
+    while not pred():
+        assert time.time() < deadline, "condition not met"
+        page.wait_for_timeout(50)
+
+
+def test_browser_upload_ended_by_server_goes_quiet(browser, tmp_path):
+    """服务端结束会话（这里：上传中关口）后，旧上传循环不再写；迟到的错误不影响下一个会话。"""
+    with _sim(tmp_path) as env, _page(browser, env["srv"].base_url) as page:
+        srv = env["srv"]
+        big = tmp_path / "big-up.bin"
+        big.write_bytes(os.urandom(24 << 20))
+        small = os.urandom(20_000)
+        (env["files"] / "small.bin").write_bytes(small)
+
+        page.click("#btnRz")
+        page.wait_for_selector(".pane:not([hidden]) [data-zm][data-phase='offer'][data-direction='upload']")
+        with page.expect_file_chooser() as fc:
+            _dialog(page).locator("[data-zm-primary]").click()
+        fc.value.set_files(str(big))
+        page.wait_for_function(
+            "() => [...document.querySelectorAll('.pane:not([hidden]) .zm-file')]"
+            ".some(e => Number(e.dataset.bytes) > 1048576)", timeout=15000)
+        assert httpx.post(f"{srv.base_url}/api/ports/{PORT}/close", json={}, timeout=5).json()["ok"]
+        _wait_dialog_closed(page)
+        page.wait_for_function(
+            "() => document.querySelector('#toasts').innerText.includes('port closed')", timeout=5000)
+        assert httpx.post(f"{srv.base_url}/api/ports/{PORT}/open", json={}, timeout=5).json()["ok"]
+        _wait_dev(env["dev"], "rz done rc=", 1, timeout=15)
+        _wait_line_after_now(srv, 15)
+
+        # 新会话照常：旧循环的残余写入/错误不会关掉它
+        got = _download(page, "small.bin")
+        assert got == [("small.bin", small)]
+        _wait_rows(page, "sz done rc=0")

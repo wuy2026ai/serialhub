@@ -5,6 +5,8 @@
 //   {"ended":bool,"tail":"<to_terminal text after the session>","error":str|null}
 //   node shim_check.mjs [--no-text] [--no-shim]
 // --no-text omits the device's "sz done" line (the session must still end, by timer).
+// --one-byte sends just "s" after ZFIN: too short for the OO check, so the timer
+// ends the session and must still hand the byte to the terminal.
 
 import Zmodem from "zmodem.js";
 import lrzszShim from "../../serialhub/static/vendor/zmodem-shim.js";
@@ -25,7 +27,8 @@ const CHUNKS = [
   // ZFIN (hex header) — lsz then exits without "OO"
   [42, 42, 24, 66, 48, 56, 48, 48, 48, 48, 48, 48, 48, 48, 48, 50, 50, 100, 13, 138],
 ];
-if (!args.has("--no-text")) CHUNKS.push(Array.from(Buffer.from("sz done rc=0\r\n")));
+if (args.has("--one-byte")) CHUNKS.push([115]);
+else if (!args.has("--no-text")) CHUNKS.push(Array.from(Buffer.from("sz done rc=0\r\n")));
 
 let ended = false;
 const tail = [];

@@ -143,6 +143,18 @@ def test_second_claim_by_other_client_raises(zhub) -> None:
         zhub.zmodem_claim("z", "tab-2")
 
 
+def test_first_claim_broadcasts_claimed_once(zhub) -> None:
+    _start(zhub)
+    sub = zhub.subscribe()
+    sid, _q = zhub.zmodem_claim("z", "tab-1")
+    zhub.zmodem_claim("z", "tab-1")  # 重复认领不再广播
+    with pytest.raises(RuntimeError):
+        zhub.zmodem_claim("z", "tab-2")
+    time.sleep(0.1)
+    claimed = [e for e in _zm_events(sub) if e["event"] == "claimed"]
+    assert claimed == [{"type": "zmodem", "event": "claimed", "port": "z", "session": sid}]
+
+
 def test_claim_without_session_raises(zhub) -> None:
     with pytest.raises(RuntimeError, match="zmodem: no active session"):
         zhub.zmodem_claim("z", "tab-1")

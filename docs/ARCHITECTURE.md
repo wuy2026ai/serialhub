@@ -597,11 +597,16 @@ def zmodem_end(self, name, session_id, client_id: Optional[str], *, abort=False,
 - `{"type":"zmodem_end","port","session","abort":bool,"tail_b64"?}` → `hub.zmodem_end(..., abort, reason="abort" if abort else "done", tail=…)`。
   `tail_b64`（可选，仅非 abort 时生效）= 客户端收到、但不属于 ZMODEM 会话的字节：zmodem.js 会话结束后
   Sentry 经 `to_terminal` 交出的内容（lsz 的 `OO` 之后设备打印的 `sz done`、提示符等）。
-- 任一失败（无会话、被他人认领、未知端口、base64 非法……）→ `{"type":"zmodem_error","port","error"}`，连接不断。
+- 任一失败（无会话、被他人认领、未知端口、base64 非法……）→ `{"type":"zmodem_error","port","code","error","session"?}`，连接不断。
+  `code` 稳定可判：`no_session`（无会话/会话已结束）| `claimed_by_other`（认领时被他人占用）| `not_owner`（write/end 不是 owner）|
+  `bad_request`（未知端口、base64 非法等）| `error`（其他）；`error` 是给人看的文本。客户端消息带了 `session`（write/end）时原样回显，
+  客户端据此丢弃旧会话迟到的错误（claim 不带 session，故其错误也不带）。
 - 连接断开时 → 对本连接认领过的**每个**会话调用 `hub.zmodem_end(..., abort=True, reason="disconnect")`（已结束的是幂等空操作）。
   认领一返回就记账（在发 `zmodem_claimed` 之前），转发任务因发送失败退出也不会抹掉记录，故中止不会被漏掉。
 - `abort` 只有字面量 `true` 才算中止（字符串 `"false"` 等按 `done` 处理）。
 - `{"type":"zmodem","event":"start"|"end",...}` 广播照常经订阅推给所有连接（受 `subscribe` 过滤）。
+- 首次认领成功（worker `zmodem_claim`，同一客户端重复认领不再发）→ 广播 `{"type":"zmodem","event":"claimed","port","session"}`
+  （只有元数据，不含 owner）；其他浏览器据此在点击前就显示“已被另一个浏览器占用”。认领方自己也会收到它，以 `zmodem_claimed` 回复为准。
 - 会话期间 REST `POST /api/ports/{name}/send` → 409 `{"ok":false,"error":"zmodem: session active on port '<name>'"}`。
 
 **`done` 结束后的文本回注**：会话只在客户端发 `zmodem_end` 时结束，设备在 `OO` 之后打印的内容可能已经进了会话。

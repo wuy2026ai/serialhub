@@ -20,6 +20,7 @@ MIT 允许再分发，条件是保留版权与许可声明——本文件即为�
 
 `zmodem.js`（作者 Gasper Software Consulting，见其 package.json）与 `crc-32`（Copyright (C) 2014-present SheetJS LLC）均为
 **Apache License 2.0**（<https://www.apache.org/licenses/LICENSE-2.0>）；未作修改，仅打包压缩。
+许可证全文随包分发：[`serialhub/static/vendor/LICENSE-zmodem.js.txt`](serialhub/static/vendor/LICENSE-zmodem.js.txt)。
 `zmodem.min.js` 由锁定在 `tests/zmodem_client/package-lock.json` 的源码一次性构建：
 
 ```sh

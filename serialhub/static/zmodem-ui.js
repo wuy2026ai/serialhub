@@ -139,7 +139,8 @@
     const primaryKey = s.phase === "prompt" ? "zm.request"
       : s.direction === "upload" ? "zm.choose" : "zm.receive";
     setText(primary.querySelector("[data-zm-primary-label]"), primaryKey);
-    primary.hidden = !(s.phase === "prompt" || s.phase === "offer" || s.phase === "inuse");
+    const needFiles = s.phase === "active" && s.direction === "upload" && !s.files;
+    primary.hidden = !(s.phase === "prompt" || s.phase === "offer" || s.phase === "inuse" || needFiles);
     primary.disabled = s.phase === "inuse";
     cancel.hidden = s.phase === "done";
     cancel.disabled = s.phase === "inuse" || s.phase === "finishing";
@@ -181,15 +182,24 @@
     s.raf = requestAnimationFrame(() => { s.raf = 0; render(port); });
   }
 
+  /* Retire a state object: its timers stop and alive(s) turns false, so a
+     still-running upload loop / sender / tail timer of it goes quiet. */
+  function dispose(s) {
+    s.finished = true;
+    clearTimeout(s.waitTimer);
+    clearTimeout(s.lingerTimer);
+    if (s.raf) { cancelAnimationFrame(s.raf); s.raf = 0; }
+  }
+
   function close(port) {
     const s = ports.get(port);
-    if (s) {
-      clearTimeout(s.waitTimer);
-      if (s.raf) cancelAnimationFrame(s.raf);
-    }
+    if (s) dispose(s);
     ports.delete(port);
     render(port);
   }
+
+  // The session this state belongs to is still ours to drive.
+  const alive = (s) => ports.get(s.port) === s && !s.finished && !s.endSent && !s.failed;
 
   /* ------------------------------------------------------- toolbar actions */
   function requireReady(port) {
@@ -244,16 +254,22 @@
       if (!path) { input.focus(); env.toast(t("zm.needPath"), "warn"); return; }
       runCommand(port, "sz " + shellQuote(path));
     } else if (s.phase === "offer") {
-      if (s.direction === "upload") {
-        // open the picker inside the click (user gesture); claim in parallel
-        const input = dialogFor(port).querySelector("[data-zm-input]");
-        input.value = "";
-        input.click();
-      }
       s.phase = "claiming";
       render(port);
       env.wsSend({ type: "zmodem_claim", port });
+    } else if (s.phase === "active" && s.direction === "upload" && !s.files) {
+      openPicker(port);
     }
+  }
+
+  // Upload: the picker opens once the claim succeeded (still inside the
+  // click's transient user activation); [Choose files…] stays as a fallback.
+  function openPicker(port) {
+    const root = dialogFor(port);
+    if (!root) return;
+    const input = root.querySelector("[data-zm-input]");
+    input.value = "";
+    input.click();
   }
 
   function onCancel(port) {
@@ -291,7 +307,7 @@
   }
 
   function fail(s, err) {
-    if (ports.get(s.port) !== s || s.failed) return;
+    if (ports.get(s.port) !== s || s.failed || s.finished) return;
     s.failed = true;
     if (!s.zmEnded) abort(s);
     env.toast(t("zm.failed", { reason: String(err && err.message ? err.message : err) }), "error");
@@ -299,7 +315,7 @@
   }
 
   function endDone(s) {
-    if (s.endSent) return;
+    if (!alive(s)) return;
     s.endSent = true;
     const msg = { type: "zmodem_end", port: s.port, session: s.sid, abort: false };
     // a late "OO" (after the shim already ended the session) is protocol, not text
@@ -316,9 +332,11 @@
         if (s.zmEnded) for (const b of octets) s.tail.push(b);
       },
       on_retract: () => {},
-      sender: (octets) => env.wsSend({
-        type: "zmodem_write", port: s.port, session: s.sid, b64: toB64(octets),
-      }),
+      sender: (octets) => {
+        if (alive(s)) {
+          env.wsSend({ type: "zmodem_write", port: s.port, session: s.sid, b64: toB64(octets) });
+        }
+      },
       on_detect: (detection) => {
         if (s.zsession) return;    // one zmodem.js session per relay session
         const zsession = detection.confirm();
@@ -360,10 +378,10 @@
     zsession.start();
   }
 
-  function waitDrain() {
+  function waitDrain(s) {
     return new Promise((resolve) => {
       (function poll() {
-        if (env.wsBuffered() <= MAX_BUFFERED) resolve();
+        if (!alive(s) || env.wsBuffered() <= MAX_BUFFERED) resolve();
         else setTimeout(poll, 15);
       })();
     });
@@ -371,11 +389,13 @@
 
   async function upload(s, zsession) {
     const files = s.files || await new Promise((resolve) => { s.resolveFiles = resolve; });
-    if (ports.get(s.port) !== s || s.endSent) return;
+    // every await below may outlive the session (server end, reconnect): re-check
+    if (!alive(s)) return;
     let remaining = files.reduce((n, f) => n + f.size, 0);
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       const data = new Uint8Array(await f.arrayBuffer());
+      if (!alive(s)) return;
       const row = { name: f.name, size: f.size, bytes: 0, t0: performance.now() };
       s.rows.push(row);
       scheduleRender(s.port);
@@ -387,43 +407,52 @@
         bytes_remaining: remaining,
       });
       remaining -= data.length;
+      if (!alive(s)) return;
       if (!xfer) { row.skipped = row.done = true; scheduleRender(s.port); continue; }
       let off = 0;
       for (; off + CHUNK < data.length; off += CHUNK) {
-        if (s.endSent) return;
+        if (!alive(s)) return;
         xfer.send(data.subarray(off, off + CHUNK));
         row.bytes = off + CHUNK;
         scheduleRender(s.port);
-        if (env.wsBuffered() > MAX_BUFFERED) await waitDrain();
+        if (env.wsBuffered() > MAX_BUFFERED) await waitDrain(s);
       }
+      if (!alive(s)) return;
       await xfer.end(data.subarray(off));
       row.bytes = data.length;
       row.done = true;
       row.end = performance.now();
       scheduleRender(s.port);
     }
-    await zsession.close();
+    if (alive(s)) await zsession.close();
   }
 
+  /* The relay session ended (zmodem_closed, or the end broadcast as fallback).
+     The toast always shows; the dialog only while this state is still current
+     (a new `start` may already have replaced it). */
   function finish(s, reason) {
-    if (ports.get(s.port) !== s || s.finished) return;
+    if (s.finished) return;
     s.finished = true;
     const ok = reason === "done" && s.zmEnded && !s.failed;
+    const current = () => ports.get(s.port) === s;
     const saves = ok && s.pendingSaves ? Promise.all(s.pendingSaves) : Promise.resolve();
     saves.then(() => {
-      if (ports.get(s.port) !== s) return;
       if (ok) {
         const n = (s.rows || []).filter((r) => !r.skipped).length;
         env.toast(t(s.direction === "upload" ? "zm.sent" : "zm.received", { n, port: s.port }), "ok");
+        if (!current()) return;
         s.phase = "done";
         render(s.port);
-        setTimeout(() => { if (ports.get(s.port) === s) close(s.port); }, DONE_LINGER_MS);
+        s.lingerTimer = setTimeout(() => { if (current()) close(s.port); }, DONE_LINGER_MS);
       } else {
         if (s.cancelled) env.toast(t("zm.cancelled", { port: s.port }), "info");
         else if (!s.failed) env.toast(t("zm.failed", { reason: reasonText(reason) }), "error");
-        close(s.port);
+        if (current()) close(s.port);
       }
-    }, (e) => { fail(s, e); });
+    }, (e) => {
+      env.toast(t("zm.failed", { reason: String(e && e.message ? e.message : e) }), "error");
+      if (current()) close(s.port);
+    });
   }
 
   function reasonText(reason) {
@@ -438,17 +467,29 @@
     if (!port) return;
     const s = ports.get(port);
     if (msg.event === "start") {
-      if (s && s.sid) return;      // ours is still running (stale ordering)
-      if (s) clearTimeout(s.waitTimer);
+      if (s && s.sid && !s.finished) {
+        // ours has not seen zmodem_closed yet; one session per port, so if its
+        // end broadcast arrived the old one is over — finish it now
+        if (!s.endReason) return;
+        finish(s, s.endReason);
+      }
+      if (s) dispose(s);
       ports.set(port, {
         port, phase: "offer", session: msg.session, direction: msg.direction,
       });
       render(port);
+    } else if (msg.event === "claimed") {
+      // another browser took it (ours is still `claiming` and learns from the reply)
+      if (s && s.session === msg.session && s.phase === "offer") {
+        s.phase = "inuse";
+        render(port);
+      }
     } else if (msg.event === "end") {
       if (!s || s.session !== msg.session) return;
       if (s.sid) {
         // ours: zmodem_closed normally follows; fall back to the broadcast
-        setTimeout(() => finish(s, msg.reason), 1500);
+        s.endReason = msg.reason || "closed";
+        setTimeout(() => finish(s, s.endReason), 1500);
         return;
       }
       if (s.cancelled) env.toast(t("zm.cancelled", { port }), "info");
@@ -471,7 +512,8 @@
     s.phase = "active";
     render(msg.port);
     try { s.sentry = startSentry(s); }
-    catch (e) { fail(s, e); }
+    catch (e) { fail(s, e); return; }
+    if (s.direction === "upload") openPicker(msg.port);
   }
 
   function onData(msg) {
@@ -487,19 +529,19 @@
     finish(s, msg.reason);
   }
 
+  /* zmodem_error carries `code`, and echoes `session` for write/end. Claim
+     errors have no session; anything else must match the live session, so a
+     late error of an old session never touches a new one. */
   function onError(msg) {
     const s = ports.get(msg.port);
     if (!s) return;
     const err = String(msg.error || "");
-    if (s.phase === "claiming") {
-      if (/claimed by another client/.test(err)) {
-        s.phase = "inuse";
-        render(msg.port);
-        return;
-      }
-      if (/no active session/.test(err)) { close(msg.port); return; }
+    if (msg.session == null) {
+      if (s.phase !== "claiming") return;
+      if (msg.code === "claimed_by_other") { s.phase = "inuse"; render(msg.port); return; }
+      if (msg.code === "no_session") { close(msg.port); return; }
       fail(s, err);
-    } else if (s.sid && !s.failed && !s.endSent) {
+    } else if (s.sid && msg.session === s.sid && alive(s)) {
       fail(s, err);
     }
   }

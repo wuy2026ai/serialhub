@@ -440,12 +440,25 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
                 except Exception:  # noqa: BLE001 - 客户端已断开
                     break
 
-        async def _zm_error(port: Any, exc: BaseException) -> None:
+        async def _zm_error(port: Any, exc: BaseException, session: Any = None,
+                            *, claim: bool = False) -> None:
+            """``zmodem_error``：带稳定的 ``code``；客户端消息带了 ``session`` 时原样回显。"""
             if isinstance(exc, KeyError):
                 error = t("server.error.unknown_port", name=str(exc))
             else:
                 error = str(exc)
-            await websocket.send_json({"type": "zmodem_error", "port": port, "error": error})
+            if isinstance(exc, (KeyError, ValueError)):
+                code = "bad_request"
+            elif "no active session" in error:
+                code = "no_session"
+            elif "claimed by another client" in error:
+                code = "claimed_by_other" if claim else "not_owner"
+            else:
+                code = "error"
+            msg = {"type": "zmodem_error", "port": port, "code": code, "error": error}
+            if session is not None:
+                msg["session"] = session
+            await websocket.send_json(msg)
 
         async def _zm_pump(port: str, sid: str, zq: "queue.Queue[Optional[bytes]]") -> None:
             """会话转发任务：负载只发给本连接（base64），遇 None 哨兵发 zmodem_closed。"""
@@ -492,7 +505,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
                 sid, zq = hub.zmodem_claim(port, client_id)
                 st = hub.zmodem_status(port)
             except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
-                await _zm_error(port, exc)
+                await _zm_error(port, exc, claim=True)
                 return
             # 先记账再 await：回复发送失败时断开路径也能中止这个已认领的会话
             if (port, sid) not in zm_claimed:
@@ -510,9 +523,9 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
                 # 阻塞写放线程里；本循环逐条 await，写入顺序与收到顺序一致
                 await asyncio.to_thread(hub.zmodem_write, port, str(sid), client_id, data)
             except binascii.Error as exc:
-                await _zm_error(port, ValueError(f"zmodem: bad base64: {exc}"))
+                await _zm_error(port, ValueError(f"zmodem: bad base64: {exc}"), sid)
             except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
-                await _zm_error(port, exc)
+                await _zm_error(port, exc, sid)
 
         async def _zm_end(port: Any, sid: Any, abort: bool, tail_b64: Any) -> None:
             try:
@@ -523,9 +536,9 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
                     abort=abort, reason="abort" if abort else "done", tail=tail,
                 )
             except binascii.Error as exc:
-                await _zm_error(port, ValueError(f"zmodem: bad base64: {exc}"))
+                await _zm_error(port, ValueError(f"zmodem: bad base64: {exc}"), sid)
             except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
-                await _zm_error(port, exc)
+                await _zm_error(port, exc, sid)
 
         def _zm_abort_all(owned: list[tuple[str, str]]) -> None:
             for port, sid in owned:

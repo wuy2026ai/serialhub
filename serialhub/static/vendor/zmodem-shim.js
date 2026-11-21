@@ -55,8 +55,14 @@
       clearTimeout(this._lrzszOOTimer);
       this._lrzszOOTimer = setTimeout(function () {
         if (self._bytes_after_OO || self._aborted) return;
-        self._bytes_after_OO = [];
+        // a lone "O" (half of OO) is protocol; anything else buffered is device text
+        var rest = self._input_buffer.splice(0, self._input_buffer.length);
+        if (rest.length === 1 && rest[0] === 79) rest = [];
+        self._bytes_after_OO = rest;
         self._on_session_end();
+        // the Sentry only forwards trailing bytes from inside consume(): hand
+        // these over the same way it forwards stray bytes ("garbage" → to_terminal)
+        if (rest.length) self._Happen("garbage", rest.slice(0));
       }, ZFIN_OO_WAIT_MS);
     };
 

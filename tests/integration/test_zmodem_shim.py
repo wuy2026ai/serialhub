@@ -28,6 +28,10 @@ def test_missing_oo_and_silence_ends_by_timer():
     assert _run("--no-text") == {"ended": True, "tail": "", "error": None}
 
 
+def test_timer_end_keeps_buffered_byte():
+    assert _run("--one-byte") == {"ended": True, "tail": "s", "error": None}
+
+
 def test_unpatched_zmodem_js_fails():
     """不打补丁时 zmodem.js 0.1.10 确实会抛错（证明上面两条测的是补丁）。"""
     res = _run("--no-shim")

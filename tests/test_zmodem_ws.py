@@ -59,9 +59,11 @@ def test_claim_without_session_errors(app_hub) -> None:
     with tc.websocket_connect("/ws") as ws:
         ws.send_json({"type": "zmodem_claim", "port": "z"})
         err = _recv_until(ws, "zmodem_error")
-        assert err == {"type": "zmodem_error", "port": "z", "error": "zmodem: no active session"}
+        assert err == {"type": "zmodem_error", "port": "z", "code": "no_session",
+                       "error": "zmodem: no active session"}
         ws.send_json({"type": "zmodem_claim", "port": "nope"})
-        assert _recv_until(ws, "zmodem_error")["port"] == "nope"
+        err = _recv_until(ws, "zmodem_error")
+        assert err["port"] == "nope" and err["code"] == "bad_request"
 
 
 def test_claim_relays_data_write_and_end(app_hub) -> None:
@@ -113,11 +115,14 @@ def test_write_by_non_owner_and_bad_base64_error(app_hub) -> None:
         _start(hub)
         sid = hub.zmodem_status("z")["session"]
         ws.send_json({"type": "zmodem_write", "port": "z", "session": sid, "b64": _b64(b"x")})
-        assert "claimed by another client" in _recv_until(ws, "zmodem_error")["error"]
+        err = _recv_until(ws, "zmodem_error")
+        assert "claimed by another client" in err["error"]
+        assert err["code"] == "not_owner" and err["session"] == sid  # 回显 session
         ws.send_json({"type": "zmodem_claim", "port": "z"})
         _recv_until(ws, "zmodem_claimed")
         ws.send_json({"type": "zmodem_write", "port": "z", "session": sid, "b64": "%%%"})
-        assert "base64" in _recv_until(ws, "zmodem_error")["error"]
+        err = _recv_until(ws, "zmodem_error")
+        assert "base64" in err["error"] and err["code"] == "bad_request" and err["session"] == sid
         assert hub.zmodem_status("z")["active"] is True  # 出错不影响会话
 
 
@@ -224,3 +229,39 @@ def test_abort_must_be_literal_true(app_hub) -> None:
         sid = _recv_until(ws, "zmodem_claimed")["session"]
         ws.send_json({"type": "zmodem_end", "port": "z", "session": sid, "abort": "false"})
         assert _recv_until(ws, "zmodem_closed")["reason"] == "done"
+
+
+def test_error_codes_and_session_echo(app_hub) -> None:
+    """claim 失败的 code 区分无会话 / 被他人认领；write/end 的错误回显客户端带来的 session。"""
+    tc, hub = app_hub
+    with tc.websocket_connect("/ws") as owner, tc.websocket_connect("/ws") as other:
+        _start(hub)
+        sid = hub.zmodem_status("z")["session"]
+        owner.send_json({"type": "zmodem_claim", "port": "z"})
+        _recv_until(owner, "zmodem_claimed")
+        other.send_json({"type": "zmodem_claim", "port": "z"})
+        err = _recv_until(other, "zmodem_error")
+        assert err["code"] == "claimed_by_other" and "session" not in err
+        other.send_json({"type": "zmodem_end", "port": "z", "session": sid, "abort": True})
+        err = _recv_until(other, "zmodem_error")
+        assert err["code"] == "not_owner" and err["session"] == sid
+        owner.send_json({"type": "zmodem_end", "port": "z", "session": sid, "abort": True})
+        _recv_until(owner, "zmodem_closed")
+        owner.send_json({"type": "zmodem_write", "port": "z", "session": sid, "b64": _b64(b"x")})
+        err = _recv_until(owner, "zmodem_error")  # 迟到的写：会话已结束
+        assert err == {"type": "zmodem_error", "port": "z", "code": "no_session",
+                       "error": "zmodem: no active session", "session": sid}
+
+
+def test_claim_broadcasts_claimed_to_every_socket(app_hub) -> None:
+    tc, hub = app_hub
+    with tc.websocket_connect("/ws") as owner, tc.websocket_connect("/ws") as other:
+        _start(hub)
+        sid = hub.zmodem_status("z")["session"]
+        owner.send_json({"type": "zmodem_claim", "port": "z"})
+        ev = {"type": "zmodem", "event": "claimed", "port": "z", "session": sid}
+        for _ in range(200):
+            if other.receive_json() == ev:
+                break
+        else:
+            raise AssertionError("no claimed broadcast")
