@@ -7,6 +7,7 @@ receive-side file handling runs against the Python sender over an in-memory pipe
 from __future__ import annotations
 
 import base64
+import io
 import os
 import threading
 import time
@@ -200,13 +201,15 @@ def test_cleanup_after_peer_cancel_writes_only_the_eol() -> None:
     assert lines == ["sz: cannot open x", "sz done rc=128"]
 
 
-def test_cleanup_stops_hint_at_provoked_junk_and_aborts_when_device_keeps_talking() -> None:
+def test_cleanup_drops_provoked_junk_and_never_doubles_the_abort() -> None:
     exc = zp.ZmodemError("c", cancelled=True,
                          after=b"rz done rc=143\r\nERR unknown: \x8a\x11\xff\r\nmore\r\n")
-    assert zc._device_lines(exc.before, exc.after) == ["rz done rc=143"]
+    assert zc._device_lines(exc.before, exc.after) == ["rz done rc=143", "more"]
+    # the device keeps talking (settle capped): we already wrote ABORT_SEQ, so the daemon must
+    # not write another (abort:false, empty tail), and the terminator still goes out
     t = _FakeTransport([], chatty=True)
     zc._cleanup(t, zp.ZmodemError("boom", timed_out=True), b"\r")
-    assert t.writes == [ABORT_SEQ] and t.ends == [(True, b"")]
+    assert t.writes == [ABORT_SEQ, b"\r"] and t.ends == [(False, b"")]
 
 
 def test_cleanup_classifies_a_write_error_followed_by_can() -> None:
@@ -325,3 +328,177 @@ def test_mcp_full_profile_errors_stay_in_envelope(monkeypatch) -> None:
         "ok": False, "error": "OSError: disk full"}
     assert asyncio.run(mcp_server.zmodem_send("a", path="x")) == {
         "ok": False, "error": "OSError: disk full"}
+
+
+# --------------------------------------------------------------------------- #
+# fix round 2
+# --------------------------------------------------------------------------- #
+_CAN = b"\x18" * 8 + b"\x08" * 8
+
+
+@pytest.mark.parametrize("before,after,want", [
+    # UTF-8 text after the cancel
+    (b"", _CAN + "sz: 无法打开 nope.bin: 没有那个文件\r\nsz done rc=128\r\n".encode(),
+     ["sz: 无法打开 nope.bin: 没有那个文件", "sz done rc=128"]),
+    # a real message after one garbage line
+    (b"", _CAN + b"\x8a\x91x\r\nsz: cannot open nope.bin\r\n", ["sz: cannot open nope.bin"]),
+    # ANSI colours, before and after the cancel
+    (b"\x1b[31mE: flash write failed\x1b[0m\r\n", _CAN, ["E: flash write failed"]),
+    (b"", _CAN + b"\x1b[31mE: flash full\x1b[0m\r\n# ", ["E: flash full", "#"]),
+    # Latin-1 (not UTF-8) text
+    (b"Fehler: Datei \xfcberschritten\r\n", _CAN, ["Fehler: Datei \ufffdberschritten"]),
+], ids=["utf8-after", "garbage-line-first", "ansi-before", "ansi-after", "latin1-before"])
+def test_hint_keeps_real_device_messages(before, after, want) -> None:
+    assert zc._device_lines(before, after) == want
+
+
+def test_hint_drops_protocol_echo_and_binary_and_caps_length() -> None:
+    echo = (b"ERR unknown: B0100000023be50\r\n"          # our ZRINIT, run as a command
+            b"ERR unknown: \x8a\x11\xff\r\n"             # our hex-header trailer
+            b"\x18\x18B0900\r\n"                          # ZDLE
+            + bytes(range(0x80, 0xC0)) + b"\r\n"          # binary
+            + b"ok " + b"y" * 400 + b"\r\n")
+    lines = zc._device_lines(b"", _CAN + echo)
+    assert lines == ["ok " + "y" * 237]
+    assert len(lines[0]) == 240
+
+
+def _device_abort_copies(t: "_FakeTransport") -> int:
+    """ABORT_SEQ copies reaching the device: ours plus one per ``abort:true`` end (daemon)."""
+    return sum(w.count(ABORT_SEQ) for w in t.writes) + sum(1 for abort, _ in t.ends if abort)
+
+
+_CANCEL = zp.ZmodemError("cancelled", cancelled=True, after=b"rz done rc=1\r\n")
+_GONE = zp.ZmodemError("gone", peer_gone=True, before=b"Killed\r\n")
+
+
+@pytest.mark.parametrize("exc,replies,chatty,pending,closed,gone", [
+    (zp.ZmodemError("t", timed_out=True), [b"$ "], False, b"", None, False),
+    (zp.ZmodemError("t", timed_out=True), [], True, b"", None, False),
+    (zp.ZmodemError("receiver never sent ZRINIT"), [b"$ "], False, b"", None, False),
+    (zp.ZmodemError("receiver never sent ZRINIT"), [], True, b"", None, False),
+    (_CANCEL, [b"$ "], False, b"", None, True),
+    (_CANCEL, [], True, b"", None, True),
+    (_GONE, [], False, b"", None, True),
+    (_GONE, [], True, b"", None, True),
+    (zp.ZmodemError("daemon: Write timeout"), [], False, _CAN + b"rz done\r\n", None, True),
+    (zp.ZmodemError("daemon: Write timeout"), [], False, b"Killed\r\n# ", None, True),
+    (zp.ZmodemError("daemon ended the session (timeout)"), [], False, b"", "timeout", False),
+], ids=["timeout", "timeout-capped", "own-error", "own-error-capped", "cancel",
+        "cancel-capped", "peer-gone", "peer-gone-capped", "write-error-then-can",
+        "write-error-then-text", "daemon-closed"])
+def test_abort_seq_at_most_once_and_never_to_a_gone_peer(exc, replies, chatty, pending,
+                                                         closed, gone) -> None:
+    t = _FakeTransport(list(replies), chatty=chatty)
+    t.pending, t.closed = pending, closed
+    out = zc._cleanup(t, exc, b"\r")
+    assert out.gone is gone
+    copies = _device_abort_copies(t)
+    assert copies == 0 if gone else copies <= 1, (t.writes, t.ends)
+    if closed is None:
+        assert t.writes[-1:] == [b"\r"]   # the cleanup terminator always goes out
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs POSIX permissions")
+def test_unwritable_dest_is_an_engine_error_with_partial_results(tmp_path) -> None:
+    """A save-side OSError (read-only dir for the second file) becomes the engine's error type,
+    so the client's one cleanup path runs; the first file is kept and reported."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    a2b, b2a = _Chan(), _Chan()
+    saver = zc._SaveDir(str(dest), False)
+    real_call = zc._SaveDir.__call__
+    offers = []
+
+    def offer(name, size):
+        offers.append(name)
+        if len(offers) == 2:
+            os.chmod(dest, 0o500)
+        return real_call(saver, name, size)
+
+    deadline = time.monotonic() + 10
+    out: dict = {}
+
+    def rx():
+        try:
+            zp.receive_files(_End(a2b, b2a), offer, deadline=deadline, abort_on_error=False)
+        except BaseException as exc:  # noqa: BLE001
+            out["exc"] = exc
+
+    th = threading.Thread(target=rx, daemon=True)
+    th.start()
+    try:
+        with pytest.raises(zp.ZmodemError):
+            zp.send_files(_End(b2a, a2b), [_spec("a.bin", b"first"), _spec("b.bin", b"second")],
+                          deadline=time.monotonic() + 3, frame_timeout=0.5)
+        th.join(10)
+    finally:
+        os.chmod(dest, 0o700)
+    exc = out["exc"]
+    assert isinstance(exc, zp.ZmodemError), exc
+    assert str(exc).startswith(f"cannot write {dest / 'b.bin'}: Permission denied"), exc
+    assert [f.name for f in exc.files] == ["a.bin"]
+    assert [s.name for s in saver.saved] == ["a.bin"]
+    assert (dest / "a.bin").read_bytes() == b"first"
+
+
+def test_cancel_mid_file_names_the_file_and_progress(tmp_path, monkeypatch) -> None:
+    """A cancel after a ZFILE is not "device sent no file": it says where it stopped."""
+    info = zp.file_info(zp.FileSpec("big.bin", io.BytesIO(b""), 4096), 1, 4096)
+    replies = [  # to our ZRINIT, then to our ZRPOS: one data subpacket, then the cancel
+        [zp.encode_bin_header(zp.ZFILE, bytes([0, 0, 0, 1]), use32=True)
+         + zp.encode_subpacket(info, zp.ZCRCW, use32=True)],
+        [zp.encode_bin_header(zp.ZDATA, zp.pos_bytes(0), use32=True)
+         + zp.encode_subpacket(b"A" * 1024, zp.ZCRCG, use32=True), _CAN + b"sz: read error\r\n"]]
+
+    class Peer:
+        chunks = [zp.encode_hex_header(zp.ZRQINIT)]
+
+        def read(self, timeout):
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def write(self, data):
+            if replies:
+                self.chunks += replies.pop(0)
+
+    def fake_run(url, token, port, cmd, direction, timeout_ms, size, engine):
+        try:
+            return engine(Peer(), zc._Clock(5000, None, size), None)
+        except zp.ZmodemError as exc:
+            hint = " | ".join(zc._device_lines(exc.before, exc.after))
+            raise zc.ZmodemClientError("device cancelled the transfer", cancelled=True,
+                                       hint=hint, files=exc.files) from None
+
+    monkeypatch.setattr(zc, "_run_session", fake_run)
+    env = zc.receive_session("http://x", None, "a", ["big.bin"], str(tmp_path))
+    assert env == {"ok": False, "files": [], "error": "device cancelled the transfer at "
+                   "1024/4096 bytes of big.bin; device said: sz: read error"}
+    assert os.listdir(tmp_path) == []
+
+
+def test_cli_exit_code_comes_from_the_result_not_the_text(tmp_path, monkeypatch, capsys) -> None:
+    """Inlined file content with lines like ``error: …`` / ``skipped …`` must not fail the CLI;
+    a partial or failed result must."""
+    from serialhub import cli
+
+    body = b"boot\nerror: sensor 3 missing\nskipped calibration\nnot received ack\n"
+    log = tmp_path / "dev.log"
+    log.write_bytes(body)
+    ok = {"ok": True, "files": [{"name": "dev.log", "bytes": len(body),
+                                 "crc32": f"{zlib.crc32(body):08X}", "path": str(log)}],
+          "missing": [], "refused": []}
+    monkeypatch.setattr(zc, "receive_session", lambda *a, **kw: dict(ok))
+    assert cli.main(["zrecv", "a", "dev.log", "--inline"]) == 0
+    assert "error: sensor 3 missing" in capsys.readouterr().out
+    monkeypatch.setattr(zc, "receive_session", lambda *a, **kw: dict(ok, missing=["x"]))
+    assert cli.main(["zrecv", "a", "dev.log", "x", "--inline"]) == 1
+    monkeypatch.setattr(zc, "receive_session",
+                        lambda *a, **kw: {"ok": False, "error": "boom", "files": []})
+    assert cli.main(["zrecv", "a", "dev.log"]) == 1
+    sent = {"name": "a", "bytes": 1, "crc32": "00000001", "seconds": 0.1, "skipped": False}
+    monkeypatch.setattr(zc, "send_session", lambda *a, **kw: {"ok": True, "files": [sent]})
+    assert cli.main(["zsend", "a", str(log)]) == 0
+    monkeypatch.setattr(zc, "send_session", lambda *a, **kw: {
+        "ok": True, "files": [sent, dict(sent, name="b", skipped=True)]})
+    assert cli.main(["zsend", "a", str(log)]) == 1
+    capsys.readouterr()

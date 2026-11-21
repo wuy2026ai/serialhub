@@ -87,8 +87,9 @@ remote). The tools send `rz` / `sz <remote>` themselves — do not `send` them f
   device is quiet, writes one line terminator to flush the device's input line, discards the
   shell's reply to it, and returns the device's own text to the ring buffer. The terminator is
   the per-port setting `zmodem_cleanup_eol`: `cr` (default) | `lf` | `crlf` | `ctrl-u-cr` |
-  `none` — use `ctrl-u-cr` or `none` on U-Boot-style shells, which repeat the last command on
-  an empty line.
+  `none`. `ctrl-u-cr` clears a partly typed line on readline-style shells. Use `none` on
+  U-Boot-style shells, which repeat the last command on an empty line (Ctrl-U then CR is still
+  an empty line there).
 - After a transfer the device's own output (`rz done rc=0`, the prompt) is returned to the
   ring buffer as normal lines, so `read` shows it.
 

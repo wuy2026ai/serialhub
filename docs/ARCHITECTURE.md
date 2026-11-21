@@ -666,6 +666,18 @@ zmodem.js 原样会对设备的下一行抛 “Only thing after ZFIN should be O
   `Write timeout`）后客户端停止写数据，先看紧随其后的设备字节（CAN / 文本）再决定是否中止。
 - **已知局限**：daemon 自己发起的中止（`unclaimed`、`timeout`、断线、浏览器的 abort）仍是 daemon 写 `ABORT_SEQ`
   并排空，没有上面的“冲掉行缓冲”一步——设备 shell 的输入行里可能残留 CAN/BS，下一条命令可能失败一次。
+- **第二轮修正（2026-11 增补，以下几条优先于上文）**：
+  - 收尾**一律** `zmodem_end abort:false`：`ABORT_SEQ` 已由客户端写过、或对方已退出，daemon 不能再写一份；第 2 步到
+    3 s 上限时 `tail` 为空，但行结束符照写。客户端被中断（如 Ctrl-C）时同样按此决定 `abort`。
+  - 接收方数据阶段：一帧超时后，若上一个有效帧之后收到的只是 shell 文本行（且没有待解析的帧），判定发送方已退出
+    （`peer_gone`），不再写 ZRPOS/ZRINIT。文本判定忽略 XON/XOFF（tty 给每个十六进制头追加的残留）。
+  - 保存侧的 `OSError`（目录只读、磁盘满）以引擎的错误类型抛出、走同一收尾；结果先列已收完的文件，再
+    `error: cannot write <path>: <reason>`。
+  - 发送节奏自适应：起步每 1 KiB 一个 ZCRCQ、窗口 4 KiB；按测得的 ACK 速率（不超过配置的波特率）重算节奏，等 ZACK
+    的时长按测得速率算、且不短于 `frame_timeout`；ZEOF 重试保留在途字节数；空 ZCRCW 同步期间较早的 ZACK 只算进度、
+    不触发重发。配置波特率高估实际线速（socket://、USB-CDC、ser2net、写 flash 流控）时也不重复发送。
+  - 提示文本：去掉 ANSI 转义，UTF-8 以替换方式解码；只丢弃大半不可打印 / 替换字符的行和我方协议回显（ZDLE、十六进制头
+    及其 `\x8a\x11` 尾、行内原始控制字节），其余设备行都保留（最多 3 行，每行 ≤ 240 字符）。
 
 守护进程行为不变、不增加文件访问面（可在远端）。对外：lite 工具 `zsend`/`zrecv`、CLI `serialhub zsend|zrecv`、
 完整 MCP profile `zmodem_send`/`zmodem_receive`（见 `docs/AGENT-LITE.md`）。

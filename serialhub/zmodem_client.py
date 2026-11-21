@@ -16,7 +16,9 @@ zsend / zrecv 的编排层：引擎（``zmodem_proto``）跑在**调用方进程
    对方可能还活着时写**一次** ``ABORT_SEQ``（引擎不写，daemon 也不写——以 ``abort:false``
    结束）→ 等设备安静（300 ms 无数据，最多 3 s），这段文本就是提示 → 写一次
    ``zmodem_cleanup_eol`` 冲掉设备输入行缓冲里的残留 → 再等安静并**丢弃** shell 对它的回应 →
-   ``zmodem_end abort:false``，``tail`` 只含设备自己的文本；设备 3 s 内都安静不下来才 ``abort:true``。
+   ``zmodem_end abort:false``，``tail`` 只含设备自己的文本（设备 3 s 内都安静不下来则 tail 为空）——
+   始终 ``abort:false``：``ABORT_SEQ`` 已写过或对方已退出，daemon 不能再写一份。自身的非 ZMODEM 异常
+   （保存目录只读、磁盘满……）也包装成引擎的错误类型走这条路。
 
 ``zsend`` / ``zrecv`` 返回给 agent 的短文本（用户错误一律 ``error: ...``，绝不抛异常；部分完成时
 先列出已传完的文件、最后一行是 ``error:``）；``send_session`` / ``receive_session`` 返回结构化
@@ -52,6 +54,7 @@ SYNC_WAIT = 30.0              #: 收尾：等 daemon 把已发出的数据写完
 SETTLE_SILENCE = 0.3          #: 收尾：连续这么久没有数据即认为设备已安静（秒）……
 SETTLE_MAX = 3.0              #: ……最多等这么久（仍在说话 → abort:true）
 HINT_LINES = 3                #: 失败提示里附带的设备行数
+HINT_LINE_MAX = 240           #: 每行最多这么多字符
 TIMEOUT_MAX_MS = 1_800_000
 AUTO_FACTOR, AUTO_SLACK = 1.5, 30.0   #: 自动超时 = 字节×10/波特率×1.5 + 30 s
 INLINE_MAX = 1 << 20          #: zsend 内联 content 解码后的上限
@@ -63,6 +66,11 @@ Progress = Optional[Callable[[str, int, Optional[int]], None]]
 
 #: A ZMODEM hex header with its CR/LF/XON trailer (protocol bytes inside device text).
 _HEX_HEADER = re.compile(rb"\*+\x18B[0-9a-fA-F]{14}\r?[\n\x8a]?\x11?")
+#: ANSI escape sequences (CSI … final byte, OSC … BEL/ST, two-byte ESC x).
+_ANSI = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])")
+#: Pieces of our own frames in a line the shell printed back: ZDLE, a hex-header body, the
+#: hex-header trailer (``\r`` ran the line, ``\x8a\x11`` stayed).
+_ECHO = re.compile(rb"\x18|\x8a\x11|B[01][0-9a-f]{13}")
 _WIN_RESERVED = re.compile(r"^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$", re.I)
 
 
@@ -75,6 +83,15 @@ class ZmodemClientError(Exception):
         self.cancelled = cancelled
         self.hint = hint
         self.files = list(files or [])
+
+
+class _LocalError(zp.ZmodemError):
+    """A failure on our side of the link (e.g. the save directory is not writable), raised as
+    the engine's error type so it takes the same cleanup path; its text is the message."""
+
+
+def _cannot_write(path: str, exc: OSError) -> _LocalError:
+    return _LocalError(f"cannot write {path}: {exc.strerror or exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -153,30 +170,35 @@ def _crc(value: int) -> str:
 
 
 def _clean_line(raw: bytes) -> Optional[str]:
-    """A device text line, or ``None`` if it holds control/binary bytes (protocol or junk)."""
+    """A device text line, or ``None`` if it is our own protocol echo or mostly binary.
+
+    ANSI escape sequences are removed and the rest is decoded as UTF-8 with replacement
+    (a Latin-1 message keeps its readable part). Echo = a piece of one of our frames (ZDLE,
+    a hex-header body or its ``\\x8a\\x11`` trailer) or raw C0 control bytes in the line (the
+    shell repeating binary it was fed). Mostly non-printable / replacement → junk.
+    """
+    if _ECHO.search(raw):
+        return None
+    # 7-bit XON/XOFF only: 0x91/0x93 are also UTF-8 continuation bytes
+    raw = _ANSI.sub(b"", raw).translate(None, b"\x11\x13")
     if any((c < 32 and c != 9) or c == 0x7F for c in raw):
         return None
-    try:
-        return raw.decode("utf-8").strip()
-    except UnicodeDecodeError:
+    text = raw.decode("utf-8", "replace").strip()
+    if not text:
+        return ""
+    bad = sum(1 for ch in text if ch == "\ufffd" or "\x80" <= ch <= "\x9f")
+    if bad * 2 >= len(text):
         return None
+    return text[:HINT_LINE_MAX]
 
 
 def _device_lines(before: bytes, after: bytes = b"") -> list[str]:
-    """Device text around a cancel: every clean line before it; after it, clean lines up to
-    the first junk line (what follows is the shell chewing on our in-flight bytes)."""
-    before = _HEX_HEADER.sub(b"", before).translate(None, b"\x11\x13\x91\x93")
-    lines = [ln for raw in re.split(rb"\r\n|\r|\n", before)
-             if (ln := _clean_line(raw))]
-    after = _HEX_HEADER.sub(b"", after.lstrip(b"\x18\x08")).translate(None, b"\x11\x13\x91\x93")
-    for raw in re.split(rb"\r\n|\r|\n", after):
-        # after a cancel the shell may be echoing our in-flight bytes: plain ASCII only
-        ln = _clean_line(raw) if all(c < 0x80 for c in raw) else None
-        if ln is None:
-            break
-        if ln:
-            lines.append(ln)
-    return lines
+    """Device text around a cancel (before it, then after it): every line that is the device's
+    own, in order; lines that are junk or echo of our bytes are dropped, not a stop."""
+    before = _HEX_HEADER.sub(b"", before)
+    after = _HEX_HEADER.sub(b"", after.lstrip(b"\x18\x08"))
+    return [ln for raw in re.split(rb"\r\n|\r|\n", before + b"\r\n" + after)
+            if (ln := _clean_line(raw))]
 
 
 # --------------------------------------------------------------------------- #
@@ -228,6 +250,8 @@ class _WsTransport:
         self._error: Optional[tuple[str, float]] = None
         self.cleaning = False   # 收尾中：daemon 对旧数据的写失败照常会来，不再当错误
         self._pending = bytearray()  # sync() 期间收到的会话数据，下次 read 先交出
+        #: 已写过 ABORT_SEQ 或对方已退出：任何结束方式都不能再让 daemon 写一份（abort:false）
+        self.no_daemon_abort = False
 
     def read(self, timeout: float) -> bytes:
         if self._pending:
@@ -381,7 +405,13 @@ def _cleanup(transport: Any, exc: zp.ZmodemError, eol: bytes) -> _Outcome:
        ≤ 3 s): that text is the hint;
     3. one line terminator flushes the device's input line buffer;
     4. sync + settle again and discard the shell's reply to it;
-    5. ``zmodem_end abort:false`` with only the step-2 text (``abort:true`` if step 2 hit its cap).
+    5. ``zmodem_end abort:false`` with only the step-2 text — always ``abort:false``: we wrote
+       the one ``ABORT_SEQ`` ourselves or the peer is gone, so the daemon must not add another;
+       if step 2 hit its cap (device still talking) the tail is empty but the terminator still
+       goes out.
+
+    ``transport.no_daemon_abort`` is set as soon as that holds, so an interrupted cleanup also
+    ends the session without the daemon's ``ABORT_SEQ``.
     """
     gone = exc.cancelled or exc.peer_gone
     before, after = exc.before, exc.after
@@ -402,19 +432,20 @@ def _cleanup(transport: Any, exc: zp.ZmodemError, eol: bytes) -> _Outcome:
                 gone, after = True, after + pre
             else:
                 after += pre
+        transport.no_daemon_abort = True  # before the write: a partial one still counts
         if not gone:
             transport.write(ABORT_SEQ, force=True)
         transport.sync()                  # everything in flight has reached the device …
         text, capped = transport.settle()  # … and the device has answered it
         lines = _device_lines(before, after + text)
-        if eol and not capped:
+        if eol:
             transport.write(eol, force=True)
             transport.sync()
             transport.settle()
     except zp.ZmodemError:                # connection gone mid-cleanup: daemon aborts
         return _Outcome(_device_lines(before, after), gone)
-    tail = "".join(f"{ln}\r\n" for ln in lines).encode("utf-8")
-    transport.end(abort=capped, tail=b"" if capped else tail, wait=CLEANUP_CLOSE_WAIT)
+    tail = b"" if capped else "".join(f"{ln}\r\n" for ln in lines).encode("utf-8")
+    transport.end(abort=False, tail=tail, wait=CLEANUP_CLOSE_WAIT)
     return _Outcome(lines, gone)
 
 
@@ -558,11 +589,22 @@ def _run_session(base_url: str, token: Optional[str], port: str, cmd: str, direc
                                     f"{(reply or {}).get('error') or 'no reply'}")
         transport = _WsTransport(ws, port, str(reply.get("session")))
         try:
-            result = engine(transport, clock, info.baud)
+            try:
+                result = engine(transport, clock, info.baud)
+            except zp.ZmodemError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - ours (not ZMODEM): same cleanup path
+                raise _LocalError(f"{type(exc).__name__}: {exc}") from exc
         except zp.ZmodemError as exc:
-            out = _cleanup(transport, exc, info.eol)
+            try:
+                out = _cleanup(transport, exc, info.eol)
+            except BaseException:
+                transport.end(abort=not transport.no_daemon_abort)
+                raise
             hint = " | ".join(out.lines[:HINT_LINES])
-            if exc.timed_out:
+            if isinstance(exc, _LocalError):
+                message = str(exc)
+            elif exc.timed_out:
                 message = clock.message()
             elif not out.gone and any(k in str(exc) for k in (
                     "Write timeout", "stopped acknowledging")):
@@ -576,8 +618,8 @@ def _run_session(base_url: str, token: Optional[str], port: str, cmd: str, direc
                 message = f"transfer failed: {exc}"
             raise ZmodemClientError(message + (f"; device said: {hint}" if hint else ""),
                                     cancelled=out.gone, hint=hint, files=exc.files) from None
-        except BaseException:
-            transport.end(abort=True)
+        except BaseException:             # e.g. KeyboardInterrupt in the engine
+            transport.end(abort=not transport.no_daemon_abort)
             raise
         result.tail = result.tail + transport.drain(TAIL_WAIT)
         transport.end(abort=False, tail=result.tail)
@@ -655,17 +697,32 @@ def format_send(env: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def send_ok(env: dict[str, Any]) -> bool:
+    """Complete success: every file sent, none refused (the CLI's exit status)."""
+    files = env.get("files") or []
+    return bool(env.get("ok")) and bool(files) and not any(f["skipped"] for f in files)
+
+
+def zsend_status(client_url: str, token: Optional[str], port: str, paths: Sequence[str] = (),
+                 *, contents: Sequence[tuple[str, bytes]] = (), cmd: str = "rz",
+                 timeout_ms: Optional[int] = None, overwrite: bool = True,
+                 progress: Progress = None) -> tuple[str, bool]:
+    """:func:`zsend` plus :func:`send_ok` of the result (never raises)."""
+    try:
+        env = send_session(client_url, token, port, paths, contents=contents, cmd=cmd,
+                           timeout_ms=timeout_ms, overwrite=overwrite, progress=progress)
+        return format_send(env), send_ok(env)
+    except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
+        return f"error: {type(exc).__name__}: {exc}", False
+
+
 def zsend(client_url: str, token: Optional[str], port: str, paths: Sequence[str] = (), *,
           contents: Sequence[tuple[str, bytes]] = (), cmd: str = "rz",
           timeout_ms: Optional[int] = None, overwrite: bool = True,
           progress: Progress = None) -> str:
     """Upload files to the device; one line per file or ``error: ...`` (never raises)."""
-    try:
-        return format_send(send_session(client_url, token, port, paths, contents=contents,
-                                        cmd=cmd, timeout_ms=timeout_ms, overwrite=overwrite,
-                                        progress=progress))
-    except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
-        return f"error: {type(exc).__name__}: {exc}"
+    return zsend_status(client_url, token, port, paths, contents=contents, cmd=cmd,
+                        timeout_ms=timeout_ms, overwrite=overwrite, progress=progress)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -699,8 +756,12 @@ class _SaveDir:
             return None
         if self.on_offer:
             self.on_offer(size)
-        fd, tmp = tempfile.mkstemp(prefix=f".{base}.", suffix=".part", dir=self.dir)
-        sink = _TempSink(self, base, tmp, os.fdopen(fd, "wb"))
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=f".{base}.", suffix=".part", dir=self.dir)
+            fh = os.fdopen(fd, "wb")
+        except OSError as exc:
+            raise _cannot_write(os.path.join(self.dir, base), exc) from None
+        sink = _TempSink(self, base, tmp, fh, size)
         self._open.append(sink)
         return sink
 
@@ -719,20 +780,28 @@ class _SaveDir:
 
 
 class _TempSink:
-    def __init__(self, owner: _SaveDir, base: str, tmp: str, fh: Any) -> None:
+    def __init__(self, owner: _SaveDir, base: str, tmp: str, fh: Any,
+                 expected: Optional[int] = None) -> None:
         self.owner, self.base, self.tmp, self.fh = owner, base, tmp, fh
+        self.expected = expected
         self.crc = 0
         self.size = 0
 
     def write(self, data: bytes) -> None:
-        self.fh.write(data)
+        try:
+            self.fh.write(data)
+        except OSError as exc:  # disk full …
+            raise _cannot_write(self.tmp, exc) from None
         self.crc = zlib.crc32(data, self.crc)
         self.size += len(data)
 
     def close(self) -> None:
-        self.fh.close()
         path = self.owner.final_path(self.base)
-        os.replace(self.tmp, path)
+        try:
+            self.fh.close()
+            os.replace(self.tmp, path)
+        except OSError as exc:
+            raise _cannot_write(path, exc) from None
         self.owner._open.remove(self)
         self.owner.saved.append(_Saved(self.base, path, self.size, self.crc))
 
@@ -778,12 +847,18 @@ def receive_session(client_url: str, token: Optional[str], port: str,
         _run_session(client_url, token, port, command, "download", clamp_timeout(timeout_ms),
                      0, engine)
     except ZmodemClientError as exc:
+        partial = saver._open[-1] if saver._open else None
         saver.discard_partial()
         files = [_saved_entry(s) for s in saver.saved]
+        said = f"; device said: {exc.hint}" if exc.hint else ""
+        if exc.cancelled and partial is not None:  # gone after a ZFILE: say where it stopped
+            total = partial.expected if partial.expected is not None else "?"
+            error = (f"device cancelled the transfer at {partial.size}/{total} bytes of "
+                     f"{partial.base}")
+            return {"ok": False, "error": error + said, "files": files}
         if exc.cancelled and not saver.saved:  # lsz: missing file → session, CAN, no file
             error = "device sent no file (missing/unreadable remote file?)"
-            return {"ok": False, "error": error + (f"; device said: {exc.hint}"
-                                                   if exc.hint else ""), "files": files}
+            return {"ok": False, "error": error + said, "files": files}
         return {"ok": False, "error": str(exc), "files": files}
     except BaseException:
         saver.discard_partial()
@@ -844,15 +919,31 @@ def format_recv(env: dict[str, Any], *, inline: bool = False, cap: Optional[int]
     return "\n".join(lines)
 
 
+def recv_ok(env: dict[str, Any]) -> bool:
+    """Complete success: every requested file received, none refused (the CLI's exit status)."""
+    return bool(env.get("ok")) and not env.get("missing") and not env.get("refused")
+
+
+def zrecv_status(client_url: str, token: Optional[str], port: str,
+                 remote: Union[Sequence[str], str], dest_dir: Optional[str] = None, *,
+                 cmd: Optional[str] = None, timeout_ms: Optional[int] = None,
+                 overwrite: bool = False, inline: bool = False, cap: Optional[int] = None,
+                 progress: Progress = None) -> tuple[str, bool]:
+    """:func:`zrecv` plus :func:`recv_ok` of the result (never raises)."""
+    names = [remote] if isinstance(remote, str) else list(remote)
+    try:
+        env = receive_session(client_url, token, port, names, dest_dir, cmd=cmd,
+                              timeout_ms=timeout_ms, overwrite=overwrite, progress=progress)
+        return format_recv(env, inline=inline, cap=cap), recv_ok(env)
+    except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
+        return f"error: {type(exc).__name__}: {exc}", False
+
+
 def zrecv(client_url: str, token: Optional[str], port: str, remote: Union[Sequence[str], str],
           dest_dir: Optional[str] = None, *, cmd: Optional[str] = None,
           timeout_ms: Optional[int] = None, overwrite: bool = False, inline: bool = False,
           cap: Optional[int] = None, progress: Progress = None) -> str:
     """Download files; one line per file (plus inline text) or ``error: ...`` (never raises)."""
-    names = [remote] if isinstance(remote, str) else list(remote)
-    try:
-        env = receive_session(client_url, token, port, names, dest_dir, cmd=cmd,
-                              timeout_ms=timeout_ms, overwrite=overwrite, progress=progress)
-        return format_recv(env, inline=inline, cap=cap)
-    except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
-        return f"error: {type(exc).__name__}: {exc}"
+    return zrecv_status(client_url, token, port, remote, dest_dir, cmd=cmd,
+                        timeout_ms=timeout_ms, overwrite=overwrite, inline=inline, cap=cap,
+                        progress=progress)[0]

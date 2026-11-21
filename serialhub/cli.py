@@ -480,7 +480,10 @@ def _progress() -> Any:
 
 
 def _cmd_zmodem(args: argparse.Namespace) -> int:
-    """``zsend`` / ``zrecv``: print the plain-text result; exit 1 on ``error:``."""
+    """``zsend`` / ``zrecv``: print the plain-text result; exit 1 unless every file made it.
+
+    The status comes from the result itself, never from scanning the text (inlined file
+    content may contain lines that look like ``error:``)."""
     from . import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
 
     url, token = _global_options(args)
@@ -505,17 +508,18 @@ def _cmd_zmodem(args: argparse.Namespace) -> int:
             text = f"error: {t('cli.error.zsend_one')}"
         else:
             text = ""
+        ok = False
         if not text:
-            text = zc.zsend(url, token, args.port, args.files, contents=contents,
-                            cmd=args.cmd, timeout_ms=zc.clamp_timeout(args.timeout_ms),
-                            overwrite=not args.no_overwrite, progress=_progress())
+            text, ok = zc.zsend_status(url, token, args.port, args.files, contents=contents,
+                                       cmd=args.cmd, timeout_ms=zc.clamp_timeout(args.timeout_ms),
+                                       overwrite=not args.no_overwrite, progress=_progress())
     else:
-        text = zc.zrecv(url, token, args.port, args.remote, args.dir,
-                        cmd=args.cmd, timeout_ms=zc.clamp_timeout(args.timeout_ms),
-                        overwrite=args.overwrite, inline=args.inline, progress=_progress())
+        text, ok = zc.zrecv_status(url, token, args.port, args.remote, args.dir,
+                                   cmd=args.cmd, timeout_ms=zc.clamp_timeout(args.timeout_ms),
+                                   overwrite=args.overwrite, inline=args.inline,
+                                   progress=_progress())
     print(text)
-    bad = ("error:", "not received ", "skipped ")
-    return 1 if any(line.startswith(bad) for line in text.split("\n")) else 0
+    return 0 if ok else 1
 
 
 def main(argv: Optional[list[str]] = None) -> int:

@@ -8,13 +8,16 @@
   （``*`` ZDLE ``C``）；数据子包 ≤ 1024 字节，ZDLE 转义（ZDLE、DLE、XON/XOFF 及其 8 位
   形式、CR；接收方要求 ``ESCCTL`` 时转义全部控制字符），收方丢弃未转义的 XON/XOFF。
 - 发送方：接收方 ``CANFC32`` 时用 CRC-32；全双工且缓冲为 0 时流式发送 ZCRCG，每
-  ``ACK_EVERY`` 字节一个 ZCRCQ 要 ZACK，未确认数据不超过 ``WINDOW``——二者按波特率定
-  （:func:`pacing`：约 1 s 线上时间、1–8 KiB，窗口 4 倍），等 ZACK 的时长按在途字节与波特率
-  计算；窗口满且等不到 ZACK 时**不往满管道里盲目重发**，而是发空 ZCRCW 要对方报位置。
+  ``ACK_EVERY`` 字节一个 ZCRCQ 要 ZACK，未确认数据不超过 ``WINDOW``——二者按线速定
+  （:func:`pacing`：约 1 s 线上时间、1–8 KiB，窗口 4 倍）：起步按 1 KiB / 4 KiB，测到 ACK 速率后按它
+  （不超过配置的波特率）放大；等 ZACK 的时长按在途字节与测得速率（尚无则按波特率）计算，且不短于帧
+  超时——配置的波特率可能高估实际线速（socket://、USB-CDC、ser2net、写 flash 时的流控）。窗口满且等不到
+  ZACK 时**不往满管道里盲目重发**，而是发空 ZCRCW 要对方报位置（其间较早的 ZACK 只算进度）。
   接收方声明了缓冲长度（或不能全双工）、或同一文件已收到 3 次 ZRPOS 时，改为分段、段尾
   ZCRCW 等 ZACK（ZRPOS 再多则子包减半，最小 128）。随时**服从 ZRPOS**（回到该偏移重发）。
 - 接收方：通告 ``CANFDX|CANOVIO|CANFC32``、缓冲 0；**先看对方已发来什么再写**——只在收到
-  ZRQINIT（并静候片刻没有 CAN/文本）或 0.3 s 无任何输入后才发 ZRINIT。CRC 错 / 位置不符 →
+  ZRQINIT（并静候片刻没有 CAN/文本）或 0.3 s 无任何输入后才发 ZRINIT；传输中一帧超时、而上个有效帧
+  之后只收到 shell 文本行 → 发送方已退出（``peer_gone``），不再写。CRC 错 / 位置不符 →
   ZRPOS 并丢弃数据直到下一个头；ZCRCW/ZCRCQ → ZACK（lsz 每个文件第一个子包以 ZCRCW 结束，
   见 zmodem-shim.js）；ZFIN 后 ``OO`` 可选（lsz 有时不发）：非 ``OO`` 的字节即会话外文本，
   静默 1 s 也结束。帧接收超时按“无输入”计时（慢速线路上一个子包本身就要 1 s 以上）。
@@ -77,6 +80,8 @@ OO_WAIT = 1.0               #: ZFIN 之后等 "OO" 的时长（lsz 可能不发�
 RETRIES = 10                #: 同一步骤的连续重试上限
 STALL_RETRIES = 3           #: 窗口满、对方毫无应答时的同步（空 ZCRCW）次数上限
 ERRORS_MAX = 20             #: 单个文件内 ZRPOS 重发请求上限（同 lrz）
+RATE_PROBE = 10240          #: 起步按这个“波特率”定节奏（1 KiB 一个 ZCRCQ），测到 ACK 速率后再放大
+RATE_MIN_SPAN = 0.1         #: 两次 ACK 速率采样至少相隔这么久（秒）
 
 _CAN5 = b"\x18" * 5
 _XONOFF = b"\x11\x13\x91\x93"
@@ -86,7 +91,7 @@ _HEXDIGITS = frozenset(b"0123456789abcdefABCDEF")
 class ZmodemError(Exception):
     """会话失败。
 
-    ``files`` = 失败前已完成的文件；``cancelled`` = 对端发了 5×CAN；``peer_gone`` = 握手时对端
+    ``files`` = 失败前已完成的文件；``cancelled`` = 对端发了 5×CAN；``peer_gone`` = 对端（握手或传输中）
     只回了普通文本（对方程序已退出）；``timed_out`` = 总截止时间到；``before`` / ``after`` =
     取消（或 peer_gone）时 CAN 之前 / 之后收到的原始字节（设备文本，可能夹着协议帧）。
     """
@@ -396,8 +401,11 @@ def pacing(baud: Optional[int]) -> tuple[int, int]:
 
 
 def _looks_like_text(raw: bytes) -> bool:
-    """Device text (a shell line), not ZMODEM: a terminated line of mostly printable bytes."""
-    raw = bytes(raw)
+    """Device text (a shell line), not ZMODEM: a terminated line of mostly printable bytes.
+
+    XON/XOFF are ignored: a tty appends them to every hex header (``\\r\\x8a\\x13\\x11``), so
+    after many headers they pile up in front of the line the shell printed."""
+    raw = bytes(raw).translate(None, _XONOFF)
     for line in re.split(rb"[\r\n]", raw)[:-1]:   # the last piece is unterminated
         if len(line) >= 3 and ZDLE not in line:
             printable = sum(1 for c in line if 32 <= c < 127 or c >= 0xA0 or c == 9)
@@ -418,6 +426,8 @@ class _Link:
         self._deadline = deadline
         self.buf = bytearray()
         self.garbage = bytearray()  # 找帧头时丢掉的字节（握手阶段据此判断对方已不在跑 ZMODEM）
+        #: 上一个有效帧头/子包之后丢掉的字节（数据阶段据此判断对方已退出、shell 在打印）
+        self.stray = bytearray()
         self._recent = b""
         self.use32 = False          # 最近一个二进制头的 CRC 类型（决定其后子包的 CRC）
         #: 对方只会发帧头（发送方的回传通道）：丢弃的字节里出现文本行即对方已退出
@@ -465,12 +475,18 @@ class _Link:
                 self.garbage += self.buf[:start]   # only what preceded a frame: never frames
                 if len(self.garbage) > 4096:
                     del self.garbage[:-4096]
+                if not isinstance(res, Header):
+                    self.stray += self.buf[:used]
+                    if len(self.stray) > 4096:
+                        del self.stray[:-4096]
                 del self.buf[:used]
                 if self.watch_text and start and self.text_seen():
                     raise self.peer_gone("receiver exited")
             if res is not None:
-                if isinstance(res, Header) and res.type in (ZFILE, ZDATA, ZSINIT, ZCOMMAND):
-                    self.use32 = res.use32
+                if isinstance(res, Header):
+                    self.stray.clear()
+                    if res.type in (ZFILE, ZDATA, ZSINIT, ZCOMMAND):
+                        self.use32 = res.use32
                 return res
             until = self._wait(until, timeout)
             if until is None:
@@ -483,6 +499,7 @@ class _Link:
             status, data, end, nxt = parse_subpacket(self.buf, 0, use32=use32)
             if status == "ok":
                 del self.buf[:nxt]
+                self.stray.clear()
                 return data, end
             if status == "bad":
                 del self.buf[:nxt]
@@ -497,10 +514,22 @@ class _Link:
         while time.monotonic() < until:
             self._fill(until)
 
-    def peer_gone(self, what: str) -> ZmodemError:
-        raw = bytes(self.garbage) + bytes(self.buf)
+    def peer_gone(self, what: str, raw: Optional[bytes] = None) -> ZmodemError:
+        if raw is None:
+            raw = bytes(self.garbage) + bytes(self.buf)
         return ZmodemError(f"{what}: the device printed text instead of ZMODEM",
                            peer_gone=True, before=raw)
+
+    def gone_midway(self, what: str) -> Optional[ZmodemError]:
+        """After a frame timeout in the data phase: if what arrived since the last good frame is
+        a shell line (and no frame is pending), the sender has exited → error, else ``None``.
+
+        Only checked after ``frame_timeout`` of silence, so file data that happens to be text
+        (a log being sent) is never mistaken for it while the sender is still talking."""
+        raw = bytes(self.stray) + bytes(self.buf)
+        if b"*\x18" not in self.buf and _looks_like_text(raw):
+            return self.peer_gone(what, raw)
+        return None
 
     def text_seen(self) -> bool:
         """Device text arrived and no further ZMODEM frame is pending."""
@@ -539,7 +568,11 @@ class _Sender:
         self.progress = progress
         self.ft = frame_timeout
         self.baud = int(baud) if baud else None
-        self.ack_every, self.window = pacing(self.baud)
+        # slow start: the configured baud may overstate the line (socket://, USB-CDC, ser2net,
+        # flow-controlled flash writes); the first ZACK comes early and gives a measured rate
+        self.ack_every, self.window = pacing(min(self.baud or RATE_PROBE, RATE_PROBE))
+        self.rate: Optional[float] = None   # measured: file bytes/s the receiver acknowledges
+        self._rmark: Optional[tuple[int, float]] = None
         self.zf1 = ZMCLOB if overwrite else 0
         self.use32 = False
         self.ctl = False
@@ -557,11 +590,35 @@ class _Sender:
         self.link.write(encode_subpacket(data, end, use32=self.use32, escape_ctl=self.ctl))
 
     def _ack_wait(self, inflight: int) -> float:
-        """How long to wait for an answer with ``inflight`` bytes still ahead of it on the line."""
-        if not self.baud:
+        """How long to wait for an answer with ``inflight`` bytes still ahead of it on the line:
+        by the measured ACK rate once there is one, else by the configured baud; never less
+        than the frame timeout."""
+        if self.rate:
+            line = inflight / self.rate
+        elif self.baud:
+            line = inflight * 1.1 * 10 / self.baud     # 1.1: escaping + framing
+        else:
             return self.ft
-        line = inflight * 1.1 * 10 / self.baud     # 1.1: escaping + framing
-        return max(2.0, 2 * line + 2.0)
+        return max(self.ft, 2 * line + 2.0)
+
+    def _rate_mark(self, pos: int) -> None:
+        """Data (re)starts at ``pos`` now: the next ZACK's rate sample counts from here."""
+        self._rmark = (pos, time.monotonic())
+
+    def _acked(self, pos: int) -> None:
+        """A ZACK for ``pos``: update the measured rate and pace by it (never above the baud)."""
+        if self._rmark is None:
+            return
+        p0, t0 = self._rmark
+        now = time.monotonic()
+        if pos <= p0 or now - t0 < RATE_MIN_SPAN:
+            return                      # too close to the last sample: let the next one cover it
+        sample = (pos - p0) / (now - t0)
+        self.rate = sample if self.rate is None else (self.rate + sample) / 2
+        self._rmark = (pos, now)
+        line_baud = int(self.rate * 10)
+        self.ack_every, self.window = pacing(min(line_baud, self.baud) if self.baud
+                                             else line_baud)
 
     # -- steps ---------------------------------------------------------------
     def handshake(self) -> None:
@@ -657,8 +714,10 @@ class _Sender:
                     self.chunk = max(128, self.chunk // 2)
             pos = acked = mark = p
             self._bin(ZDATA, pos_bytes(pos))
+            self._rate_mark(pos)
 
         self._bin(ZDATA, pos_bytes(pos))
+        self._rate_mark(pos)
         while True:
             f.seek(pos)
             chunk = f.read(self.chunk)
@@ -691,9 +750,9 @@ class _Sender:
                 continue
             if end == ZCRCQ:
                 mark = pos
-            # 流式：看一眼回传通道；窗口满则阻塞等 ZACK
+            # 流式：看一眼回传通道；窗口满（或已发空 ZCRCW 等对方报位置）则阻塞等 ZACK
             while True:
-                full = pos - acked >= self.window
+                full = synced or pos - acked >= self.window
                 h = self.link.header(self._ack_wait(pos - acked + junk) if full else 0)
                 if h is None:
                     if not full:
@@ -709,13 +768,14 @@ class _Sender:
                     continue
                 if h.type == ZACK:
                     junk = 0
-                    if synced:
-                        stalls = 0
-                        restart(h.pos)
-                        break
-                    if acked < h.pos <= pos:
+                    if acked < h.pos <= pos:     # progress (a late ZACK is not a failure)
                         acked = h.pos
                         stalls = 0
+                        self._acked(h.pos)
+                    if synced and h.pos == pos:  # the answer to our empty ZCRCW
+                        stalls = 0
+                        restart(pos)
+                        break
                 elif h.type == ZRPOS:
                     restart(h.pos, by_zrpos=True)
                     break
@@ -734,6 +794,7 @@ class _Sender:
             h = self.link.header(self._ack_wait(inflight))
             if isinstance(h, Header):
                 if h.type == ZACK and h.pos == pos:
+                    self._acked(pos)
                     return pos, False
                 if h.type == ZRPOS:
                     return h.pos, True
@@ -765,7 +826,7 @@ class _Sender:
             tries += 1
             if tries > RETRIES:
                 raise ZmodemError("no answer to ZEOF")
-            inflight = 0
+            # the data ahead of the ZEOF may still be on its way: keep waiting as long
             self._bin(ZEOF, pos_bytes(pos))
 
     def finish(self) -> None:
@@ -855,6 +916,8 @@ class _Receiver:
             if not isinstance(h, Header):
                 if not started and self.link.text_seen():
                     raise self.link.peer_gone("sender exited")
+                if h is None and started and (gone := self.link.gone_midway("sender exited")):
+                    raise gone
                 tries += 1
                 if tries > RETRIES:
                     raise ZmodemError("sender went silent")
@@ -922,6 +985,8 @@ class _Receiver:
         while True:
             h = self.link.header(self.ft)
             if h is None:
+                if gone := self.link.gone_midway(f"sender exited during {name!r}"):
+                    raise gone
                 zrpos()
                 continue
             if not isinstance(h, Header):
@@ -935,6 +1000,9 @@ class _Receiver:
                 resync = False
                 while True:
                     sub = self._sub(self.link.use32)
+                    if sub is None and (gone := self.link.gone_midway(
+                            f"sender exited during {name!r}")):
+                        raise gone
                     if not isinstance(sub, tuple):
                         zrpos()
                         break

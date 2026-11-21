@@ -32,8 +32,9 @@ defaults:
   # zmodem: true / zmodem_claim_ms: 5000 / zmodem_idle_ms: 15000 为缺省值。
   # zsend/zrecv（agent/CLI）传输非干净结束（设备取消、超时、出错）后，先等设备安静，再写这个
   # 行结束符冲掉设备输入行缓冲里的残留字节，然后丢弃 shell 对它的回应：
-  #   cr（默认）| lf | crlf | ctrl-u-cr（先 ^U 清行再回车）| none（不写）
-  # ⚠ U-Boot 风格的 shell 在空行上会重复上一条命令：这类设备用 ctrl-u-cr 或 none。
+  #   cr（默认）| lf | crlf | ctrl-u-cr（先 ^U 再回车：在 readline 风格的 shell 上清掉打了一半的行）
+  #   | none（不写）
+  # ⚠ U-Boot 风格的 shell 在空行上会重复上一条命令（^U 后回车仍是空行，同样会重复）：这类设备用 none。
   zmodem_cleanup_eol: cr
   # ---- 引脚控制（DTR/RTS）----
   # 默认关闭（enabled: false）。关闭时 worker 任何时刻都不调用 setDTR/setRTS（含 open

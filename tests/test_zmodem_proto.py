@@ -485,24 +485,18 @@ class _Line:
             return data
 
 
-@pytest.mark.parametrize("baud,size", [(9600, 8000), (4800, 4300)])  # > WINDOW (4 KiB)
-def test_throttled_line_completes_without_flooding(baud, size) -> None:
+# The pacing comes from ``baud`` (9600 → 1 KiB / 4 KiB window, also at 4800); the line runs
+# somewhat faster than that so each case takes ~2 s, and the file is larger than the window.
+@pytest.mark.parametrize("baud,rate,size", [(9600, 3200, 6000), (4800, 2400, 4300)])
+def test_throttled_line_completes_without_flooding(baud, rate, size) -> None:
     """Low baud + deep pipe: no blind resend into a full pipe; wire bytes stay ~ the file."""
     data = os.urandom(size)
-    line_tx, line_rx = _Line(baud // 10), _Line(baud // 10)
-    a2b, b2a = _Chan(), _Chan()
-    a2b.put = line_tx.put  # type: ignore[method-assign]
-    a2b.get = line_tx.get  # type: ignore[method-assign]
-    b2a.put = line_rx.put  # type: ignore[method-assign]
-    b2a.get = line_rx.get  # type: ignore[method-assign]
-    t0 = time.monotonic()
-    tx, rx, saved, _ = _run_pair({"x": data}, chans=(a2b, b2a), timeout=20,
-                                 tx_kw={"baud": baud, "frame_timeout": 0.5},
-                                 rx_kw={"frame_timeout": 0.5})
+    tx, rx, saved, sent, took = _throttled_pair(rate, data, {"baud": baud, "frame_timeout": 0.5},
+                                                {"frame_timeout": 0.5}, 20)
     assert saved == {"x": data}, (tx, rx)
     escaped = len(zp.zdle_escape(data))
-    assert line_tx.sent <= 1.2 * escaped, (line_tx.sent, escaped)
-    assert time.monotonic() - t0 < 1.15 * len(zp.zdle_escape(data)) / (baud // 10) + 2
+    assert sent <= 1.2 * escaped, (sent, escaped)
+    assert took < 3.5 * escaped / rate + 1, took   # ≥ 3× headroom over the line time
 
 
 def _drop_once(match: Callable[[bytes, int], Optional[tuple[int, int]]]):
@@ -608,3 +602,117 @@ def test_hex_header_with_xon_xoff_inside() -> None:
     h, used = zp.parse_header(noisy)
     assert isinstance(h, zp.Header) and (h.type, h.pos) == (zp.ZACK, 0x8000)
     assert not zp._looks_like_text(b"\r\x8a\x11")
+
+
+# --------------------------------------------------------------------------- #
+# fix round 2
+# --------------------------------------------------------------------------- #
+class _Timed(_Scripted):
+    """A peer that answers each of our writes with the next scripted reply (``first`` is there
+    from the start) and notes how many bytes we had written when ``marker`` was read."""
+
+    def __init__(self, first: bytes, replies: list[bytes], marker: bytes) -> None:
+        super().__init__([first], on_write=lambda t, d: t.replies and t.chunks.append(
+            t.replies.pop(0)))
+        self.replies = list(replies)
+        self.marker = marker
+        self.written_at_marker: Optional[int] = None
+
+    def read(self, timeout: float) -> bytes:
+        data = super().read(timeout)
+        if self.marker in data and self.written_at_marker is None:
+            self.written_at_marker = len(self.written)
+        return data
+
+
+def test_receiver_sender_dies_mid_file_writes_nothing_after_text() -> None:
+    """lsz killed mid-file (no CAN): the shell's text ends the session, no ZRPOS to it."""
+    info = zp.file_info(zp.FileSpec("f.bin", io.BytesIO(b""), 4096), 1, 4096)
+    t = _Timed(zp.encode_hex_header(zp.ZRQINIT), [
+        zp.encode_bin_header(zp.ZFILE, bytes([0, 0, 0, 1]), use32=True)
+        + zp.encode_subpacket(info, zp.ZCRCW, use32=True),                 # → our ZRINIT
+        zp.encode_bin_header(zp.ZDATA, zp.pos_bytes(0), use32=True)         # → our ZRPOS
+        + zp.encode_subpacket(b"A" * 1024, zp.ZCRCG, use32=True) + b"Killed\r\n# "],
+        b"Killed")
+    saved: dict = {}
+    with pytest.raises(zp.ZmodemError) as ei:
+        zp.receive_files(t, lambda n, s: _Sink(saved, n), deadline=time.monotonic() + 6,
+                         frame_timeout=0.5, abort_on_error=False)
+    assert ei.value.peer_gone and not ei.value.timed_out, ei.value
+    assert t.written_at_marker is not None
+    assert len(t.written) == t.written_at_marker, bytes(t.written[t.written_at_marker:])
+    assert b"Killed" in ei.value.before
+
+
+def test_receiver_sender_dies_between_files_writes_nothing_after_text() -> None:
+    t = _Timed(LSZ_EMPTY[0], [LSZ_EMPTY[1], LSZ_EMPTY[2], b"Segmentation fault\r\n# "],
+               b"Segmentation")
+    with pytest.raises(zp.ZmodemError) as ei:
+        zp.receive_files(t, lambda n, s: _Sink({}, n), deadline=time.monotonic() + 6,
+                         frame_timeout=0.5, abort_on_error=False)
+    assert ei.value.peer_gone, ei.value
+    assert t.written_at_marker is not None
+    assert len(t.written) == t.written_at_marker
+
+
+def test_receiving_a_text_file_is_not_peer_gone() -> None:
+    """File data that looks like shell text must not be mistaken for a dead sender."""
+    data = b"Killed\r\n# ls\r\nroot@dev:~# echo hi\r\n" * 2000
+    tx, rx, saved, _ = _run_pair({"log.txt": data})
+    assert saved == {"log.txt": data}, (tx, rx)
+
+
+def _throttled_pair(rate: int, data: bytes, tx_kw: dict, rx_kw: dict, timeout: float):
+    """Python sender → receiver over a ``rate`` bytes/s line (both ways) behind deep pipes."""
+    line_tx, line_rx = _Line(rate), _Line(rate)
+    a2b, b2a = _Chan(), _Chan()
+    a2b.put, a2b.get = line_tx.put, line_tx.get  # type: ignore[method-assign]
+    b2a.put, b2a.get = line_rx.put, line_rx.get  # type: ignore[method-assign]
+    t0 = time.monotonic()
+    tx, rx, saved, _ = _run_pair({"x": data}, chans=(a2b, b2a), timeout=timeout,
+                                 tx_kw=tx_kw, rx_kw=rx_kw)
+    return tx, rx, saved, line_tx.sent, time.monotonic() - t0
+
+
+def test_sender_adapts_when_the_configured_baud_overstates_the_line() -> None:
+    """socket://, USB-CDC, ser2net, flow-controlled flash: ACKs come slower than the configured
+    baud predicts. Real line 960 B/s ("9600 baud", as rr2/t2c.py), default frame timeout,
+    configured baud 12× and 120× the real rate, and unknown: the sender measures the ACK rate
+    and paces / waits by it — byte-exact, and hardly anything is sent twice.
+
+    The three cases run at once (each is ~38 s of line time)."""
+    size = 36_000                      # > the 32 KiB window a 115200-or-faster baud gives
+    cases = {"12x": 12 * 9600, "120x": 120 * 9600, "unknown": None}
+    res: dict = {}
+
+    def run(label, nominal):
+        data = os.urandom(size)
+        tx, rx, saved, sent, took = _throttled_pair(960, data, {"baud": nominal}, {}, 120)
+        res[label] = (saved == {"x": data}, sent / len(zp.zdle_escape(data)), took, tx, rx)
+
+    threads = [threading.Thread(target=run, args=kv, daemon=True) for kv in cases.items()]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(130)
+    for label in cases:
+        ok, ratio, took, tx, rx = res[label]
+        assert ok, (label, tx, rx)
+        assert ratio <= 1.2, (label, round(ratio, 2))
+        assert took < 1.3 * size / 960 + 5, (label, round(took, 1))
+
+
+def test_text_after_xon_xoff_noise_is_still_text() -> None:
+    """lrz's hex headers end with a tty's XOFF/XON (``\\r\\x8a\\x13\\x11``); those remnants pile
+    up in front of the shell line printed after the receiver died (seen in the sim: no CAN,
+    then ``rz done rc=143`` — the sender must stop rather than sync into the shell)."""
+    assert zp._looks_like_text(b"\x13\x11" * 200 + b"rz done rc=143\r\n")
+    acks = b"".join(zp.encode_hex_header(zp.ZACK, zp.pos_bytes(p))[:-1] + b"\x8a\x13\x11"
+                    for p in range(1024, 9 * 1024, 1024))
+    rinit = zp.encode_hex_header(zp.ZRINIT, zp.flags_bytes(zp.CANFDX | zp.CANFC32))
+    t = _Timed(rinit, [zp.encode_hex_header(zp.ZRPOS), acks + b"rz done rc=143\r\n"], b"rz done")
+    with pytest.raises(zp.ZmodemError) as ei:
+        zp.send_files(t, [_spec("big", os.urandom(64 * 1024))], deadline=time.monotonic() + 20,
+                      baud=9600, frame_timeout=1.0, abort_on_error=False)
+    assert ei.value.peer_gone, ei.value
+    assert len(t.written) == t.written_at_marker

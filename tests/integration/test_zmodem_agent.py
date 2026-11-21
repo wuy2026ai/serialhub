@@ -16,6 +16,7 @@ import pytest
 
 from serialhub import cli, lite
 from serialhub import zmodem_client as zc
+from serialhub import zmodem_proto as zp
 from serialhub.client import Client
 
 import httpx
@@ -45,12 +46,12 @@ def _sim(tmp_path, names=("a",), interval: float = 0.2, same_dir: bool = False,
     files.mkdir(exist_ok=True)
     recv.mkdir(exist_ok=True)
     with ExitStack() as st:
-        ports, pairs = [], []
+        ports, pairs, devs = [], [], []
         for n in names:
             pair = st.enter_context(PtyPair())
             pairs.append(pair)
-            st.enter_context(MockDevice(pair.dev_path, n, files, recv, interval=interval,
-                                        extra=extra))
+            devs.append(st.enter_context(MockDevice(pair.dev_path, n, files, recv,
+                                                    interval=interval, extra=extra)))
             ports.append({"name": n, "device": pair.host_path, "autostart": True,
                           **(port_cfg or {})})
         srv = st.enter_context(LiveServer(ports))
@@ -62,7 +63,8 @@ def _sim(tmp_path, names=("a",), interval: float = 0.2, same_dir: bool = False,
                 _wait_line(srv, n, r"^PKT name=", 5)
             else:
                 _command_until(srv, n, "ping", r"^pong$", 5)
-        yield {"srv": srv, "files": files, "recv": recv, "client": Client(srv.base_url)}
+        yield {"srv": srv, "files": files, "recv": recv, "client": Client(srv.base_url),
+               "devs": devs}
 
 
 def _blob(path) -> bytes:
@@ -198,6 +200,17 @@ def test_device_cancels_mid_upload_partial_results_and_clean_shell(tmp_path):
         # at 9600): let it finish — nothing is sent meanwhile — then ping exactly once
         _wait_quiet(env["srv"], "a")
         _shell_clean(env["srv"])
+        # the mock discards what reaches the killed rz (as a UART would swallow it) but counts
+        # it: at most the sender's window for 9600 baud plus one subpacket (×1.1 for escaping
+        # and framing, as the engine reckons) — and after that window exactly one cleanup
+        # terminator arrived (an empty line), then our single ping
+        log = env["devs"][0].output()
+        m = re.search(r"^rz killed discarded=(\d+)$", log, re.M)
+        assert m, log
+        _every, window = zp.pacing(9600)
+        assert int(m.group(1)) <= 1.1 * (window + zp.SUBPACKET), log
+        after = re.findall(r"^rz killed then line=(.*)$", log, re.M)
+        assert after == ["b''", "b'ping'"], log
 
 
 def _wait_quiet(srv, port: str, quiet: float = 2.0, cap: float = 40.0) -> None:
@@ -256,6 +269,37 @@ def test_zrecv_missing_remote_file(tmp_path):
         assert out.startswith("error: device sent no file (missing/unreadable remote file?); "
                               "device said: sz done rc=128"), out  # (+ PKT lines it printed)
         assert os.listdir(tmp_path / "o") == []
+        _shell_clean(env["srv"])
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_zrecv_unwritable_dir_for_second_file(tmp_path, monkeypatch):
+    """Our save side fails (read-only dir when the second file arrives): the same cleanup path
+    as any failure — first file kept and listed, then ``error: cannot write …``, clean shell."""
+    real = zc._SaveDir.__call__
+    calls = []
+
+    def offer(self, name, size):
+        calls.append(name)
+        if len(calls) == 2:
+            os.chmod(self.dir, 0o500)
+        return real(self, name, size)
+
+    monkeypatch.setattr(zc._SaveDir, "__call__", offer)
+    with _sim(tmp_path) as env:
+        (env["files"] / "one.bin").write_bytes(b"1" * 3000)
+        (env["files"] / "two.bin").write_bytes(b"2" * 3000)
+        out_dir = tmp_path / "o"
+        try:
+            out = zc.zrecv(env["srv"].base_url, None, "a", ["one.bin", "two.bin"], str(out_dir))
+        finally:
+            os.chmod(out_dir, 0o700)
+        lines = out.split("\n")
+        assert lines[0].startswith("received one.bin 3000B crc="), out
+        assert lines[1].startswith(f"error: cannot write {out_dir / 'two.bin'}: "
+                                   "Permission denied"), out
+        assert len(lines) == 2, out
+        assert sorted(os.listdir(out_dir)) == ["one.bin"]
         _shell_clean(env["srv"])
 
 

@@ -9,6 +9,9 @@
 命令：``ping`` / ``echo TEXT`` / ``stream on|off`` / ``ls`` / ``rz [ARGS]``（无参数 = ``lrz -y``，
 否则原样把 ARGS 交给 lrz，如 ``rz -v`` 不覆盖已存在文件）/ ``sz FILE...``。
 ``--rz-kill-after`` 让 lrz 在启动这么多秒后被 SIGTERM（lrz 随即发 CAN 退出），模拟传输中途被取消。
+被杀后 mock 丢弃随后的在途数据（读到 0.2 s 无数据为止），并在 stdout 记录
+``rz killed discarded=<字节数>``，之后收到的每一行（含空行）记为 ``rz killed then line=<repr>``，
+直到第一条非空命令——测试据此核对在途数据量与收尾行结束符的个数。
 
 PKT 行格式（CRLF 结尾）::
 
@@ -69,6 +72,7 @@ class MockDevice:
         self.stream.set()
         self.stop = threading.Event()
         self.seq = 0
+        self.after_kill = False           # rz 被杀后：记录收到的行，直到第一条非空命令
 
     def write_line(self, text: str) -> None:
         with self.lock:
@@ -118,11 +122,16 @@ class MockDevice:
                     self.stream.set()
             if killed:
                 # 被杀的 rz 留下的在途数据：像真实 UART 那样照收不阻塞，但不当命令执行——
-                # 读到连续 300 ms 无数据为止并丢弃（否则仿真里 mock 会逐行回显这些二进制垃圾）
+                # 读到连续 200 ms 无数据为止并丢弃（否则仿真里 mock 会逐行回显这些二进制垃圾），
+                # 丢弃量记到 stdout，供测试核对它不超过发送方的窗口
                 quiet = time.monotonic()
-                while time.monotonic() - quiet < 0.3:
-                    if self.ser.read(4096):
+                discarded = 0
+                while time.monotonic() - quiet < 0.2:
+                    if data := self.ser.read(4096):
+                        discarded += len(data)
                         quiet = time.monotonic()
+                print(f"rz killed discarded={discarded}", flush=True)
+                self.after_kill = True
             self.ser.write(f"{label} done rc={rc}\r\n".encode())
             # 同时打到 stdout：中止后这行可能落在宿主的排空窗口里被丢弃，测试据此确认退出码
             print(f"{label} done rc={rc}", flush=True)
@@ -175,7 +184,12 @@ class MockDevice:
                               default=-1)
                     if idx < 0:
                         break
-                    raw, buf = buf[:idx], buf[idx + 1:]
+                    # CRLF 算一个行结束（否则 "rz\r\n" 的 \n 会在传输结束后冒出一个空行）
+                    end = idx + 2 if buf[idx:idx + 2] == b"\r\n" else idx + 1
+                    raw, buf = buf[:idx], buf[end:]
+                    if self.after_kill:
+                        print(f"rz killed then line={raw!r}", flush=True)
+                        self.after_kill = not raw.strip()
                     if raw.strip():
                         self.handle(raw.decode("utf-8", "replace"))
         finally:
