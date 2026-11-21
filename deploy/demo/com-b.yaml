@@ -1,0 +1,4 @@
+server: { host: 127.0.0.1, port: 8766, token: null, cors: true }
+ports:
+  - { name: com-b, device: "loop://", baud: 115200, autostart: true }
+logging: { enabled: false, dir: logs/com-b }

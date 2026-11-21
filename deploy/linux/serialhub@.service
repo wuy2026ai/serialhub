@@ -1,0 +1,19 @@
+# Optional: run at boot with systemd (one unit per config).
+# Install: edit User= and the two paths, then
+#   sudo cp serialhub@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now serialhub@com-a serialhub@com-b
+[Unit]
+Description=serialhub %i
+After=network.target
+
+[Service]
+User=CHANGE_ME
+SupplementaryGroups=dialout
+WorkingDirectory=/opt/cjznb-serialhub
+ExecStart=/opt/cjznb-serialhub/.venv/bin/serialhub serve --config /opt/cjznb-serialhub/deploy/linux/%i.yaml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

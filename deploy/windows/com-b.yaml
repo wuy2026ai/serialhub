@@ -1,0 +1,25 @@
+# serialhub instance "com-b" -> web UI http://<host>:8766/
+# Edit 'device' to your real port. List candidates with: serialhub discover
+server:
+  host: 127.0.0.1   # start script --host / -ListenHost overrides this (e.g. 0.0.0.0 for LAN)
+  port: 8766
+  token: null       # set a string to require "Authorization: Bearer <token>"
+  cors: true
+defaults:
+  baud: 115200
+  data_bits: 8
+  parity: N
+  stop_bits: 1
+  flow: none
+  eol: "\r\n"
+  reconnect_ms: 1000
+  reconnect_max_ms: 10000
+ports:
+  - name: com-b
+    device: "COM4"
+    autostart: true
+logging:
+  enabled: false    # true = also write received lines to disk
+  dir: logs/com-b
+  max_mb: 16
+  backups: 3
