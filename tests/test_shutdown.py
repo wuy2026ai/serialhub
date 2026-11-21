@@ -119,6 +119,51 @@ def test_origin_mismatch_is_403(make_app, origin) -> None:
     assert calls == []
 
 
+def _request(headers: dict[str, str]):
+    from starlette.requests import Request
+
+    return Request({"type": "http", "method": "POST", "path": "/api/shutdown",
+                    "headers": [(k.lower().encode("latin-1"), v.encode("latin-1"))
+                                for k, v in headers.items()]})
+
+
+@pytest.mark.parametrize("origin,host,ok", [
+    ("http://h:8765", None, False),                    # no Host header at all
+    ("http://[::1]:8765", "[::1]:8765", True),         # IPv6 literal
+    ("http://[::1]:8765", "[::2]:8765", False),
+    ("http://[::1]:8765", "[::1]:8766", False),
+    ("http://LOCALHOST:8765", "localhost:8765", True),  # host names are case-insensitive
+    ("http://localhost:8765", "LocalHost:8765", True),
+    ("http://h", "h:80", True),                        # default port, either side
+    ("http://h", "h", True),
+    ("http://h:80", "h", True),
+    ("https://h", "h:443", True),
+    ("https://h", "h:80", False),
+    ("http://h:99999", "h:99999", False),              # malformed port
+    ("http://h:abc", "h:abc", False),
+    ("http://h:8765", "h:abc", False),
+    ("null", "h:8765", False),                         # sandboxed iframe / file:// page
+    ("", "h:8765", False),
+], ids=["no-host", "ipv6", "ipv6-other-host", "ipv6-other-port", "upper-origin", "upper-host",
+        "default-port-host-80", "default-port-bare", "explicit-80-bare-host", "https-443",
+        "https-vs-80", "port-out-of-range", "port-not-a-number", "host-port-malformed", "null",
+        "empty"])
+def test_same_origin_cases(origin, host, ok) -> None:
+    from serialhub.server import _same_origin
+
+    headers = {"Origin": origin}
+    if host is not None:
+        headers["Host"] = host
+    assert _same_origin(_request(headers)) is ok
+
+
+def test_ipv6_same_origin_is_accepted_end_to_end(make_app) -> None:
+    tc, _hub, calls = make_app()
+    r = tc.post("/api/shutdown", headers={"Host": "[::1]:8765", "Origin": "http://[::1]:8765"})
+    assert r.status_code == 200, r.text
+    assert _until(lambda: calls, 5.0)
+
+
 # ---- accepted ----------------------------------------------------------------- #
 @pytest.mark.parametrize("headers", [
     {},                                   # non-browser client

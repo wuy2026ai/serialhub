@@ -698,3 +698,8 @@ zmodem.js 原样会对设备的下一行抛 “Only thing after ZFIN should be O
 
 **CLI / 客户端**：`serialhub shutdown`（`--url` / `--token`，单行 JSON 信封 `{"ok":true,"data":{"stopping":true}}`，退出码 0/1）；
 `Client.shutdown()`。MCP（full / lite）与 `lite.TOOLS` **不**提供停机工具。
+
+**安全边界补充（2026-11 增补）**：`Origin`/`Host` 比对只挡跨站表单 / fetch，挡不住 DNS 重绑定——未设 `server.token`
+时，攻击者域名解析到本机后，其页面请求的 `Origin` 与 `Host` 都是攻击者域名、比对通过，即可停止服务；对外监听时应设
+`token:` 或 `allow_shutdown: false`。位于会改写 `Host` 的反向代理之后时，浏览器的 `Origin` 与改写后的 `Host` 不一致，
+Exit 按钮得到 `403`（`serialhub shutdown` 等不带 `Origin` 的客户端不受影响）。

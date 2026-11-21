@@ -11,7 +11,7 @@ import socket
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 import pytest
 
@@ -142,5 +142,9 @@ def test_exit_dismiss_does_nothing(browser):
 def test_exit_button_hidden_when_disabled(browser):
     with LiveServer(LOOP, server={"allow_shutdown": False}) as srv, \
             _page(browser, srv.base_url) as page:
-        page.wait_for_timeout(500)  # /health has been read
+        # the button starts hidden, so first prove the page has consumed /health: the uptime
+        # stat leaves its "–" placeholder in the same step that decides the button
+        page.wait_for_function(
+            "document.querySelector('#statUptime').textContent.trim() !== '\\u2013'",
+            timeout=10000)
         assert page.locator("#exitBtn").is_hidden()
