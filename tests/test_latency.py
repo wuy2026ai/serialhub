@@ -705,3 +705,26 @@ def test_ringbuffer_cursor_read_scans_only_tail() -> None:
         rb.read(since_seq=39990)
     per_call = (time.perf_counter() - t0) / 200
     assert per_call < 0.0002, per_call  # whole-ring copy: ~0.5 ms
+
+
+def test_emit_complete_lines_matches_find_eol_reference() -> None:
+    import random
+
+    from serialhub.serialport import _find_eol
+
+    def reference(raw: bytes):
+        b, out = bytearray(raw), []
+        while (idx := _find_eol(b)) is not None:
+            out.append(bytes(b[:idx[0]]))
+            del b[:idx[1]]
+        return out, bytes(b)
+
+    rng = random.Random(7)
+    worker = SerialPortWorker(PortConfig(name="x", device="loop://"), _StubHub())
+    for _ in range(3000):
+        raw = bytes(rng.choice(b"ab\r\n") for _ in range(rng.randint(0, 14)))
+        got: list = []
+        worker._emit = got.append  # type: ignore[method-assign]
+        buf = bytearray(raw)
+        worker._emit_complete_lines(buf)
+        assert (got, bytes(buf)) == reference(raw), raw

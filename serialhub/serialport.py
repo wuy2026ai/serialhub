@@ -1109,14 +1109,33 @@ class SerialPortWorker(threading.Thread):
         return chunk
 
     def _emit_complete_lines(self, buf: bytearray) -> None:
-        while True:
-            idx = _find_eol(buf)
-            if idx is None:
-                break
-            end, drop = idx
-            raw = bytes(buf[:end])
-            del buf[:drop]
-            self._emit(raw)
+        """吐出缓冲里的全部整行（规则同 :func:`_find_eol`），最后一次性删掉已消费的前缀。
+
+        用 ``bytearray.find`` 定位 ``\n``/``\r``（C 实现）并缓存下一处位置，一大段突发数据
+        （2000 行）不必逐字节 Python 循环、也不必每行搬动缓冲。
+        """
+        pos = 0
+        size = len(buf)
+        nl = buf.find(b"\n")
+        nc = buf.find(b"\r")
+        try:
+            while nl >= 0 or nc >= 0:
+                if nc < 0 or 0 <= nl < nc:
+                    end, drop = nl, nl + 1
+                elif nc + 1 >= size:
+                    break  # 结尾孤立 \r：等待可能的 \n
+                else:
+                    end, drop = nc, (nc + 2 if buf[nc + 1] == _LF else nc + 1)
+                raw = bytes(buf[pos:end])
+                pos = drop
+                self._emit(raw)
+                if nl < pos:
+                    nl = buf.find(b"\n", pos)
+                if nc < pos:
+                    nc = buf.find(b"\r", pos)
+        finally:
+            if pos:
+                del buf[:pos]
 
     def _emit(self, raw: bytes) -> None:
         """增量解码后入环（kind=rx）。
