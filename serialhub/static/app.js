@@ -286,6 +286,7 @@ function createRuntime(name) {
     name,
     pane: tpl,
     term: null, fit: null, ro: null,
+    lastSeq: null, histBusy: false, liveQ: [], clearGen: 0,   // history/dedupe
     lines: [],          // retained records for filter/search/fallback
     deferred: [],       // lines buffered while paused
     hits: [], hitIdx: -1,
@@ -407,7 +408,8 @@ function createTerminal(rt) {
     return;
   }
   const term = new window.Terminal({
-    fontFamily: '"IBM Plex Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace',
+    // same local-first stack as --mono in style.css (no webfont is fetched)
+    fontFamily: '"IBM Plex Mono", ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Liberation Mono", monospace',
     fontSize: 12.5,
     lineHeight: 1.28,
     letterSpacing: 0,
@@ -873,6 +875,12 @@ function trimArr(arr, n) { while (arr.length > n) arr.shift(); }
 function onLine(name, line) {
   if (!portStillKnown(name)) return;   // late line from a port a config switch removed
   const rt = ensurePort(name);
+  if (rt.histBusy) { rt.liveQ.push(line); return; }   // history fetch in flight: replay after it
+  const seq = line.seq;
+  if (typeof seq === "number") {
+    if (rt.lastSeq != null && seq <= rt.lastSeq) return;   // already shown (history overlap)
+    rt.lastSeq = seq;
+  }
   const rec = buildRecord(line);
   rt.lineCount += 1;
   rt.byteCount += byteLen(rec.text);
@@ -886,6 +894,68 @@ function onLine(name, line) {
   }
   if (state.active === name) scheduleCounters();
 }
+/* History on (re)connect: GET /api/ports/<n>/read returns the ring buffer.
+   First load: last HISTORY_LINES lines; reconnect: since_seq=<last seen>.
+   Live WS lines that arrive meanwhile are queued (rt.liveQ) and replayed after
+   the history is written; rt.lastSeq drops overlaps, so no duplicates/gaps
+   (the WS is subscribed before the hello, i.e. before this snapshot). */
+const HISTORY_LINES = 500;
+async function fetchRead(name, params) {
+  const headers = state.token ? { Authorization: "Bearer " + state.token } : {};
+  try {
+    const res = await fetch(apiUrl(`/api/ports/${encodeURIComponent(name)}/read`, params), { headers });
+    const d = await res.json();
+    return d && d.ok ? d : null;
+  } catch (_e) { return null; }
+}
+
+function renderBatch(rt, recs) {
+  if (!rt.term) { recs.forEach((rec) => renderRecord(rt, rec)); return; }
+  const parts = [];
+  for (const rec of recs) {
+    if (rt.filterRe && !rt.filterRe.test(rec.plain)) continue;
+    rec.row = rt.writeIndex++;
+    parts.push(buildPrefix(rec) + rec.text + "\r\n");
+  }
+  if (!parts.length) return;
+  rt.term.write(parts.join(""));
+  if (state.autoscroll && state.active === rt.name) rt.term.scrollToBottom();
+}
+
+async function loadHistory(rt) {
+  if (state.stopped || rt.histBusy) return;
+  if (window.ZmodemUI && window.ZmodemUI.busy(rt.name)) return;   // never inject during a transfer
+  rt.histBusy = true; rt.liveQ = [];
+  const gen = rt.clearGen;
+  let lines = [];
+  try {
+    const since = rt.lastSeq;
+    let r = await fetchRead(rt.name, since == null ? { limit: HISTORY_LINES } : { since_seq: since });
+    if (r && since != null && r.last_seq != null && r.last_seq < since) {   // daemon restarted: seq reset
+      rt.lastSeq = null;
+      r = await fetchRead(rt.name, { limit: HISTORY_LINES });
+    }
+    if (r) lines = r.lines || []; else rt.lastSeq = null;   // fetch failed: stop de-duplicating
+  } catch (_e) { rt.lastSeq = null; }
+  try {
+    if (lines.length > state.maxRenderLines) lines = lines.slice(-state.maxRenderLines);
+    const base = rt.lastSeq;
+    const fresh = lines.filter((l) => base == null || l.seq > base);
+    fresh.forEach((l) => { if (typeof l.seq === "number" && (rt.lastSeq == null || l.seq > rt.lastSeq)) rt.lastSeq = l.seq; });
+    if (fresh.length && gen === rt.clearGen && portStillKnown(rt.name)) {   // "clear" while fetching: drop
+      const recs = fresh.map(buildRecord);
+      rt.lines.push(...recs);
+      trimArr(rt.lines, state.maxRenderLines);
+      if (state.paused) { rt.deferred.push(...recs); trimArr(rt.deferred, state.maxRenderLines); }
+      else renderBatch(rt, recs);
+    }
+  } finally {
+    rt.histBusy = false;
+    const q = rt.liveQ; rt.liveQ = [];
+    q.forEach((l) => onLine(rt.name, l));
+  }
+}
+
 function onMark(name, msg) {
   onLine(name, { seq: msg.seq, port: name, ts_ms: msg.ts_ms || Date.now(),
     text: t("markLine", { label: msg.label || "" }), ansi: false, kind: "mark" });
@@ -1004,7 +1074,7 @@ function connectWS() {
     handleWsMessage(msg);
   });
   ws.addEventListener("close", () => {
-    if (state.ws === ws && window.ZmodemUI) window.ZmodemUI.onDisconnect();
+    if (state.ws === ws && state.zmInited) window.ZmodemUI.onDisconnect();
     if (state.stopped) return;   // service exited on purpose: no reconnect loop
     setConn("idle", "connReconnecting");
     scheduleReconnect();
@@ -1034,7 +1104,40 @@ function wsSend(obj) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
 }
 
+/* ZMODEM scripts are loaded on demand (first zmodem message or rz/sz click).
+   Messages that arrive while they load are queued and replayed in order. */
+let zmQueue = null;
+function ensureZmodem() {
+  if (window.ZmodemUI && state.zmInited) return Promise.resolve();
+  if (state.zmPromise) return state.zmPromise;
+  state.zmPromise = (window.__loadZmodem ? window.__loadZmodem() : Promise.resolve()).then(() => {
+    if (!window.ZmodemUI) return;
+    window.ZmodemUI.init({
+      wsSend, sendCommand, t, toast,
+      paneFor: (name) => { const rt = state.runtimes.get(name); return rt ? rt.pane : null; },
+      activePort: () => $("#sendPort").value || state.active,
+      wsBuffered: () => (state.ws ? state.ws.bufferedAmount : 0),
+    });
+    state.zmInited = true;
+    const q = zmQueue || []; zmQueue = null;
+    q.forEach(([fn, m]) => window.ZmodemUI[fn](m));
+  });
+  return state.zmPromise;
+}
+function zmRoute(fn, msg) {
+  if (state.zmInited) { window.ZmodemUI[fn](msg); return; }
+  (zmQueue = zmQueue || []).push([fn, msg]);
+  ensureZmodem();
+}
+
+/* Messages that arrive before init() finished (WS opens in parallel with the
+   config fetch / xterm load) are held here and replayed in order. */
+let preReady = [];
 function handleWsMessage(msg) {
+  if (preReady) { preReady.push(msg); return; }
+  dispatchWsMessage(msg);
+}
+function dispatchWsMessage(msg) {
   if (!msg || typeof msg !== "object") return;
   if (msg.ok === false && msg.error === "unauthorized") {
     setConn("unauthorized", "connUnauthorized");
@@ -1049,11 +1152,11 @@ function handleWsMessage(msg) {
     case "pong": break;
     case "shutdown": enterStopped(); break;   // the daemon is exiting (any tab's Exit)
     // ZMODEM: broadcasts (start/end) + this connection's session relay
-    case "zmodem": if (window.ZmodemUI) window.ZmodemUI.onBroadcast(msg); break;
-    case "zmodem_claimed": if (window.ZmodemUI) window.ZmodemUI.onClaimed(msg); break;
-    case "zmodem_data": if (window.ZmodemUI) window.ZmodemUI.onData(msg); break;
-    case "zmodem_closed": if (window.ZmodemUI) window.ZmodemUI.onClosed(msg); break;
-    case "zmodem_error": if (window.ZmodemUI) window.ZmodemUI.onError(msg); break;
+    case "zmodem": zmRoute("onBroadcast", msg); break;
+    case "zmodem_claimed": zmRoute("onClaimed", msg); break;
+    case "zmodem_data": zmRoute("onData", msg); break;
+    case "zmodem_closed": zmRoute("onClosed", msg); break;
+    case "zmodem_error": zmRoute("onError", msg); break;
     default: break;
   }
 }
@@ -1067,6 +1170,7 @@ function onHello(ports) {
     const rt = ensurePort(p.name);
     rt.state = p.open ? "open" : (p.last_error ? "error" : "closed");
     updatePortHeader(rt);
+    loadHistory(rt);
   });
   if (!state.active && ports.length) activate(ports[0].name);
   updateGlobalStats();
@@ -1324,8 +1428,8 @@ function applyConfig(cfg) {
   updateConfigIndicator();
 }
 
-async function loadConfig() {
-  const r = await api("GET", "/api/config");
+async function loadConfig(pending) {
+  const r = await (pending || api("GET", "/api/config"));
   if (!r.ok || !r.config) return;
   applyConfig(r.config);
   // build port runtimes from config (ensures tabs before WS hello)
@@ -1571,7 +1675,7 @@ function bindUI() {
   $("#btnClear").addEventListener("click", () => {
     const rt = state.active ? state.runtimes.get(state.active) : null;
     if (!rt) return;
-    rt.lines = []; rt.deferred = []; rt.hits = []; rt.hitIdx = -1; rt.writeIndex = 0;
+    rt.lines = []; rt.deferred = []; rt.hits = []; rt.hitIdx = -1; rt.writeIndex = 0; rt.clearGen++;
     if (rt.term) { rt.term.clear(); rt.term.reset(); }
     else rt.el.fallback.innerHTML = "";
     $("#searchResults").hidden = true;
@@ -1644,6 +1748,11 @@ async function init() {
   try { state.sendHistory = JSON.parse(safeGet("serialhub.sendHistory", "[]")) || []; }
   catch (_e) { state.sendHistory = []; }
 
+  // Start the config fetch and the WebSocket right away, in parallel with the
+  // xterm load; WS messages are held in preReady until the UI is set up.
+  const cfgPromise = api("GET", "/api/config");
+  connectWS();
+
   // Wait for xterm.js (local vendor -> CDN fallback) to settle before we
   // decide whether to render with the terminal or the plain-text fallback.
   if (window.__xtermReady) { try { await window.__xtermReady; } catch (_e) { /* ignore */ } }
@@ -1656,16 +1765,19 @@ async function init() {
   $("#btnAuto").classList.toggle("on", state.autoscroll);
   $("#btnTs").classList.toggle("on", state.timestamp);
   bindUI();
-  if (window.ZmodemUI) {
-    window.ZmodemUI.init({
-      wsSend, sendCommand, t, toast,
-      paneFor: (name) => { const rt = state.runtimes.get(name); return rt ? rt.pane : null; },
-      activePort: () => $("#sendPort").value || state.active,
-      wsBuffered: () => (state.ws ? state.ws.bufferedAmount : 0),
+  // ZMODEM UI loads lazily; rz/sz buttons trigger the load, then re-click.
+  ["btnRz", "btnSz"].forEach((id) => {
+    const b = document.getElementById(id);
+    if (!b) return;
+    b.addEventListener("click", function once(e) {
+      if (state.zmInited) return;
+      b.removeEventListener("click", once);
+      e.stopImmediatePropagation();
+      ensureZmodem().then(() => b.click());
     });
-  }
+  });
 
-  await loadConfig();
+  await loadConfig(cfgPromise);
   updateEmptyState();
   fillSendPorts();
 
@@ -1673,7 +1785,9 @@ async function init() {
   if (!state.active && state.runtimes.size) activate(state.runtimes.keys().next().value);
   buildTabs();
 
-  connectWS();
+  // WS messages queued while we were initialising
+  const held = preReady; preReady = null;
+  held.forEach(dispatchWsMessage);
   // interval ids are kept so the "service stopped" state can cancel them
   state.timers = [
     setInterval(tickRates, 1000),

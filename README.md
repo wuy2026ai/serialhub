@@ -17,6 +17,7 @@ Turn one or more serial ports into a **persistent, reviewable, incrementally rea
 > The MCP-specific guide is in [`docs/MCP.md`](docs/MCP.md) (Chinese: [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)).
 > The DSH (DeepSeek Harness) integration walkthrough is in [`docs/DSH.md`](docs/DSH.md) (Chinese: [`docs/DSH.zh-CN.md`](docs/DSH.zh-CN.md)).
 > The compact 8-tool interface for small local LLMs (`mcp --profile lite`, `tools`, `call`; including agent file transfer `zsend` / `zrecv`) is in [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md).
+> Connecting Hermes Agent with the lowest per-call latency (kept-open MCP session): [`docs/HERMES.md`](docs/HERMES.md).
 
 ---
 

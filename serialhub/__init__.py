@@ -8,9 +8,33 @@ from __future__ import annotations
 
 __version__ = "0.1.0"
 
-from .config import Config, PortConfig
-from .hub import Hub
-from .models import Line
-from .ringbuffer import RingBuffer
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .config import Config, PortConfig
+    from .hub import Hub
+    from .models import Line
+    from .ringbuffer import RingBuffer
+
+# Lazy (PEP 562): keep ``import serialhub`` cheap for client-side CLI commands.
+_LAZY = {
+    "Config": "config",
+    "PortConfig": "config",
+    "Hub": "hub",
+    "Line": "models",
+    "RingBuffer": "ringbuffer",
+}
+
+
+def __getattr__(name: str) -> Any:
+    mod = _LAZY.get(name)
+    if mod is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(f".{mod}", __name__), name)
+    globals()[name] = value
+    return value
+
 
 __all__ = ["__version__", "Line", "RingBuffer", "Config", "PortConfig", "Hub"]

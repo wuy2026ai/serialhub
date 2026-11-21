@@ -17,6 +17,7 @@
 > MCP 专项说明见 [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)。
 > DSH（DeepSeek Harness）接入全过程见 [`docs/DSH.zh-CN.md`](docs/DSH.zh-CN.md)。
 > 面向本地小模型的 8 工具精简接口（`mcp --profile lite`、`tools`、`call`；含 agent 文件传输 `zsend` / `zrecv`）见 [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)（英文）。
+> 以最低单次调用延迟接入 Hermes Agent（常驻 MCP 会话）：[`docs/HERMES.md`](docs/HERMES.md)（英文）。
 
 ---
 

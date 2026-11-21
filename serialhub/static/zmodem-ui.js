@@ -571,7 +571,8 @@
   }
 
   window.ZmodemUI = {
-    init, onBroadcast, onClaimed, onData, onClosed, onError, onDisconnect,
+    init, busy: (port) => { const s = ports.get(port); return !!s && ["waiting", "claiming", "active", "finishing"].includes(s.phase); },
+    onBroadcast, onClaimed, onData, onClosed, onError, onDisconnect,
     _shellQuote: shellQuote,
   };
 })();

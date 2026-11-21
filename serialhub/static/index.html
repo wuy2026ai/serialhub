@@ -7,10 +7,8 @@
   <link rel="icon" href="data:," />
   <title>serialhub · serial console</title>
 
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" />
+  <!-- Fonts: local-first stack in style.css (IBM Plex when installed, else system
+       fonts). No external font request: nothing here can block first paint. -->
 
   <!-- xterm.js (ANSI terminal renderer) — vendored locally, CDN as fallback.
        If the local copy fails we retry from the CDN; only if BOTH fail is
@@ -321,14 +319,22 @@
       "/static/vendor/addon-fit.min.js",
       "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"
     ], "__fitFailed");
-    // zmodem.js (rz/sz in the browser), then serialhub's lrzsz shim, which
-    // patches window.Zmodem as soon as it runs. zmodem-ui.js awaits this.
-    window.__zmodemReady = loadFirst([
-      "/static/vendor/zmodem.min.js",
-      "https://cdn.jsdelivr.net/npm/zmodem.js@0.1.10/dist/zmodem.js"
-    ], "__zmodemFailed").then(function (ok) {
-      return ok && loadFirst(["/static/vendor/zmodem-shim.js"], "__zmodemFailed");
-    });
+    // ZMODEM (zmodem.js, serialhub's lrzsz shim, then zmodem-ui.js) is loaded
+    // lazily by app.js on the first zmodem event / rz-sz click via
+    // window.__loadZmodem(); the promise is memoised and keeps the load order.
+    window.__loadZmodem = function () {
+      if (window.__zmodemLoading) return window.__zmodemLoading;
+      window.__zmodemReady = loadFirst([
+        "/static/vendor/zmodem.min.js",
+        "https://cdn.jsdelivr.net/npm/zmodem.js@0.1.10/dist/zmodem.js"
+      ], "__zmodemFailed").then(function (ok) {
+        return ok && loadFirst(["/static/vendor/zmodem-shim.js"], "__zmodemFailed");
+      });
+      window.__zmodemLoading = window.__zmodemReady.then(function () {
+        return loadFirst(["/static/zmodem-ui.js"], "__zmodemUiFailed");
+      });
+      return window.__zmodemLoading;
+    };
   })();
   </script>
 
@@ -348,7 +354,6 @@
   </script>
   <script src="/static/i18n/en.js"></script>
   <script src="/static/i18n/zh.js"></script>
-  <script src="/static/zmodem-ui.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
