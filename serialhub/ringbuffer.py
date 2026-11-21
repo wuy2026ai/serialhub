@@ -19,6 +19,9 @@ __all__ = ["RingBuffer"]
 
 Pattern = Union[str, "re.Pattern[str]", None]
 
+#: 从尾部倒扫游标时，遇到 seq <= 游标后再多看这么多行才停（容忍并发 ingest 造成的轻微乱序）。
+_SCAN_SLACK = 16
+
 
 def _matches(text: str, pattern: Pattern) -> bool:
     """pattern 为 None/空串时不筛选；字符串按正则编译匹配；否则用已编译对象。"""
@@ -103,21 +106,51 @@ class RingBuffer:
     ) -> dict:
         """增量读取（§4.1）。游标优先 ``since_seq`` → ``since_ts`` → 末尾 ``limit``。"""
         kinds_set = set(kinds) if kinds else None
+        if since_seq is not None:
+            # seq 单调递增：从尾部倒扫到游标即停，不复制整个环（§16）。
+            with self._lock:
+                first = self._buf[0].seq if self._buf else None
+                last = self._buf[-1].seq if self._buf else None
+                tail: list[Line] = []
+                slack = 0
+                for line in reversed(self._buf):
+                    if line.seq > since_seq:
+                        tail.append(line)
+                        slack = 0
+                    else:
+                        slack += 1
+                        if slack > _SCAN_SLACK:
+                            break
+            tail.reverse()
+            return self._finish(tail, first, last, True, since_seq, regex, limit,
+                                strip_ansi, kinds_set)
         with self._lock:
             items = list(self._buf)
         first = items[0].seq if items else None
         last = items[-1].seq if items else None
 
-        if since_seq is not None:
-            cursor_mode = True
-            base = [line for line in items if line.seq > since_seq]
-        elif since_ts is not None:
+        if since_ts is not None:
             cursor_mode = True
             base = [line for line in items if line.ts_ms > since_ts]
         else:
             cursor_mode = False
             base = items
+        return self._finish(base, first, last, cursor_mode, since_seq, regex, limit,
+                            strip_ansi, kinds_set)
 
+    @staticmethod
+    def _finish(
+        base: list[Line],
+        first: Optional[int],
+        last: Optional[int],
+        cursor_mode: bool,
+        since_seq: Optional[int],
+        regex: Pattern,
+        limit: Optional[int],
+        strip_ansi: bool,
+        kinds_set: Optional[set[str]],
+    ) -> dict:
+        """筛选（kinds/regex）→ limit → 组装 ``read`` 的返回结构。"""
         filtered = [
             line for line in base
             if (kinds_set is None or line.kind in kinds_set) and _matches(line.text, regex)

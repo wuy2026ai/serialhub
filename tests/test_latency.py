@@ -678,3 +678,30 @@ def test_i18n_access_log_help_in_both_catalogs() -> None:
     for lang in ("en", "zh"):
         cat = _json.loads((root / f"{lang}.json").read_text(encoding="utf-8"))
         assert cat.get("cli.arg.access_log")
+
+
+# --------------------------------------------------------------------------- #
+# D. RingBuffer.read does not copy the whole ring for a cursor near the tail
+# --------------------------------------------------------------------------- #
+def test_ringbuffer_cursor_read_scans_only_tail() -> None:
+    from serialhub.models import Line
+    from serialhub.ringbuffer import RingBuffer
+
+    rb = RingBuffer(max_lines=20000, max_bytes=1 << 30)
+    for seq in range(1, 20001):
+        rb.append(Line(seq=seq * 2, port="p", ts_ms=seq, text=f"l{seq}"))
+    out = rb.read(since_seq=39990)
+    assert [ln["seq"] for ln in out["lines"]] == [39992, 39994, 39996, 39998, 40000]
+    assert out["first_seq"] == 2 and out["last_seq"] == 40000 and out["next_seq"] == 40000
+    assert rb.read(since_seq=40000)["lines"] == []
+    assert rb.read(since_seq=0, limit=2)["has_more"] is True
+    assert rb.read(limit=3)["lines"][0]["seq"] == 39996
+    # a slightly out-of-order append (tx ingested by another thread) is not lost
+    rb.append(Line(seq=40003, port="p", ts_ms=1, text="a"))
+    rb.append(Line(seq=40002, port="p", ts_ms=1, text="b"))
+    assert [ln["seq"] for ln in rb.read(since_seq=40000)["lines"]] == [40003, 40002]
+    t0 = time.perf_counter()
+    for _ in range(200):
+        rb.read(since_seq=39990)
+    per_call = (time.perf_counter() - t0) / 200
+    assert per_call < 0.0002, per_call  # whole-ring copy: ~0.5 ms
