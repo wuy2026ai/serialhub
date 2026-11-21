@@ -96,5 +96,6 @@
   "cli.arg.zrecv_inline": "同时打印文本文件内容（上限 4000 字符）",
   "cli.error.zsend_one": "给出文件路径或 --content，二者只能选一",
   "cli.error.zsend_name": "--content 需要 --name",
-  "cli.arg.zsend_no_overwrite": "保留设备上已存在的同名文件（lrz 会回 ZSKIP）；默认覆盖"
+  "cli.arg.zsend_no_overwrite": "保留设备上已存在的同名文件（lrz 会回 ZSKIP）；默认覆盖",
+  "cli.arg.access_log": "记录每个 HTTP 请求（uvicorn 访问日志；默认关闭）"
 }

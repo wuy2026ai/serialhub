@@ -272,6 +272,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--no-autostart", action="store_true")
     p.add_argument("--log-level", default=None)
+    p.add_argument("--access-log", action="store_true", help=t("cli.arg.access_log"))
 
     p = add("mcp", help=t("cli.cmd.mcp"))
     p.add_argument("--stdio", action="store_true", help=t("cli.arg.stdio"))
@@ -404,7 +405,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     hub.start()
     app = create_app(hub, cfg)
     server = uvicorn.Server(uvicorn.Config(app, host=cfg.server.host, port=cfg.server.port,
-                                           log_level=args.log_level or "info"))
+                                           log_level=args.log_level or "info",
+                                           access_log=bool(args.access_log)))
     # POST /api/shutdown (Web UI "Exit" / `serialhub shutdown`) ends server.run() cleanly.
     app.state.request_exit = lambda: setattr(server, "should_exit", True)
     try:

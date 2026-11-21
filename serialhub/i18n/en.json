@@ -96,5 +96,6 @@
   "cli.arg.zrecv_inline": "also print the content of text files (capped at 4000 chars)",
   "cli.error.zsend_one": "give file path(s) or --content, not both",
   "cli.error.zsend_name": "--content needs --name",
-  "cli.arg.zsend_no_overwrite": "keep an existing device file (lrz then answers ZSKIP); default: overwrite"
+  "cli.arg.zsend_no_overwrite": "keep an existing device file (lrz then answers ZSKIP); default: overwrite",
+  "cli.arg.access_log": "log every HTTP request (uvicorn access log; off by default)"
 }

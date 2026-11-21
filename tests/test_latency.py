@@ -611,3 +611,70 @@ def test_ws_partial_events_coalesced(live) -> None:
         assert partials and partials[-1] == "typing 199"
         assert len(partials) < 200
         hub.set_pending("t", "")
+
+
+# --------------------------------------------------------------------------- #
+# 6. static/HTTP: gzip, Cache-Control, access log flag
+# --------------------------------------------------------------------------- #
+def test_static_gzip_and_cache_control(client) -> None:
+    gz = {"Accept-Encoding": "gzip"}
+    r = client.get("/static/app.js", headers=gz)
+    assert r.status_code == 200 and r.headers.get("content-encoding") == "gzip"
+    assert r.headers["cache-control"] == "no-cache"
+    r = client.get("/", headers=gz)
+    assert r.headers.get("content-encoding") == "gzip"
+    assert r.headers["cache-control"] == "no-cache"
+    r = client.get("/static/vendor/xterm.min.js", headers=gz)
+    assert r.status_code == 200 and r.headers.get("content-encoding") == "gzip"
+    assert r.headers["cache-control"].startswith("public, max-age=")
+    assert int(r.headers["cache-control"].split("max-age=")[1]) >= 86400
+    # revalidation still works (ETag -> 304)
+    etag = client.get("/static/app.js").headers["etag"]
+    assert client.get("/static/app.js", headers={"If-None-Match": etag}).status_code == 304
+    # small JSON is not compressed, API responses carry no static cache header
+    r = client.get("/health", headers=gz)
+    assert "content-encoding" not in r.headers and "cache-control" not in r.headers
+
+
+def test_large_json_gzipped(client, hub) -> None:
+    for i in range(60):
+        hub.ingest("t", f"line {i} " + "x" * 40)
+    r = client.get("/api/ports/t/read", headers={"Accept-Encoding": "gzip"})
+    assert r.headers.get("content-encoding") == "gzip"
+    assert r.json()["ok"] is True
+
+
+def test_serve_access_log_flag(monkeypatch, tmp_path) -> None:
+    import json as _json
+
+    from serialhub import cli
+
+    cfg = tmp_path / "c.json"
+    cfg.write_text(_json.dumps({"ports": [{"name": "a", "device": "loop://",
+                                           "autostart": False}]}))
+    seen: list = []
+
+    class FakeServer:
+        def __init__(self, config) -> None:
+            seen.append(config)
+            self.should_exit = False
+
+        def run(self) -> None:
+            pass
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    assert cli.main(["serve", "--config", str(cfg)]) in (0, None)
+    assert cli.main(["serve", "--config", str(cfg), "--access-log"]) in (0, None)
+    assert [c.access_log for c in seen] == [False, True]
+
+
+def test_i18n_access_log_help_in_both_catalogs() -> None:
+    import json as _json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "serialhub" / "i18n"
+    for lang in ("en", "zh"):
+        cat = _json.loads((root / f"{lang}.json").read_text(encoding="utf-8"))
+        assert cat.get("cli.arg.access_log")

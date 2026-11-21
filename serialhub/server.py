@@ -33,6 +33,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -50,6 +51,11 @@ except Exception:  # noqa: BLE001 - 包初始化期间允许缺失
     VERSION = "0.1.0"
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+#: 第三方 vendor 资源（xterm/zmodem.js）的缓存时长：长缓存（文件名无版本号，取 7 天）。
+VENDOR_MAX_AGE_S = 7 * 24 * 3600
+#: 不小于这么多字节的响应才 gzip（静态资源与大 JSON，§16）。
+GZIP_MIN_BYTES = 1024
 
 #: ``POST /api/shutdown`` 先回响应、再等这么久才真正停机（让响应与 WS 广播送达）。
 SHUTDOWN_DELAY_S = 0.2
@@ -81,6 +87,37 @@ class I18nMiddleware:
             await self.app(scope, receive, send)
         finally:
             set_locale(None)
+
+
+class CacheControlMiddleware:
+    """Pure-ASGI: ``Cache-Control`` for the Web UI (§16).
+
+    ``/static/vendor/*`` gets a long ``max-age``; the app's own html/js/css (``/`` and the
+    rest of ``/static/*``) get ``no-cache`` — the browser keeps them but revalidates with
+    ``ETag``/``Last-Modified`` (a cheap 304), so a new version shows up on the next load.
+    API and WebSocket responses are untouched.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        path = scope.get("path") or ""
+        if scope.get("type") != "http" or not (path == "/" or path.startswith("/static/")):
+            await self.app(scope, receive, send)
+            return
+        value = (f"public, max-age={VENDOR_MAX_AGE_S}".encode("latin-1")
+                 if path.startswith("/static/vendor/") else b"no-cache")
+
+        async def _send(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", [])
+                           if k.lower() != b"cache-control"]
+                headers.append((b"cache-control", value))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, _send)
 
 
 # --------------------------------------------------------------------------- #
@@ -753,6 +790,10 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         if index_file.is_file():
             return FileResponse(str(index_file))
         return JSONResponse(status_code=404, content={"ok": False, "error": t("server.error.ui_not_built")})
+
+    # gzip for static assets and JSON >= 1 KiB; Cache-Control for the UI (§16).
+    app.add_middleware(GZipMiddleware, minimum_size=GZIP_MIN_BYTES)
+    app.add_middleware(CacheControlMiddleware)
 
     # Outermost user middleware (added last ⇒ insert(0)): sets the per-request
     # locale before auth/exception handlers/endpoints run, so a request with an
