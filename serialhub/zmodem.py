@@ -21,7 +21,10 @@ from typing import Optional
 
 from .models import now_ms
 
-__all__ = ["ABORT_SEQ", "HEADER_RE", "Detection", "ZmodemDetector", "ZmodemSession"]
+__all__ = [
+    "ABORT_SEQ", "DRAIN_MAX_MS", "DRAIN_SILENCE_MS", "END_REASONS", "HEADER_RE",
+    "Detection", "ZmodemDetector", "ZmodemSession",
+]
 
 #: 写给设备的中止序列：8×CAN + 8×BS（lrzsz 的标准取消串）。
 ABORT_SEQ: bytes = b"\x18" * 8 + b"\x08" * 8
@@ -33,6 +36,15 @@ HEADER_RE = re.compile(rb"\*\*\x18B0([01])")
 _PREFIX = b"**\x18B0"
 
 _DIRECTIONS = {b"0": "download", b"1": "upload"}
+
+#: 会话结束原因的合法取值。
+END_REASONS = frozenset({"done", "abort", "timeout", "unclaimed", "closed", "disconnect"})
+
+#: 非 ``done`` 结束后进入“排空”：丢弃读到的字节（设备还在发、OS/USB 缓冲里还有
+#: 负载），直到连续这么久读不到数据……
+DRAIN_SILENCE_MS = 300
+#: ……或排空总时长达到上限，再回到行模式。
+DRAIN_MAX_MS = 3000
 
 
 @dataclass

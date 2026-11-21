@@ -325,6 +325,7 @@ class TcpBridge:
             self._hub.write_bytes(self._port, data)
         except Exception as exc:
             self._record_error(exc)
+            return  # 没写到设备（如 ZMODEM 会话进行中）就不记 tx 行
         try:
             self._hub.ingest(self._port, data.decode("utf-8", errors="replace"), kind="tx")
         except Exception as exc:

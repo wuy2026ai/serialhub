@@ -11,7 +11,9 @@ import time
 
 import pytest
 
-from serialhub.zmodem import ABORT_SEQ
+from serialhub import zmodem
+from serialhub.tcp_bridge import TcpBridge
+from serialhub.zmodem import ABORT_SEQ, Detection
 
 ZRQINIT = b"**\x18B00000000000000\r\x8a\x11"
 POLL_TIMEOUT = 3.0
@@ -74,6 +76,25 @@ def _drain(q: "queue.Queue", timeout: float = 0.5) -> bytes:
 def _device_sends(hub, data: bytes) -> None:
     """模拟设备在会话中发字节：绕过会话期间对普通写入的拦截，直接写 loop://。"""
     hub._require_worker("z")._write_raw(data)
+
+
+def _spy_writes(hub) -> list[bytes]:
+    """记录 worker 的全部原始写入（含 ABORT_SEQ）。"""
+    worker = hub._require_worker("z")
+    real = worker._write_raw
+    written: list[bytes] = []
+
+    def spy(data: bytes) -> int:
+        written.append(bytes(data))
+        return real(data)
+
+    worker._write_raw = spy  # type: ignore[method-assign]
+    return written
+
+
+def _drain_over(hub, timeout: float = 5.0) -> bool:
+    worker = hub._require_worker("z")
+    return bool(_until(lambda: worker._zm_drain_started is None, timeout=timeout))
 
 
 def _start(hub) -> None:
@@ -171,22 +192,159 @@ def test_end_is_idempotent_and_resumes_line_mode(zhub) -> None:
 
 def test_abort_writes_abort_seq(zhub) -> None:
     _start(zhub)
+    written = _spy_writes(zhub)
     sid, _ = zhub.zmodem_claim("z", "tab-1")
     assert zhub.zmodem_end("z", sid, "tab-1", abort=True, reason="abort")["reason"] == "abort"
-    zhub.write_bytes("z", b"\n")  # loop:// 把 ABORT_SEQ 回读成文本，补一个换行收行
-    assert _until(lambda: ABORT_SEQ.decode() in _lines(zhub, {"rx"}))
+    assert written == [ABORT_SEQ]
+    # loop:// 回读的 ABORT_SEQ 落在排空窗口里：被丢弃，不入环
+    assert _drain_over(zhub)
+    assert _lines(zhub, {"rx"}) == ["rz"]
+
+
+def test_end_rejects_unknown_reason(zhub) -> None:
+    _start(zhub)
+    sid = zhub.zmodem_status("z")["session"]
+    with pytest.raises(ValueError, match="reason"):
+        zhub.zmodem_end("z", sid, None, reason="bogus")
+    assert zhub.zmodem_status("z")["active"] is True
+
+
+def test_done_end_resumes_immediately_without_drain(zhub) -> None:
+    _start(zhub)
+    sid, _ = zhub.zmodem_claim("z", "tab-1")
+    zhub.zmodem_end("z", sid, "tab-1")
+    assert zhub._require_worker("z")._zm_drain_started is None
+
+
+def test_drain_discards_trailing_payload_then_resumes(zhub) -> None:
+    _start(zhub)
+    sid, _ = zhub.zmodem_claim("z", "tab-1")
+    zhub.zmodem_end("z", sid, "tab-1", abort=True, reason="abort")
+    for i in range(4):  # 每段间隔 < DRAIN_SILENCE_MS：都落在排空窗口内
+        _device_sends(zhub, bytes([0x18, 0x41 + i, 0x0A, 0x8A, 0x0D, 0xFF]) * 20)
+        time.sleep(0.1)
+    assert _drain_over(zhub)
+    assert _lines(zhub, {"rx"}) == ["rz"]  # 残余负载一行都没进环
+    zhub.write_bytes("z", b"hello\n")
+    assert _until(lambda: "hello" in _lines(zhub, {"rx"}))
+    assert _lines(zhub, {"rx"}) == ["rz", "hello"]  # 行缓冲/解码器是干净的
+
+
+def test_drain_cap_honoured_when_garbage_never_stops(zhub, monkeypatch) -> None:
+    monkeypatch.setattr(zmodem, "DRAIN_MAX_MS", 600)
+    _start(zhub)
+    sid, _ = zhub.zmodem_claim("z", "tab-1")
+    worker = zhub._require_worker("z")
+    t0 = time.time()
+    zhub.zmodem_end("z", sid, "tab-1", abort=True, reason="abort")
+    while worker._zm_drain_started is not None and time.time() - t0 < 3.0:
+        _device_sends(zhub, b"\x18\xff\x00garbage")  # 从不静默
+        time.sleep(0.03)
+    elapsed = time.time() - t0
+    assert worker._zm_drain_started is None
+    assert 0.5 <= elapsed < 1.5
+
+
+def test_claim_landing_at_deadline_is_not_killed(hub_factory, make_config) -> None:
+    """确定性复现“判定后、摘除前”的空隙：在 _zm_lock 第一次释放时插入认领。"""
+    hub = hub_factory(make_config(ports=[_port(autostart=False)]))
+    worker = hub._require_worker("z")  # 不打开：没有读循环线程干扰
+    worker._zm_begin(Detection(direction="download", initial=ZRQINIT))
+    worker._zm_session.started_ms -= 10_000  # 认领期限已过
+    sub = hub.subscribe()
+
+    outcome: dict = {}
+
+    class HookLock:
+        def __init__(self, inner):
+            self.inner = inner
+            self.armed = False
+
+        def __enter__(self):
+            self.inner.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.inner.release()
+            if self.armed:
+                self.armed = False
+                try:
+                    outcome["claim"] = worker.zmodem_claim("tab-1")
+                except RuntimeError as err:
+                    outcome["error"] = str(err)
+            return False
+
+    lock = HookLock(worker._zm_lock)
+    worker._zm_lock = lock
+    lock.armed = True
+    worker._zm_check_deadlines()
+
+    ends = [e for e in _zm_events(sub) if e["event"] == "end"]
+    assert [e["reason"] for e in ends] == ["unclaimed"]
+    # 认领要么干净地失败（会话已被摘除），绝不能“认领成功后又被当作 unclaimed 杀掉”
+    assert "claim" not in outcome
+    assert outcome["error"] == "zmodem: no active session"
+
+
+def test_session_writes_not_starved_by_reader(zhub) -> None:
+    _start(zhub)
+    sid, q = zhub.zmodem_claim("z", "tab-1")
+    n = 20
+    t0 = time.time()
+    for _ in range(n):
+        zhub.zmodem_write("z", sid, "tab-1", b"x" * 64)
+    elapsed = time.time() - t0
+    assert elapsed < n * 0.1 / 4, elapsed  # 旧实现每次要等读循环的 0.1 s 读超时
+
+
+def test_bridge_does_not_ingest_tx_when_write_refused(zhub, free_tcp_port) -> None:
+    bridge = TcpBridge(zhub, "z", mode="server", tcp_port=free_tcp_port())
+    _start(zhub)
+    bridge._forward_to_serial(b"ls\n")
+    assert _lines(zhub, {"tx"}) == []
+    assert "zmodem" in (bridge._last_error or "")
+
+
+def test_read_error_ends_session_closed(zhub) -> None:
+    sub = zhub.subscribe()
+    _start(zhub)
+    sid, q = zhub.zmodem_claim("z", "tab-1")
+    worker = zhub._require_worker("z")
+
+    class Broken:
+        @property
+        def in_waiting(self):
+            raise OSError("unplugged")
+
+        def read(self, *_a):
+            raise OSError("unplugged")
+
+        def close(self):
+            pass
+
+    with worker._io_lock:
+        real, worker._serial = worker._serial, Broken()
+    real.close()
+    assert _until(lambda: [e for e in _zm_events(sub) if e["event"] == "end"] or None) == [{
+        "type": "zmodem", "event": "end", "port": "z", "session": sid,
+        "reason": "closed", "rx_bytes": len(ZRQINIT), "tx_bytes": 0,
+    }]
+    assert _drain(q, timeout=1.0) == ZRQINIT
 
 
 def test_unclaimed_timeout_aborts_and_resumes(hub_factory, make_config) -> None:
     hub = hub_factory(make_config(ports=[_port(zmodem_claim_ms=200)]))
     sub = hub.subscribe()
+    written = _spy_writes(hub)
     _start(hub)
     assert _until(lambda: not hub.zmodem_status("z")["active"], timeout=2.0)
     ends = [e for e in _zm_events(sub) if e["event"] == "end"]
     assert [e["reason"] for e in ends] == ["unclaimed"]
+    assert ABORT_SEQ in written
+    assert _drain_over(hub)  # 回读的 ABORT_SEQ 被排空丢弃
     hub.write_bytes("z", b"hello\n")
-    # ABORT_SEQ 写给设备，loop:// 把它回读成下一行文本的开头
-    assert _until(lambda: ABORT_SEQ.decode() + "hello" in _lines(hub, {"rx"}))
+    assert _until(lambda: "hello" in _lines(hub, {"rx"}))
+    assert _lines(hub, {"rx"}) == ["rz", "hello"]
 
 
 def test_idle_timeout(hub_factory, make_config) -> None:

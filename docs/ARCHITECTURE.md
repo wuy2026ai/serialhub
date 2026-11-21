@@ -558,7 +558,12 @@ class TcpBridge:
 - `close()`/`Hub.stop()` → `closed`（尽力写 `ABORT_SEQ` 后关口）；串口读错误断线 → `closed`（不写）。
 - 结束：队列放 `None` → `hub.mark(port, "[zmodem] end reason=<r> rx=<n> tx=<n>")` → 广播
   `{"type":"zmodem","event":"end","port","session","reason","rx_bytes","tx_bytes"}`，
-  `reason ∈ done|abort|timeout|unclaimed|closed|disconnect`；随后回到行模式。
+  `reason ∈ done|abort|timeout|unclaimed|closed|disconnect`（`END_REASONS`）；`done` 立即回到行模式。
+- 非 `done` 结束 → **排空**：读到的字节一律丢弃（检测器停用），直到连续 `DRAIN_SILENCE_MS = 300` 无数据
+  或总计 `DRAIN_MAX_MS = 3000`（`zmodem.py` 模块常量），再以清空的行缓冲/重置的解码器回到行模式——
+  设备处理 CAN 之前还在发的负载、OS/USB 缓冲里的残余都不会进环。
+- 会话中读循环只读 `in_waiting` 字节（无数据时在 `_io_lock` 外等 5 ms），不在锁下阻塞 0.1 s，owner 的写不被饿死。
+- TCP 桥：`write_bytes` 失败（如会话进行中）时不再 `ingest` tx 行。
 
 **Hub API**（未知端口一律 `KeyError`）：
 ```python
@@ -570,8 +575,10 @@ def zmodem_write(self, name, session_id, client_id, data: bytes) -> int
     # 仅 owner；原始写，tx_bytes += n，刷新活动时间；会话不符 → 上述两种 RuntimeError
 def zmodem_end(self, name, session_id, client_id: Optional[str], *, abort=False, reason="done") -> dict
     # 幂等；返回 {"port","session","reason","rx_bytes","tx_bytes"}；abort 先写 ABORT_SEQ。
+    # reason ∉ END_REASONS → ValueError。
     # client_id 非 None 且会话被他人认领 → RuntimeError；已结束的会话返回同一摘要，未知 id 返回 reason=None。
 ```
 
 **锁**：worker 新增 `_zm_lock`（叶子锁）守护会话指针与会话字段；持有时不做串口 I/O、不调 hub、不阻塞
-（只对无界队列 `put_nowait`，保证数据、认领回放与结束哨兵的先后顺序）。
+（只对无界队列 `put_nowait`，保证数据、认领回放与结束哨兵的先后顺序）。超时判定 / owner 校验与摘除会话
+（`_zm_session = None`）在同一临界区内完成，期间落地的认领或别的客户端的结束不会误杀新会话。
