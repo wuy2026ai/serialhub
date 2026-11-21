@@ -728,3 +728,47 @@ def test_emit_complete_lines_matches_find_eol_reference() -> None:
         buf = bytearray(raw)
         worker._emit_complete_lines(buf)
         assert (got, bytes(buf)) == reference(raw), raw
+
+
+# --------------------------------------------------------------------------- #
+# /ws: a write racing the end of its session gets zmodem_closed before the error
+# --------------------------------------------------------------------------- #
+def test_ws_closed_precedes_late_write_error(hub_factory, make_config, monkeypatch) -> None:
+    import asyncio
+    import base64
+
+    from fastapi.testclient import TestClient
+
+    from serialhub.server import create_app
+
+    cfg = make_config(ports=[{"name": "z", "device": "loop://", "autostart": True,
+                              "reconnect_ms": 200, "reconnect_max_ms": 500}])
+    hub = hub_factory(cfg)
+    orig = asyncio.to_thread
+
+    async def slow_sentinel(func, *a, **kw):  # the session pump notices the end late
+        result = await orig(func, *a, **kw)
+        if result is None and getattr(func, "__name__", "") == "get":
+            await asyncio.sleep(0.3)
+        return result
+
+    monkeypatch.setattr(asyncio, "to_thread", slow_sentinel)
+    with TestClient(create_app(hub, cfg)) as tc, tc.websocket_connect("/ws") as ws:
+        assert _until(lambda: hub.status("z")["open"])
+        hub.write_bytes("z", b"rz\r**\x18B00000000000000\r\x8a\x11")
+        assert _until(lambda: hub.zmodem_status("z")["active"])
+        ws.send_json({"type": "zmodem_claim", "port": "z"})
+        sid = None
+        while sid is None:
+            msg = ws.receive_json()
+            if msg.get("type") == "zmodem_claimed":
+                sid = msg["session"]
+        hub.close("z")  # server ends the session ("closed")
+        ws.send_json({"type": "zmodem_write", "port": "z", "session": sid,
+                      "b64": base64.b64encode(b"late").decode()})
+        order = []
+        while len(order) < 2:
+            msg = ws.receive_json()
+            if msg.get("type") in ("zmodem_closed", "zmodem_error"):
+                order.append(msg["type"])
+        assert order == ["zmodem_closed", "zmodem_error"]

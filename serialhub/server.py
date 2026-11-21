@@ -698,7 +698,16 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             except binascii.Error as exc:
                 await _zm_error(port, ValueError(f"zmodem: bad base64: {exc}"), sid)
             except Exception as exc:  # noqa: BLE001 - 报错给客户端，连接不断
+                if "no active session" in str(exc):
+                    await _zm_closed_first(port, sid)
                 await _zm_error(port, exc, sid)
+
+        async def _zm_closed_first(port: Any, sid: Any) -> None:
+            """写入撞上了本连接会话的结束：先让该会话的转发任务发出 ``zmodem_closed``（至多 1 s），
+            客户端据此先看到结束原因（如 ``closed``），迟到的写错误随后被当作旧会话的错误忽略。"""
+            entry = zm_sessions.get(port)
+            if entry is not None and entry[0] == str(sid) and not entry[1].done():
+                await asyncio.wait({entry[1]}, timeout=1.0)
 
         async def _zm_end(port: Any, sid: Any, abort: bool, tail_b64: Any) -> None:
             try:
