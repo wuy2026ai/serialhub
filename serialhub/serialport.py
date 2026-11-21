@@ -965,19 +965,19 @@ class SerialPortWorker(threading.Thread):
         with self._zm_lock:
             active = self._zm_session is not None
         try:
-            with self._io_lock:
-                sock = getattr(ser, "_socket", None)  # pyserial socket:// 实现才有
-                if sock is not None and getattr(ser, "is_open", False):
-                    # 会话中不阻塞（timeout=0），否则沿用端口读超时。
-                    data: bytes = self._read_socket(
-                        ser, sock, 0 if active else (ser.timeout or 0)
-                    )
-                elif active:
+            sock = getattr(ser, "_socket", None)  # pyserial socket:// 实现才有
+            if sock is not None and getattr(ser, "is_open", False):
+                # 会话中不阻塞（timeout=0），否则沿用端口读超时；空闲等待在锁外（§16）。
+                data: bytes = self._read_socket(
+                    ser, sock, 0 if active else (ser.timeout or 0), self._io_lock
+                )
+            elif active:
+                with self._io_lock:
                     # 会话中：只取已到达的字节，不在 _io_lock 下阻塞 0.1 s，owner 的写不被饿死。
                     waiting = ser.in_waiting
                     data = ser.read(waiting) if waiting else b""
-                else:
-                    data = ser.read(4096)
+            else:
+                data = self._read_idle(ser)
         except Exception as exc:
             with self._state_lock:
                 self._last_error = f"read: {type(exc).__name__}: {exc}"
@@ -988,19 +988,60 @@ class SerialPortWorker(threading.Thread):
             self._stop.wait(_ACTIVE_POLL_S)  # 锁外短暂让出，避免空转
         return data
 
+    def _read_idle(self, ser: "serial.SerialBase") -> bytes:
+        """行模式读（§16）：首字节一到立即返回，等待期间不持 ``_io_lock``。
+
+        - 有 ``fd`` 的 POSIX 串口：锁外 ``select`` 等可读（至多读超时），再在锁内读
+          ``in_waiting``（为 0 时读 1 字节：EOF/断开照常抛 SerialException）。
+        - 无 ``fd``（Windows、``loop://``、``rfc2217://`` 等）：锁外阻塞读 1 字节（至多读超时，
+          首字节到达即返回），再在锁内取走 ``in_waiting`` 的其余字节。
+
+        pyserial 的 ``read(4096)`` 会一直累积到 4096 字节或读超时（0.1 s）才返回，且旧实现
+        全程持锁：RX 平均晚 ~50 ms、写入也要排队等它。
+        """
+        timeout = ser.timeout if ser.timeout is not None else 0.1
+        fd = getattr(ser, "fd", None)
+        if isinstance(fd, int) and not isinstance(fd, bool) and fd >= 0:
+            try:
+                ready, _, _ = select.select([fd], [], [], timeout)
+            except InterruptedError:
+                return b""
+            if not ready:
+                return b""
+            with self._io_lock:
+                waiting = ser.in_waiting
+                return ser.read(waiting if waiting else 1)
+        first = ser.read(1)
+        if not first:
+            return b""
+        with self._io_lock:
+            waiting = ser.in_waiting
+            rest = ser.read(waiting) if waiting else b""
+        return first + rest
+
     @staticmethod
-    def _read_socket(ser: "serial.SerialBase", sock: "socket.socket", timeout: float) -> bytes:
+    def _read_socket(
+        ser: "serial.SerialBase",
+        sock: "socket.socket",
+        timeout: float,
+        io_lock: Optional["threading.Lock"] = None,
+    ) -> bytes:
         """socket:// 专用读：select + 单次 recv(4096)。
 
         pyserial 的 ``read()`` 在循环里累积字节，recv 返回 b""（对端关闭）时抛
         SerialException，把同一次调用里已累积的字节一并丢掉（对端发完即关会丢尾部）。
         这里一次只 recv 一段，立即返回；EOF 时才抛异常，此前的数据已在上一轮交付。
+        给出 ``io_lock`` 时 select 等待在锁外，只有 recv 持锁（写不必等读超时）。
         """
         try:
             ready, _, _ = select.select([sock], [], [], timeout)
             if not ready:
                 return b""
-            chunk = sock.recv(4096)
+            if io_lock is not None:
+                with io_lock:
+                    chunk = sock.recv(4096)
+            else:
+                chunk = sock.recv(4096)
         except (BlockingIOError, InterruptedError):
             return b""
         except OSError as exc:
