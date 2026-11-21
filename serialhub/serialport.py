@@ -47,6 +47,7 @@ import queue
 import select
 import socket
 import threading
+import time
 from typing import TYPE_CHECKING, Optional
 
 import serial
@@ -70,6 +71,9 @@ _LF = 0x0A
 
 #: ZMODEM 会话中读循环无数据时的轮询间隔（秒）。
 _ACTIVE_POLL_S = 0.005
+
+#: 中止串的有界排空上限（秒）：轮询 ``out_waiting`` 至多这么久，排不空就丢弃输出缓冲。
+_ABORT_DRAIN_S = 1.0
 
 #: 允许被引脚 API 操作的引脚（DTR/RTS）。
 _PIN_NAMES = ("dtr", "rts")
@@ -387,11 +391,14 @@ class SerialPortWorker(threading.Thread):
             self._tx_lines += 1
         return count
 
-    def _write_raw(self, data: bytes) -> int:
+    def _write_raw(self, data: bytes, *, drain_timeout: Optional[float] = None) -> int:
         """写原始字节并 flush（不计 tx_lines）；未打开 → RuntimeError，写失败记 last_error 后重抛。
 
         在读循环线程里（如截止时间触发的中止串）不做 flush（tcdrain）：tcdrain 要等对端读走数据，
         而对端（或中间的 socat）此刻可能正卡在把数据写给我们，读循环再等它就是死锁。
+
+        ``drain_timeout`` 非 None 时不用无界的 tcdrain，改为有界排空（见 :meth:`_bounded_drain`）：
+        中止串走这条路，关口/停服时对端不读（仍在狂发的 lsz、被 CTS 拉住的 UART）也不会卡死。
         """
         drain = threading.current_thread() is not self._loop_thread
         with self._state_lock:
@@ -404,7 +411,9 @@ class SerialPortWorker(threading.Thread):
             # flush（tcdrain）放在 _io_lock 外：它要等对端读走数据，若持锁等，读循环读不了，
             # 正在发送的设备（lsz）写满缓冲后不再读输入 → tcdrain 永不返回（死锁）。
             try:
-                if drain:
+                if drain and drain_timeout is not None:
+                    self._bounded_drain(ser, len(data), drain_timeout)
+                elif drain:
                     ser.flush()
             except Exception as exc:  # flush 失败记录但不致命
                 with self._state_lock:
@@ -415,6 +424,32 @@ class SerialPortWorker(threading.Thread):
             self._broadcast_status()
             raise
         return int(written) if written is not None else len(data)
+
+    def _bounded_drain(self, ser: "serial.SerialBase", size: int, timeout: float) -> None:
+        """轮询 ``out_waiting`` 至归零，至多 ``timeout`` 秒；超时则 ``reset_output_buffer()``。
+
+        设备在读的正常情况下数据照常排出（不丢中止串）；对端不读时按时放弃、丢弃输出缓冲，
+        之后的 close 也不会再等排空。不支持 ``out_waiting`` 的口按波特率估算线上时间睡一下。
+        """
+        pause = threading.Event()  # 只用来定时等待（不会被 set）
+        end = time.monotonic() + timeout
+        while True:
+            try:
+                pending = int(ser.out_waiting)
+            except Exception:  # noqa: BLE001 - socket:// 等不支持：按 8N1 线上时间估算
+                baud = max(1, int(getattr(self._pc, "baud", 115200) or 115200))
+                pause.wait(min(timeout, size * 10.0 / baud))
+                return
+            if pending <= 0:
+                return
+            if time.monotonic() >= end:
+                break
+            pause.wait(0.01)
+        try:
+            ser.reset_output_buffer()
+        except Exception as exc:  # noqa: BLE001 - 丢弃失败记录但不致命
+            with self._state_lock:
+                self._last_error = f"flush: {type(exc).__name__}: {exc}"
 
     def status(self) -> dict:
         with self._state_lock:
@@ -885,7 +920,8 @@ class SerialPortWorker(threading.Thread):
         """（锁外）会话摘除后的收尾：可选写中止串、队列放 None、写 end 标记并广播。"""
         if abort and self.is_open:
             try:
-                self._write_raw(ABORT_SEQ)  # 在读循环线程里时不 tcdrain（见 _write_raw）
+                # 有界排空（读循环线程里则完全不等，见 _write_raw）：关口/停服必须按时完成
+                self._write_raw(ABORT_SEQ, drain_timeout=_ABORT_DRAIN_S)
             except Exception:  # noqa: BLE001 - 写失败已由 _write_raw 记入 last_error 并广播
                 pass
         session.queue.put_nowait(None)

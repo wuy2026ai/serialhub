@@ -616,7 +616,7 @@ class _Sender:
         sample = (pos - p0) / (now - t0)
         self.rate = sample if self.rate is None else (self.rate + sample) / 2
         self._rmark = (pos, now)
-        line_baud = int(self.rate * 10)
+        line_baud = max(1, int(self.rate * 10))   # <0.1 B/s 测得 0：0 会被 pacing 当作“未知”
         self.ack_every, self.window = pacing(min(line_baud, self.baud) if self.baud
                                              else line_baud)
 
@@ -843,6 +843,14 @@ class _Sender:
         # 每个文件都已被 ZRINIT 确认：对方不回 ZFIN 也不影响数据，视为完成
 
 
+def _attach_files(exc: BaseException, results: list[FileResult]) -> None:
+    """非 :class:`ZmodemError` 的异常也带上 ``files``（失败前已完成的文件）。"""
+    try:
+        exc.files = list(results)  # type: ignore[attr-defined]
+    except AttributeError:  # 极少数不接受属性的异常类型
+        pass
+
+
 def send_files(t: Transport, files: list[FileSpec], *, deadline: Deadline,
                progress: Progress = None, frame_timeout: float = FRAME_TIMEOUT,
                baud: Optional[int] = None, overwrite: bool = False,
@@ -869,6 +877,9 @@ def send_files(t: Transport, files: list[FileSpec], *, deadline: Deadline,
         if abort_on_error and not (exc.cancelled or exc.peer_gone):
             _abort(link)
         exc.files = list(results)
+        raise
+    except Exception as exc:  # 本地错误（读文件失败等）：同样带上已完成的文件
+        _attach_files(exc, results)
         raise
 
 
@@ -1075,4 +1086,7 @@ def receive_files(t: Transport, save: Callable[[str, Optional[int]], Optional[Si
         if abort_on_error and not (exc.cancelled or exc.peer_gone):
             _abort(link)
         exc.files = list(rx.results)
+        raise
+    except Exception as exc:  # 本地错误（save 失败等）：同样带上已完成的文件
+        _attach_files(exc, rx.results)
         raise

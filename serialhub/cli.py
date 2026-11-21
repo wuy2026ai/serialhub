@@ -441,7 +441,8 @@ def _cmd_tools(args: argparse.Namespace) -> int:
 
 
 def _cmd_call(args: argparse.Namespace) -> int:
-    """Run one lite tool and print its plain-text result; exit 1 on ``error:``."""
+    """Run one lite tool and print its plain-text result; exit 1 unless it succeeded
+    (``lite.call_ex``: zsend/zrecv by the transfer result, the others on ``error:``)."""
     from . import lite  # noqa: PLC0415
 
     tool_args: Any = {}
@@ -454,9 +455,9 @@ def _cmd_call(args: argparse.Namespace) -> int:
     url, token = _global_options(args)
     if getattr(args, "url", None) is None:  # same env fallback as `mcp --profile lite`
         url = os.environ.get("SERIALHUB_URL") or url
-    text = lite.call(Client(url, token), args.tool, tool_args)
+    text, ok = lite.call_ex(Client(url, token), args.tool, tool_args)
     print(text)
-    return 1 if text.startswith("error:") else 0
+    return 0 if ok else 1
 
 
 def _progress() -> Any:

@@ -192,6 +192,7 @@ Field-by-field names and defaults (consistent with `config.py` / `config.example
 | `rts` | bool | `true` | Whether to raise RTS after opening |
 | `eol` | str | `"\r\n"` | Default `send` terminator; also accepts `none` / `\n` / `\r` / a custom literal |
 | `encoding` | str | `utf-8` | Used for byte decoding (errors=replace) |
+| `zmodem_cleanup_eol` | str | `cr` | `cr`\|`lf`\|`crlf`\|`ctrl-u-cr`\|`none`; line terminator sent once after a failed agent transfer to flush the device's input line; use `none` for U-Boot-style shells that repeat the last command on an empty line |
 | `reconnect_ms` | int | `1000` | Initial reconnect interval on disconnect |
 | `reconnect_max_ms` | int | `10000` | Reconnect backoff ceiling |
 | `flush_ms` | int | `50` | Time-slice framing: a partial line with no newline is flushed as a line after this many ms. **Only used by `framing: idle`** and only when `> 0` (`0` no longer means "flush on every read") |
@@ -406,7 +407,7 @@ Exit codes: `0`=success, `1`=failure. Global options: `--url` (default `http://1
 | `shutdown` | - | `POST /api/shutdown` | Stop the daemon like the Web UI **Exit** button (aborts transfers, closes every port, exits); `{"ok":true,"data":{"stopping":true}}` |
 | `mcp` | `[--stdio]` `[--transport]` `[--profile full\|lite]` | (MCP) | Run the MCP server (`lite` = 8 compact tools, see [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)) |
 | `tools` | `[--format anthropic\|openai]` | (local) | Print the lite tool definitions as a raw JSON array (no envelope, no daemon needed) |
-| `call` | `TOOL` `[JSON-ARGS]` | (lite) | Run one lite tool and print **plain text** (no envelope); exit 1 on `error:` |
+| `call` | `TOOL` `[JSON-ARGS]` | (lite) | Run one lite tool and print **plain text** (no envelope); exit 1 when the result starts with `error:`; for `zsend`/`zrecv` the exit code is the transfer's result status (0 only when every requested file transferred, 1 on any failed, skipped or missing file) |
 | `zsend` | `PORT FILE...` `[--content TEXT\|- --name NAME]` `[--encoding text\|base64]` `[--no-overwrite]` `[--cmd rz]` `[--timeout-ms]` | (`/ws`) | ZMODEM upload with the built-in Python engine (sends `rz` itself); prints `sent <name> <bytes>B crc=<CRC32> in <s>s` per file, plain text |
 | `zrecv` | `PORT REMOTE...` `[--dir]` `[--cmd "sz {remote}"]` `[--overwrite]` `[--inline]` `[--timeout-ms]` | (`/ws`) | ZMODEM download into `--dir` (sends `sz` itself); prints `received <name> <bytes>B crc=<CRC32> -> <path>` per file |
 

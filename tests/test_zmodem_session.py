@@ -600,3 +600,84 @@ def test_abort_seq_is_written_without_tcdrain(hub_factory, make_config) -> None:
     assert _until(lambda: hub.zmodem_status("z")["active"])
     assert _until(lambda: not hub.zmodem_status("z")["active"], timeout=5)
     assert True not in flushes, flushes
+
+
+class _StuckSerial:
+    """包住真实 loop:// 口：flush()（tcdrain）永不返回、out_waiting 永远非零——
+    模拟对端不再读输入（socat pty 写满 / RTS/CTS 被拉住的 UART）。"""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.writes: list[bytes] = []
+        self.reset_out = 0
+        self._never = threading.Event()
+        self.pending = lambda: 100  # out_waiting 的取值（测试可替换）
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+        return self._real.write(data)
+
+    def flush(self) -> None:
+        self._never.wait()  # 永久阻塞
+
+    @property
+    def out_waiting(self) -> int:
+        return self.pending()
+
+    def reset_output_buffer(self) -> None:
+        self.reset_out += 1
+        self._real.reset_output_buffer()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_close_bounded_when_drain_never_returns(zhub) -> None:
+    """关口时写 ABORT_SEQ 不能做无界 tcdrain：对端不读时 close 也须在界限内返回。"""
+    worker = zhub._require_worker("z")
+    _until(lambda: worker.is_open)
+    _start(zhub)
+    zhub.zmodem_claim("z", "tab-1")
+    stuck = _StuckSerial(worker._serial)
+    with worker._io_lock, worker._state_lock:
+        worker._serial = stuck
+    t0 = time.monotonic()
+    done = threading.Event()
+    threading.Thread(target=lambda: (zhub.close("z"), done.set()), daemon=True).start()
+    try:
+        assert done.wait(3.0), "close() hung on an unbounded drain"
+    finally:
+        stuck._never.set()  # 失败时放开 flush，免得拖住 fixture 收尾
+    assert time.monotonic() - t0 < 2.5
+    assert ABORT_SEQ in stuck.writes  # 中止串照常写出
+    assert stuck.reset_out >= 1  # 排不空就丢弃输出缓冲，再关口
+
+
+def test_abort_drain_waits_for_device_to_read(zhub) -> None:
+    """正常情况（设备在读）：有界等待 out_waiting 归零，不丢中止串、不清输出缓冲。"""
+    worker = zhub._require_worker("z")
+    _until(lambda: worker.is_open)
+    _start(zhub)
+    sid, _ = zhub.zmodem_claim("z", "tab-1")
+    stuck = _StuckSerial(worker._serial)
+    polls = {"n": 0}
+
+    def draining() -> int:
+        polls["n"] += 1
+        return 0 if polls["n"] > 3 else 10
+
+    stuck.pending = draining
+    with worker._io_lock, worker._state_lock:
+        worker._serial = stuck
+    done = threading.Event()
+    threading.Thread(
+        target=lambda: (zhub.zmodem_end("z", sid, "tab-1", abort=True, reason="abort"),
+                        done.set()),
+        daemon=True,
+    ).start()
+    try:
+        assert done.wait(3.0), "abort end hung on an unbounded drain"
+    finally:
+        stuck._never.set()
+    assert ABORT_SEQ in stuck.writes
+    assert polls["n"] > 3 and stuck.reset_out == 0

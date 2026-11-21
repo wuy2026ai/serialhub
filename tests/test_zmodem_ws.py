@@ -131,19 +131,17 @@ def test_disconnect_aborts_owned_session(app_hub) -> None:
     worker = hub._require_worker("z")
     written: list[bytes] = []
     real = worker._write_raw
-    worker._write_raw = lambda data: (written.append(bytes(data)), real(data))[1]
+    worker._write_raw = lambda data, **kw: (written.append(bytes(data)), real(data, **kw))[1]
     sub = hub.subscribe()
     with tc.websocket_connect("/ws") as ws:
         _start(hub)
         ws.send_json({"type": "zmodem_claim", "port": "z"})
         _recv_until(ws, "zmodem_claimed")
     assert _until(lambda: not hub.zmodem_status("z")["active"])
-    ends = []
-    while not sub.empty():
-        ev = sub.get_nowait()
-        if ev.get("type") == "zmodem" and ev.get("event") == "end":
-            ends.append(ev)
-    assert [e["reason"] for e in ends] == ["disconnect"]
+    # end 在中止串（有界）排空之后才广播：等它到，而不是只看 active
+    reasons: list[str] = []
+    assert _until(lambda: reasons.extend(_end_reasons(sub)) or reasons)
+    assert reasons == ["disconnect"]
     assert ABORT_SEQ in written
 
 
@@ -207,7 +205,9 @@ def test_pump_send_failure_still_aborts_on_disconnect(app_hub, monkeypatch) -> N
         time.sleep(0.3)  # 转发任务发送 zmodem_data 失败并退出
         assert hub.zmodem_status("z")["active"] is True
     assert _until(lambda: not hub.zmodem_status("z")["active"])
-    assert _end_reasons(sub) == ["disconnect"]
+    reasons: list[str] = []
+    assert _until(lambda: reasons.extend(_end_reasons(sub)) or reasons)
+    assert reasons == ["disconnect"]
 
 
 def test_claim_reply_failure_still_aborts(app_hub, monkeypatch) -> None:
@@ -218,7 +218,9 @@ def test_claim_reply_failure_still_aborts(app_hub, monkeypatch) -> None:
         _start(hub)
         ws.send_json({"type": "zmodem_claim", "port": "z"})
         assert _until(lambda: not hub.zmodem_status("z")["active"])
-    assert _end_reasons(sub) == ["disconnect"]
+    reasons: list[str] = []
+    assert _until(lambda: reasons.extend(_end_reasons(sub)) or reasons)
+    assert reasons == ["disconnect"]
 
 
 def test_abort_must_be_literal_true(app_hub) -> None:

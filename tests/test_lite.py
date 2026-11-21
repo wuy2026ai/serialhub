@@ -702,3 +702,84 @@ def test_cli_call_honours_serialhub_url_env(live, capsys, monkeypatch) -> None:
     monkeypatch.setenv("SERIALHUB_URL", client.base_url)
     assert cli.main(["call", "ports"]) == 0
     assert capsys.readouterr().out.startswith("t open")
+
+
+# --------------------------------------------------------------------------- #
+# fix round: status comes from the structured result (call_ex), not the text
+# --------------------------------------------------------------------------- #
+_NOWHERE = "http://127.0.0.1:1"
+_SENT = {"name": "a.bin", "bytes": 1, "crc32": "00000001", "seconds": 0.1, "skipped": False}
+_ZSEND = json.dumps({"port": "a", "content": "x", "name": "a.bin"})
+_ZRECV = {"port": "a", "remote": "dev.log", "inline": True}
+
+
+def _zc_results(monkeypatch, tmp_path, case: str) -> None:
+    from serialhub import zmodem_client as zc
+
+    body = b"error: sensor 3 missing\nskipped calibration\n"
+    log = tmp_path / "dev.log"
+    log.write_bytes(body)
+    got = {"ok": True, "files": [{"name": "dev.log", "bytes": len(body), "crc32": "00000002",
+                                  "path": str(log)}], "missing": [], "refused": []}
+    send = {"partial": {"ok": False, "error": "boom", "files": [_SENT]},
+            "skipped": {"ok": True, "files": [_SENT, dict(_SENT, name="b", skipped=True)]},
+            "ok": {"ok": True, "files": [_SENT]}}
+    recv = {"partial": {"ok": False, "error": "boom", "files": got["files"]},
+            "skipped": dict(got, missing=["x"]), "ok": got}
+    monkeypatch.setattr(zc, "send_session", lambda *a, **kw: dict(send[case]))
+    monkeypatch.setattr(zc, "receive_session", lambda *a, **kw: dict(recv[case]))
+
+
+@pytest.mark.parametrize("case,ok", [("partial", False), ("skipped", False), ("ok", True)])
+def test_call_ex_zmodem_status_from_result(monkeypatch, tmp_path, case, ok) -> None:
+    _zc_results(monkeypatch, tmp_path, case)
+    client = Client(_NOWHERE, timeout=1.0)
+    text, status = lite.call_ex(client, "zsend", json.loads(_ZSEND))
+    assert status is ok and text == lite.call(client, "zsend", json.loads(_ZSEND))
+    if case == "partial":
+        assert text.splitlines()[0].startswith("sent a.bin") and "error:" in text
+    text, status = lite.call_ex(client, "zrecv", _ZRECV)
+    assert status is ok, text
+    if case == "ok":  # inline file content that starts with "error:" does not fail it
+        assert "\nerror: sensor 3 missing" in text
+
+
+def test_call_ex_serial_tool_error_is_not_ok() -> None:
+    text, ok = lite.call_ex(Client(_NOWHERE, timeout=1.0), "read", {"port": "t"})
+    assert text.startswith("error:") and ok is False
+    text, ok = lite.call_ex(Client(_NOWHERE, timeout=1.0), "nope", {})
+    assert text.startswith("error:") and ok is False
+
+
+@pytest.mark.parametrize("case,code", [("partial", 1), ("skipped", 1), ("ok", 0)])
+def test_cli_call_exit_code_from_zmodem_status(monkeypatch, tmp_path, capsys, case,
+                                               code) -> None:
+    from serialhub import cli
+
+    _zc_results(monkeypatch, tmp_path, case)
+    assert cli.main(["call", "zsend", _ZSEND, "--url", _NOWHERE]) == code
+    assert cli.main(["call", "zrecv", json.dumps(_ZRECV), "--url", _NOWHERE]) == code
+    capsys.readouterr()
+    assert cli.main(["call", "read", '{"port": "t"}', "--url", _NOWHERE]) == 1
+
+
+@pytest.mark.parametrize("case,ok", [("partial", False), ("skipped", False), ("ok", True)])
+def test_mcp_lite_flags_zmodem_status(monkeypatch, tmp_path, case, ok) -> None:
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from serialhub import mcp_lite
+
+    _zc_results(monkeypatch, tmp_path, case)
+    server = mcp_lite.build(_NOWHERE, None)
+    if not mcp_lite.ERROR_FLAG_SUPPORTED:
+        pytest.skip("this mcp SDK cannot flag isError")
+    for name, args in (("zsend", json.loads(_ZSEND)), ("zrecv", _ZRECV)):
+        res = asyncio.run(server.call_tool(name, args))
+        assert _mcp_text(res) == lite.call(Client(_NOWHERE), name, args)
+        assert bool(getattr(res, "is_error", getattr(res, "isError", False))) is (not ok)
+
+
+def test_zrecv_dir_description_says_cwd() -> None:
+    by = {t["name"]: t["input_schema"]["properties"] for t in lite.TOOLS}
+    assert by["zrecv"]["dir"]["description"] == "Local directory, default: cwd"

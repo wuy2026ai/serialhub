@@ -90,7 +90,7 @@ def test_live_shutdown_aborts_claimed_zmodem_before_close() -> None:
         worker = hub._require_worker("z")
         events: list[object] = []
         real_write, real_close = worker._write_raw, worker._close_serial
-        worker._write_raw = lambda data: (events.append(bytes(data)), real_write(data))[1]
+        worker._write_raw = lambda data, **kw: (events.append(bytes(data)), real_write(data, **kw))[1]
         worker._close_serial = lambda: (events.append("close"), real_close())[1]
         with ws_connect(srv.ws_url) as ws:
             _recv_type(ws, "hello")

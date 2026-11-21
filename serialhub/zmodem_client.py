@@ -260,6 +260,8 @@ class _WsTransport:
             return out
         until = time.monotonic() + max(0.0, timeout)
         while True:
+            if self.closed == "shutdown":  # {"type":"shutdown"}: the whole daemon is going away
+                raise zp.ZmodemError("daemon stopped (shutdown)")
             if self.closed is not None:
                 raise zp.ZmodemError(f"daemon ended the session ({self.closed})")
             now = time.monotonic()
@@ -279,6 +281,9 @@ class _WsTransport:
             except Exception as exc:  # noqa: BLE001 - connection lost
                 raise zp.ZmodemError(f"daemon connection lost: {exc}") from None
             msg = _json(raw)
+            if msg.get("type") == "shutdown":  # broadcast without "port"
+                self.closed = self.closed or "shutdown"
+                continue
             if msg.get("port") != self.port:
                 continue
             kind = msg.get("type")
@@ -324,6 +329,9 @@ class _WsTransport:
                 return False
             if msg.get("type") == "pong":
                 return True
+            if msg.get("type") == "shutdown":
+                self.closed = self.closed or "shutdown"
+                return False
             if msg.get("port") != self.port:
                 continue
             if msg.get("type") == "zmodem_data" and msg.get("session") == self.session:
@@ -537,6 +545,19 @@ class _Clock:
         return msg
 
 
+def _run_engine(engine: Callable[..., zp.SessionResult], transport: Any, clock: Any,
+                baud: Optional[int]) -> zp.SessionResult:
+    """Run ``engine``; any non-ZMODEM exception becomes a :class:`_LocalError` (same cleanup
+    path) that keeps the files the engine had already completed (``exc.files``)."""
+    try:
+        return engine(transport, clock, baud)
+    except zp.ZmodemError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - ours (not ZMODEM): same cleanup path
+        raise _LocalError(f"{type(exc).__name__}: {exc}",
+                          getattr(exc, "files", None)) from exc
+
+
 def _run_session(base_url: str, token: Optional[str], port: str, cmd: str, direction: str,
                  timeout_ms: Optional[int], size: int,
                  engine: Callable[[zp.Transport, "_Clock", Optional[int]], zp.SessionResult]
@@ -589,12 +610,7 @@ def _run_session(base_url: str, token: Optional[str], port: str, cmd: str, direc
                                     f"{(reply or {}).get('error') or 'no reply'}")
         transport = _WsTransport(ws, port, str(reply.get("session")))
         try:
-            try:
-                result = engine(transport, clock, info.baud)
-            except zp.ZmodemError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - ours (not ZMODEM): same cleanup path
-                raise _LocalError(f"{type(exc).__name__}: {exc}") from exc
+            result = _run_engine(engine, transport, clock, info.baud)
         except zp.ZmodemError as exc:
             try:
                 out = _cleanup(transport, exc, info.eol)

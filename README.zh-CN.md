@@ -191,6 +191,7 @@ python -m serialhub serve --config config.example.yaml --no-autostart
 | `rts` | bool | `true` | 打开后是否置 RTS |
 | `eol` | str | `"\r\n"` | `send` 默认结尾；也接受 `none` / `\n` / `\r` / 自定义字面量 |
 | `encoding` | str | `utf-8` | 字节解码用（errors=replace） |
+| `zmodem_cleanup_eol` | str | `cr` | `cr`\|`lf`\|`crlf`\|`ctrl-u-cr`\|`none`；agent 传输失败后只发送一次的行结束符，用来冲掉设备的输入行；U-Boot 这类空行会重复上一条命令的 shell 请用 `none` |
 | `reconnect_ms` | int | `1000` | 断线重连初始间隔 |
 | `reconnect_max_ms` | int | `10000` | 重连退避上限 |
 | `flush_ms` | int | `50` | 时间片断帧：无换行的残行超过此毫秒数即作为一行吐出。**仅 `framing: idle` 使用**，且仅当 `> 0` 时生效（`0` 不再等于“每轮都吐”） |
@@ -401,7 +402,7 @@ CLI 是**瘦客户端**：除 `serve` / `mcp` 外，每个子命令打印**恰�
 | `shutdown` | - | `POST /api/shutdown` | 等同 Web UI 的 **Exit** 按钮停止守护（中止传输、关闭所有口、退出）；`{"ok":true,"data":{"stopping":true}}` |
 | `mcp` | `[--stdio]` `[--transport]` `[--profile full\|lite]` | (MCP) | 运行 MCP 服务器（`lite` = 8 个精简工具，见 [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)） |
 | `tools` | `[--format anthropic\|openai]` | (本地) | 以原始 JSON 数组打印 lite 工具定义（非信封，无需守护进程） |
-| `call` | `TOOL` `[JSON-ARGS]` | (lite) | 运行一个 lite 工具并打印**纯文本**（非信封）；`error:` 时退出码 1 |
+| `call` | `TOOL` `[JSON-ARGS]` | (lite) | 运行一个 lite 工具并打印**纯文本**（非信封）；结果以 `error:` 开头时退出码 1；`zsend`/`zrecv` 的退出码取自传输结果状态（所请求文件全部传输成功才为 0，任一文件失败、跳过或缺失即为 1） |
 | `zsend` | `PORT FILE...` `[--content TEXT\|- --name NAME]` `[--encoding text\|base64]` `[--no-overwrite]` `[--cmd rz]` `[--timeout-ms]` | (`/ws`) | 用内置 Python 引擎做 ZMODEM 上传（自己发送 `rz`）；每个文件打印一行 `sent <name> <bytes>B crc=<CRC32> in <s>s`，纯文本 |
 | `zrecv` | `PORT REMOTE...` `[--dir]` `[--cmd "sz {remote}"]` `[--overwrite]` `[--inline]` `[--timeout-ms]` | (`/ws`) | ZMODEM 下载到 `--dir`（自己发送 `sz`）；每个文件打印一行 `received <name> <bytes>B crc=<CRC32> -> <path>` |
 

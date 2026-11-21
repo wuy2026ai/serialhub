@@ -26,7 +26,7 @@ import copy
 import os
 import re
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 from .client import Client
 from .models import KIND_MARK, KIND_TX, strip_ansi
@@ -140,7 +140,7 @@ TOOLS: list[dict[str, Any]] = [
      "input_schema": _obj({
          "port": _PORT,
          "remote": _names("Device file names"),
-         "dir": _s("Local directory, default ."),
+         "dir": _s("Local directory, default: cwd"),
          "inline": _b("Also return text content"),
          "overwrite": _b("Replace existing file; default false"),
          "cmd": _s('Device command, default "sz {remote}"'),
@@ -512,7 +512,7 @@ def _tool_control(client: Client, a: dict[str, Any]) -> str:
     return f"mark {env.get('seq')}"
 
 
-def _tool_zsend(client: Client, a: dict[str, Any]) -> str:
+def _tool_zsend(client: Client, a: dict[str, Any]) -> tuple[str, bool]:
     from . import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
 
     if ("path" in a) == ("content" in a):
@@ -527,23 +527,25 @@ def _tool_zsend(client: Client, a: dict[str, Any]) -> str:
             raise LiteError(str(exc)) from None
     elif "name" in a:
         raise LiteError("name goes with content; with path the local file name is used")
-    return zc.zsend(client.base_url, client.token, a["port"], a.get("path") or [],
-                    contents=contents, cmd=a.get("cmd", "rz"),
-                    timeout_ms=zc.clamp_timeout(a.get("timeout_ms")),
-                    overwrite=a.get("overwrite", True))
+    return zc.zsend_status(client.base_url, client.token, a["port"], a.get("path") or [],
+                           contents=contents, cmd=a.get("cmd", "rz"),
+                           timeout_ms=zc.clamp_timeout(a.get("timeout_ms")),
+                           overwrite=a.get("overwrite", True))
 
 
-def _tool_zrecv(client: Client, a: dict[str, Any]) -> str:
+def _tool_zrecv(client: Client, a: dict[str, Any]) -> tuple[str, bool]:
     from . import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
 
-    return zc.zrecv(client.base_url, client.token, a["port"], a["remote"],
-                    os.path.expanduser(a["dir"]) if a.get("dir") else None, cmd=a.get("cmd"),
-                    timeout_ms=zc.clamp_timeout(a.get("timeout_ms")),
-                    overwrite=bool(a.get("overwrite")), inline=bool(a.get("inline")),
-                    cap=MAX_BLOCK_CHARS)
+    return zc.zrecv_status(client.base_url, client.token, a["port"], a["remote"],
+                           os.path.expanduser(a["dir"]) if a.get("dir") else None,
+                           cmd=a.get("cmd"), timeout_ms=zc.clamp_timeout(a.get("timeout_ms")),
+                           overwrite=bool(a.get("overwrite")), inline=bool(a.get("inline")),
+                           cap=MAX_BLOCK_CHARS)
 
 
-_HANDLERS: dict[str, Callable[[Client, dict[str, Any]], str]] = {
+#: zsend / zrecv return ``(text, ok)`` (status from the structured result: inlined file
+#: content may contain ``error:`` lines); the other tools return the text.
+_HANDLERS: dict[str, Callable[[Client, dict[str, Any]], Union[str, tuple[str, bool]]]] = {
     "ports": _tool_ports,
     "send": _tool_send,
     "read": _tool_read,
@@ -555,13 +557,26 @@ _HANDLERS: dict[str, Callable[[Client, dict[str, Any]], str]] = {
 }
 
 
-def call(client: Client, name: str, args: Any) -> str:
-    """Run one lite tool; always returns plain text (``error: ...`` on failure)."""
+def call_ex(client: Client, name: str, args: Any) -> tuple[str, bool]:
+    """Run one lite tool; returns ``(text, ok)`` and never raises.
+
+    For ``zsend`` / ``zrecv`` ``ok`` is the transfer status the ``serialhub zsend`` /
+    ``zrecv`` commands exit with (every requested file transferred, none skipped, missing
+    or refused); for the other tools it is ``not text.startswith("error:")``.
+    """
     try:
         if name not in _HANDLERS:
             raise LiteError(f"unknown tool {name!r}; tools: {', '.join(_HANDLERS)}")
-        return _HANDLERS[name](client, _validate(name, args))
+        out = _HANDLERS[name](client, _validate(name, args))
     except LiteError as exc:
-        return f"error: {exc}"
+        return f"error: {exc}", False
     except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
-        return f"error: {type(exc).__name__}: {exc}"
+        return f"error: {type(exc).__name__}: {exc}", False
+    if isinstance(out, tuple):
+        return out
+    return out, not out.startswith("error:")
+
+
+def call(client: Client, name: str, args: Any) -> str:
+    """Run one lite tool; always returns plain text (``error: ...`` on failure)."""
+    return call_ex(client, name, args)[0]

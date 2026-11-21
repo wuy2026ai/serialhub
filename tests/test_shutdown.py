@@ -216,3 +216,38 @@ def test_websocket_receives_shutdown(make_app) -> None:
             raise AssertionError("no shutdown message")
         assert msg == {"type": "shutdown"}
     assert _until(lambda: calls, 5.0)
+
+
+class _ScriptedWs:
+    """Minimal sync-websocket stand-in: hands out queued messages, then times out."""
+
+    def __init__(self, msgs: list[str]) -> None:
+        self.msgs = list(msgs)
+        self.sent: list[str] = []
+
+    def recv(self, timeout: float = 0.0) -> str:
+        if self.msgs:
+            return self.msgs.pop(0)
+        time.sleep(min(timeout, 0.01))
+        raise TimeoutError
+
+    def send(self, data: str) -> None:
+        self.sent.append(data)
+
+
+def test_zmodem_transport_treats_shutdown_broadcast_as_daemon_stopped() -> None:
+    """The daemon's ``{"type":"shutdown"}`` (no ``port`` field) ends a session at once:
+    the engine must not keep waiting for data until its timeout."""
+    import json
+
+    from serialhub import zmodem_client as zc
+    from serialhub import zmodem_proto as zp
+
+    t = zc._WsTransport(_ScriptedWs([json.dumps({"type": "shutdown"})]), "a", "s1")
+    t0 = time.monotonic()
+    with pytest.raises(zp.ZmodemError, match="daemon stopped"):
+        t.read(5.0)
+    assert time.monotonic() - t0 < 1.0
+    t2 = zc._WsTransport(_ScriptedWs([json.dumps({"type": "shutdown"})]), "a", "s1")
+    assert t2.sync(timeout=5.0) is False
+    assert t2.closed is not None

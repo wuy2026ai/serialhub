@@ -14,7 +14,7 @@ Compact JSON of name + description + input schema per tool (a test keeps lite â‰
 | lite, Anthropic format (`serialhub tools`) | 8 | 4,192 |
 | lite, OpenAI format (`serialhub tools --format openai`) | 8 | 4,424 |
 
-The six serial tools alone are 2,648 chars; `zsend` + `zrecv` add 1,544.
+Of the 8 lite tools, the six serial tools (`ports`, `send`, `read`, `wait`, `search`, `control`) are 2,648 chars; `zsend` + `zrecv` add 1,544.
 
 ## The eight tools
 
@@ -116,8 +116,9 @@ console 14-14 next=14 more=0
 CLI: `serialhub zsend <port> <file>... [--content TEXT|- --name NAME] [--no-overwrite]
 [--cmd CMD] [--timeout-ms N]` and `serialhub zrecv <port> <remote>... [--dir DIR] [--cmd CMD]
 [--overwrite] [--inline] [--timeout-ms N]` print the same text (progress on stderr only when
-it is a TTY; `--content -` reads stdin as bytes; exit 1 on an `error:`, `skipped` or
-`not received` line). The full MCP profile has the same operations as `zmodem_send` (`path`,
+it is a TTY; `--content -` reads stdin as bytes; exit code from the transfer's result status, not
+from scanning the text: 0 only when every requested file transferred, 1 on any failed, skipped or
+missing file; the same holds for `serialhub call zsend|zrecv`). The full MCP profile has the same operations as `zmodem_send` (`path`,
 `content`, `name`, `encoding`, `overwrite`, `cmd`, `timeout_ms`) / `zmodem_receive` (`remote`,
 `dir`, `inline`, `overwrite`, `cmd`, `timeout_ms`) with the usual `{"ok": ...}` envelope.
 
@@ -184,8 +185,8 @@ serialhub tools                    # Anthropic tool array, one line of JSON (no 
 serialhub call send '{"port":"console","data":"help","wait":"ready"}'
 ```
 
-No `{"ok":..}` envelope here: `tools` prints a raw JSON array, `call` plain text (exit 1 on
-`error:`; URL from `--url`, else `SERIALHUB_URL`). From Python: `lite.to_anthropic()` /
+No `{"ok":..}` envelope here: `tools` prints a raw JSON array, `call` plain text (exit 1 when the result starts with
+`error:`, except `zsend`/`zrecv`, whose exit code follows the transfer status: 0 only if every file transferred; URL from `--url`, else `SERIALHUB_URL`). From Python: `lite.to_anthropic()` /
 `lite.to_openai()` and `lite.call(Client(url, token), name, args)`.
 
 ### 3. The example agent

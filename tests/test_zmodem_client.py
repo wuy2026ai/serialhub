@@ -502,3 +502,71 @@ def test_cli_exit_code_comes_from_the_result_not_the_text(tmp_path, monkeypatch,
         "ok": True, "files": [sent, dict(sent, name="b", skipped=True)]})
     assert cli.main(["zsend", "a", str(log)]) == 1
     capsys.readouterr()
+
+
+# --------------------------------------------------------------------------- #
+# fix round: a non-protocol error keeps the files already transferred
+# --------------------------------------------------------------------------- #
+def test_run_engine_wraps_local_error_with_completed_files() -> None:
+    done = zp.FileResult("a.bin", 5, zlib.crc32(b"first"), 0.1)
+
+    def engine(t, clock, baud):
+        exc = OSError("read error")
+        exc.files = [done]
+        raise exc
+
+    with pytest.raises(zc._LocalError) as ei:
+        zc._run_engine(engine, None, None, None)
+    assert str(ei.value) == "OSError: read error" and ei.value.files == [done]
+
+
+def _quiet(fn):
+    """A peer thread whose own (expected) failure must not leak into later tests."""
+    def run():
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            pass
+    return run
+
+
+def test_send_session_oserror_on_second_file_lists_the_first(tmp_path, monkeypatch) -> None:
+    """OSError while reading the SECOND local file: ``sent a.bin`` line, then ``error:``."""
+    a = tmp_path / "a.bin"
+    a.write_bytes(b"first")
+    b = tmp_path / "b.bin"
+    b.write_bytes(b"second")
+    real_open = open
+
+    class _Bad:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def read(self, *a):
+            raise OSError("read error")
+
+        def __getattr__(self, name):
+            return getattr(self.fh, name)
+
+    def fake_open(path, *a, **kw):
+        fh = real_open(path, *a, **kw)
+        return _Bad(fh) if str(path).endswith("b.bin") else fh
+
+    def fake_run(url, token, port, cmd, direction, timeout_ms, size, engine):
+        a2b, b2a = _Chan(), _Chan()
+        deadline = time.monotonic() + 10
+        threading.Thread(target=_quiet(lambda: zp.receive_files(
+            _End(a2b, b2a), lambda n, s: io.BytesIO(), deadline=deadline)), daemon=True).start()
+        try:
+            return zc._run_engine(engine, _End(b2a, a2b), zc._Clock(10000, None, size), None)
+        except zp.ZmodemError as exc:
+            raise zc.ZmodemClientError(str(exc), files=exc.files) from None
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(zc, "_run_session", fake_run)
+    env = zc.send_session("http://x", None, "a", [str(a), str(b)])
+    monkeypatch.setattr("builtins.open", real_open)
+    assert env["ok"] is False and [f["name"] for f in env["files"]] == ["a.bin"]
+    lines = zc.format_send(env).splitlines()
+    assert lines[0].startswith("sent a.bin 5B") and lines[-1] == "error: OSError: read error"
+    assert not zc.send_ok(env)

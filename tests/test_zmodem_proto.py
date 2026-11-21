@@ -716,3 +716,66 @@ def test_text_after_xon_xoff_noise_is_still_text() -> None:
                       baud=9600, frame_timeout=1.0, abort_on_error=False)
     assert ei.value.peer_gone, ei.value
     assert len(t.written) == t.written_at_marker
+
+
+# --------------------------------------------------------------------------- #
+# fix round: completed files survive any exception; pacing never gets 0
+# --------------------------------------------------------------------------- #
+def _quiet(fn):
+    """A peer thread whose own (expected) failure must not leak into later tests."""
+    def run():
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            pass
+    return run
+
+
+class _BadRead(io.BytesIO):
+    def read(self, *a):  # noqa: ANN002
+        raise OSError("read error")
+
+
+def test_send_files_non_protocol_error_keeps_completed_files() -> None:
+    """OSError reading the SECOND local file: the first, already acknowledged, is reported."""
+    a2b, b2a = _Chan(), _Chan()
+    deadline = time.monotonic() + 10
+    saved: dict = {}
+    threading.Thread(target=_quiet(lambda: zp.receive_files(
+        _End(a2b, b2a), lambda n, s: _Sink(saved, n), deadline=deadline)), daemon=True).start()
+    bad = zp.FileSpec(name="b.bin", data=_BadRead(), size=10, mtime=1_700_000_000)
+    with pytest.raises(OSError) as ei:
+        zp.send_files(_End(b2a, a2b), [_spec("a.bin", b"first"), bad], deadline=deadline,
+                      abort_on_error=False)
+    assert [f.name for f in ei.value.files] == ["a.bin"]
+    assert saved == {"a.bin": b"first"}
+
+
+def test_receive_files_non_protocol_error_keeps_completed_files() -> None:
+    a2b, b2a = _Chan(), _Chan()
+    deadline = time.monotonic() + 10
+    saved: dict = {}
+
+    def save(name, size):
+        if name == "b.bin":
+            raise RuntimeError("no room")
+        return _Sink(saved, name)
+
+    threading.Thread(target=_quiet(lambda: zp.send_files(
+        _End(b2a, a2b), [_spec("a.bin", b"first"), _spec("b.bin", b"second")],
+        deadline=deadline)), daemon=True).start()
+    with pytest.raises(RuntimeError) as ei:
+        zp.receive_files(_End(a2b, b2a), save, deadline=deadline, abort_on_error=False)
+    assert [f.name for f in ei.value.files] == ["a.bin"]
+    assert saved == {"a.bin": b"first"}
+
+
+@pytest.mark.parametrize("baud", [None, 9600])
+def test_measured_rate_below_0_1_bps_paces_slowest_not_largest(baud) -> None:
+    sender = zp._Sender(zp._Link(_End(_Chan(), _Chan()), time.monotonic() + 5), None, 1.0,
+                        baud, False)
+    sender._rmark = (0, time.monotonic() - 20)   # 1 byte acknowledged in 20 s: 0.05 B/s
+    sender._acked(1)
+    assert 0 < sender.rate < 0.1
+    assert (sender.ack_every, sender.window) == zp.pacing(1) == (1024, 4096)
+    assert zp.pacing(None) == zp.pacing(0) == (8192, 32768)   # unknown baud: unchanged

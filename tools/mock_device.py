@@ -9,7 +9,8 @@
 命令：``ping`` / ``echo TEXT`` / ``stream on|off`` / ``ls`` / ``rz [ARGS]``（无参数 = ``lrz -y``，
 否则原样把 ARGS 交给 lrz，如 ``rz -v`` 不覆盖已存在文件）/ ``sz FILE...``。
 ``--rz-kill-after`` 让 lrz 在启动这么多秒后被 SIGTERM（lrz 随即发 CAN 退出），模拟传输中途被取消。
-被杀后 mock 丢弃随后的在途数据（读到 0.2 s 无数据为止），并在 stdout 记录
+被杀后 mock 丢弃随后的在途数据，直到客户端的收尾行结束符（不丢；见 ``_discard_in_flight``）
+或连续 10 s 无数据，并在 stdout 记录
 ``rz killed discarded=<字节数>``，之后收到的每一行（含空行）记为 ``rz killed then line=<repr>``，
 直到第一条非空命令——测试据此核对在途数据量与收尾行结束符的个数。
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -58,7 +60,16 @@ def _find(*names: str) -> str | None:
     return None
 
 
+#: 一块数据末尾的收尾行结束符（cr / crlf）。
+_EOL_TAIL = re.compile(rb"\r\n?\Z")
+#: hex 头在它的 CR 之前的部分（``**\x18B`` + 14 个 hex）：此处的 CR 不是收尾行结束符。
+_HEX_TAIL = re.compile(rb"\x18B[0-9a-fA-F]{14}\Z")
+
+
 class MockDevice:
+    #: rz 被杀后丢弃在途数据：没等到收尾行结束符时，连续这么久无数据即结束（秒）。
+    DISCARD_QUIET_S = 10.0
+
     def __init__(self, ser: serial.Serial, name: str, interval: float,
                  files_dir: str, recv_dir: str, rz_kill_after: float = 0.0) -> None:
         self.ser = ser
@@ -73,6 +84,7 @@ class MockDevice:
         self.stop = threading.Event()
         self.seq = 0
         self.after_kill = False           # rz 被杀后：记录收到的行，直到第一条非空命令
+        self.carry = b""                  # 丢弃在途数据时读到、需交回读循环断行的字节
 
     def write_line(self, text: str) -> None:
         with self.lock:
@@ -121,20 +133,39 @@ class MockDevice:
                 if was_streaming:          # 恢复传输前的 stream 状态
                     self.stream.set()
             if killed:
-                # 被杀的 rz 留下的在途数据：像真实 UART 那样照收不阻塞，但不当命令执行——
-                # 读到连续 200 ms 无数据为止并丢弃（否则仿真里 mock 会逐行回显这些二进制垃圾），
-                # 丢弃量记到 stdout，供测试核对它不超过发送方的窗口
-                quiet = time.monotonic()
-                discarded = 0
-                while time.monotonic() - quiet < 0.2:
-                    if data := self.ser.read(4096):
-                        discarded += len(data)
-                        quiet = time.monotonic()
-                print(f"rz killed discarded={discarded}", flush=True)
-                self.after_kill = True
+                self._discard_in_flight()
             self.ser.write(f"{label} done rc={rc}\r\n".encode())
             # 同时打到 stdout：中止后这行可能落在宿主的排空窗口里被丢弃，测试据此确认退出码
             print(f"{label} done rc={rc}", flush=True)
+
+    def _discard_in_flight(self) -> None:
+        """被杀的 rz 留下的在途数据：像真实 UART 那样照收不阻塞，但不当命令执行。
+
+        在途数据何时到不定：宿主按节奏写、机器负载高时，lrz 退出好几秒后还会有整段数据到
+        （固定的静默窗口会把它漏成命令行）。可靠的界线是顺序：客户端先确认 daemon 已把在途
+        数据全部写出（sync），再等 ≥300 ms 设备静默，才发**唯一一个**收尾行结束符。所以
+        一直丢弃到收尾行结束符为止，它本身不丢、交回读循环照常断行。认法：只由
+        ``\\r``/``\\n`` 组成的一块；或一块以 ``\\r``（``\\r\\n``）结尾且不是 hex 头的结尾——
+        ZDLE 数据里的 CR 总被转义，裸 ``\\r`` 只会出现在 hex 头里（宿主堵住时两者可能连成一块）。
+        没有收尾行结束符（``zmodem_cleanup_eol: none``）时，连续 ``DISCARD_QUIET_S`` 无数据即结束。
+        丢弃量记到 stdout（``rz killed discarded=N``），供测试核对它不超过发送方的窗口。
+        """
+        last = time.monotonic()
+        discarded = 0
+        while time.monotonic() - last < self.DISCARD_QUIET_S:
+            data = self.ser.read(4096)
+            if not data:
+                continue
+            cut = len(data) if data.strip(b"\r\n") else 0  # 只含行结束符：整块都是收尾
+            if cut and (m := _EOL_TAIL.search(data)) and not _HEX_TAIL.search(data, 0, m.start()):
+                cut = m.start()
+            discarded += cut
+            if cut < len(data):
+                self.carry += data[cut:]
+                break
+            last = time.monotonic()
+        print(f"rz killed discarded={discarded}", flush=True)
+        self.after_kill = True
 
     def handle(self, line: str) -> None:
         cmd, _, rest = line.strip().partition(" ")
@@ -192,6 +223,8 @@ class MockDevice:
                         self.after_kill = not raw.strip()
                     if raw.strip():
                         self.handle(raw.decode("utf-8", "replace"))
+                        buf += self.carry
+                        self.carry = b""
         finally:
             self.stop.set()
 

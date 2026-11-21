@@ -23,7 +23,8 @@ from mcp.types import CallToolResult, TextContent  # noqa: E402 - after the comp
 #: ``CallToolResult``'s error flag: ``is_error`` (mcp 2.x) or ``isError`` (mcp 1.x).
 _IS_ERROR_FIELD = "is_error" if "is_error" in getattr(CallToolResult, "model_fields", {}) \
     else "isError"
-#: Set by :func:`build`: whether ``error:`` results are flagged ``isError`` on this SDK.
+#: Set by :func:`build`: whether failed results (``lite.call_ex`` not ok) are flagged
+#: ``isError`` on this SDK.
 ERROR_FLAG_SUPPORTED = False
 
 DEFAULT_URL = "http://127.0.0.1:8765"
@@ -46,8 +47,8 @@ def _make_tool_fn(name: str, client: Client, flag_errors: bool = False) -> Any:
 
     async def _tool(**kwargs: Any) -> Any:
         args = {k: v for k, v in kwargs.items() if v is not None}
-        text = await asyncio.to_thread(lite.call, client, name, args)
-        if flag_errors and text.startswith("error:"):
+        text, ok = await asyncio.to_thread(lite.call_ex, client, name, args)
+        if flag_errors and not ok:
             return CallToolResult(content=[TextContent(type="text", text=text)],
                                   **{_IS_ERROR_FIELD: True})
         return text
@@ -98,7 +99,7 @@ def build(base_url: Optional[str] = None, token: Optional[str] = None) -> Any:
             "serialhub.mcp_lite: warning: cannot reach the MCP SDK tool registry; "
             "publishing signature-derived schemas instead of the exact lite schemas.\n")
         return server
-    # Flag "error: ..." results as isError only where the text stays identical.
+    # Flag failed results (call_ex ok=False) as isError only where the text stays identical.
     ERROR_FLAG_SUPPORTED = _probe_error_flag(registry[lite.TOOLS[0]["name"]])
     if ERROR_FLAG_SUPPORTED:
         for spec in lite.TOOLS:
