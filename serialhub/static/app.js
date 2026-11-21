@@ -286,6 +286,7 @@ function createRuntime(name) {
     name,
     pane: tpl,
     term: null, fit: null, ro: null,
+    pend: { shown: "", want: "", raf: 0 },   // unterminated tail ("partial"), see pendSet
     lastSeq: null, histBusy: false, liveQ: [], clearGen: 0,   // history/dedupe
     lines: [],          // retained records for filter/search/fallback
     deferred: [],       // lines buffered while paused
@@ -872,6 +873,56 @@ function renderFallback(rt, rec) {
 
 function trimArr(arr, n) { while (arr.length > n) arr.shift(); }
 
+/* Pending tail ("partial" WS event / REST `pending`): the unterminated last line (a prompt such as
+   "=> ") shown live at the bottom of the terminal. rt.pend.shown is what is currently on the cursor
+   row (no trailing \r\n). Updates are erased with \r\x1b[2K and rewritten, at most once per animation
+   frame. Wrapped tails are avoided by capping the displayed text to cols-1 (ellipsis + the tail's end),
+   so the tail always occupies exactly one row. A "line" event erases it first. */
+function pendFit(rt, text) {
+  let s = String(text || "").replace(/\t/g, " ").replace(/[\x00-\x1f\x7f]/g, "");
+  const cols = Math.max(4, (rt.term && rt.term.cols) || 80);
+  if (s.length > cols - 1) s = "\u2026" + s.slice(-(cols - 2));
+  return s;
+}
+function pendTarget(rt) {
+  if (state.stopped || state.paused || rt.filterRe || rt.histBusy) return null;   // null: leave as is
+  if (window.ZmodemUI && window.ZmodemUI.busy(rt.name)) return "";                // never draw during a transfer
+  return pendFit(rt, rt.pend.want);
+}
+function pendFlush(rt) {
+  rt.pend.raf = 0;
+  if (!rt.term) return;
+  const target = pendTarget(rt);
+  if (target === null || target === rt.pend.shown) return;
+  rt.term.write("\r\x1b[2K" + target);
+  rt.pend.shown = target;
+  if (state.autoscroll && state.active === rt.name) rt.term.scrollToBottom();
+}
+function pendSchedule(rt) {
+  if (!rt.term || rt.pend.raf) return;
+  rt.pend.raf = requestAnimationFrame(() => pendFlush(rt));
+}
+function pendSet(name, text) {
+  if (!portStillKnown(name)) return;
+  const rt = ensurePort(name);
+  if (rt.histBusy) { rt.liveQ.push({ __partial: text || "" }); return; }   // keep order with queued lines
+  const want = text || "";
+  if (want === rt.pend.want && (rt.pend.raf || want === rt.pend.shown)) return;
+  rt.pend.want = want;
+  pendSchedule(rt);
+}
+/* Erase the shown tail now (call right before writing a line / when the terminal is wiped). */
+function pendErase(rt) {
+  rt.pend.want = "";
+  if (rt.term && rt.pend.shown) rt.term.write("\r\x1b[2K");
+  rt.pend.shown = "";
+}
+/* The terminal was cleared/reset: nothing is shown any more. */
+function pendForget(rt) {
+  rt.pend.want = ""; rt.pend.shown = "";
+  if (rt.pend.raf) { cancelAnimationFrame(rt.pend.raf); rt.pend.raf = 0; }
+}
+
 function onLine(name, line) {
   if (!portStillKnown(name)) return;   // late line from a port a config switch removed
   const rt = ensurePort(name);
@@ -881,6 +932,7 @@ function onLine(name, line) {
     if (rt.lastSeq != null && seq <= rt.lastSeq) return;   // already shown (history overlap)
     rt.lastSeq = seq;
   }
+  pendErase(rt);   // the completed line replaces the tail
   const rec = buildRecord(line);
   rt.lineCount += 1;
   rt.byteCount += byteLen(rec.text);
@@ -928,6 +980,7 @@ async function loadHistory(rt) {
   rt.histBusy = true; rt.liveQ = [];
   const gen = rt.clearGen;
   let lines = [];
+  let pending = "";
   try {
     const since = rt.lastSeq;
     let r = await fetchRead(rt.name, since == null ? { limit: HISTORY_LINES } : { since_seq: since });
@@ -935,13 +988,14 @@ async function loadHistory(rt) {
       rt.lastSeq = null;
       r = await fetchRead(rt.name, { limit: HISTORY_LINES });
     }
-    if (r) lines = r.lines || []; else rt.lastSeq = null;   // fetch failed: stop de-duplicating
+    if (r) { lines = r.lines || []; pending = typeof r.pending === "string" ? r.pending : ""; } else rt.lastSeq = null;   // fetch failed: stop de-duplicating
   } catch (_e) { rt.lastSeq = null; }
   try {
     if (lines.length > state.maxRenderLines) lines = lines.slice(-state.maxRenderLines);
     const base = rt.lastSeq;
     const fresh = lines.filter((l) => base == null || l.seq > base);
     fresh.forEach((l) => { if (typeof l.seq === "number" && (rt.lastSeq == null || l.seq > rt.lastSeq)) rt.lastSeq = l.seq; });
+    if (gen === rt.clearGen && portStillKnown(rt.name)) pendErase(rt);
     if (fresh.length && gen === rt.clearGen && portStillKnown(rt.name)) {   // "clear" while fetching: drop
       const recs = fresh.map(buildRecord);
       rt.lines.push(...recs);
@@ -951,8 +1005,9 @@ async function loadHistory(rt) {
     }
   } finally {
     rt.histBusy = false;
+    if (gen === rt.clearGen && portStillKnown(rt.name)) { rt.pend.want = pending; pendSchedule(rt); }   // shown once, after the history lines
     const q = rt.liveQ; rt.liveQ = [];
-    q.forEach((l) => onLine(rt.name, l));
+    q.forEach((l) => (l && l.__partial !== undefined ? pendSet(rt.name, l.__partial) : onLine(rt.name, l)));
   }
 }
 
@@ -1147,6 +1202,7 @@ function dispatchWsMessage(msg) {
   switch (msg.type) {
     case "hello": onHello(msg.ports || []); break;
     case "line": if (msg.line) onLine(msg.port, msg.line); break;
+    case "partial": pendSet(msg.port, typeof msg.text === "string" ? msg.text : ""); break;
     case "status": onStatus(msg); break;
     case "mark": onMark(msg.port, msg); break;
     case "pong": break;
@@ -1170,6 +1226,7 @@ function onHello(ports) {
     const rt = ensurePort(p.name);
     rt.state = p.open ? "open" : (p.last_error ? "error" : "closed");
     updatePortHeader(rt);
+    pendErase(rt);   // reconnect: drop the old tail; loadHistory re-reads it from REST
     loadHistory(rt);
   });
   if (!state.active && ports.length) activate(ports[0].name);
@@ -1207,7 +1264,7 @@ function applyFilter(pattern) {
 }
 function rebuildView(rt) {
   // Re-render the retained buffer under the current filter state.
-  if (rt.term) { rt.term.clear(); rt.term.reset(); }
+  if (rt.term) { rt.term.clear(); rt.term.reset(); pendForget(rt); }
   else { rt.el.fallback.innerHTML = ""; }
   rt.writeIndex = 0;
   rt.lines.forEach((rec) => renderRecord(rt, rec));
@@ -1676,7 +1733,7 @@ function bindUI() {
     const rt = state.active ? state.runtimes.get(state.active) : null;
     if (!rt) return;
     rt.lines = []; rt.deferred = []; rt.hits = []; rt.hitIdx = -1; rt.writeIndex = 0; rt.clearGen++;
-    if (rt.term) { rt.term.clear(); rt.term.reset(); }
+    if (rt.term) { rt.term.clear(); rt.term.reset(); pendForget(rt); }
     else rt.el.fallback.innerHTML = "";
     $("#searchResults").hidden = true;
     updateSearchCount();
