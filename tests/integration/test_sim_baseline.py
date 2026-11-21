@@ -96,3 +96,69 @@ def test_device_unplug_reconnect(tmp_path):
         for x in (dev2, dev, pair2, pair):
             if x:
                 x.stop()
+
+
+def _raw_open(path: str) -> int:
+    import tty
+    fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+    tty.setraw(fd)
+    return fd
+
+
+def _read_until(fd: int, needle: bytes, timeout: float) -> bytes:
+    import select
+    buf, deadline = b"", time.time() + timeout
+    while needle not in buf and time.time() < deadline:
+        if select.select([fd], [], [], 0.2)[0]:
+            buf += os.read(fd, 4096)
+    return buf
+
+
+def test_device_sz_to_host_rz_1mib(tmp_path):
+    """设备 sz -> 宿主 lrz：1 MiB 足以填满 PTY 缓冲，验证子进程 fd 为阻塞模式。"""
+    import subprocess
+    need_tools("socat", "lrz", "lsz")
+    import shutil
+    rz = shutil.which("lrz") or shutil.which("rz")
+    files, recv = tmp_path / "files", tmp_path / "recv"
+    files.mkdir(); recv.mkdir()
+    data = os.urandom(1 << 20)
+    (files / "blob.bin").write_bytes(data)
+    with PtyPair() as pair, MockDevice(pair.dev_path, "a", files, tmp_path, interval=0):
+        time.sleep(0.5)
+        fd = _raw_open(pair.host_path)
+        try:
+            os.write(fd, b"sz blob.bin\r")
+            rc = subprocess.call([rz, "-y"], stdin=fd, stdout=fd,
+                                 stderr=subprocess.DEVNULL, cwd=recv, timeout=60)
+            assert rc == 0
+            assert b"sz done rc=0" in _read_until(fd, b"sz done rc=0", 5)
+        finally:
+            os.close(fd)
+    assert (recv / "blob.bin").read_bytes() == data
+
+
+def test_host_sz_to_device_rz_1mib(tmp_path):
+    """宿主 lsz -> 设备 rz：文件落入 recv-dir 且设备打印 rz done rc=0。"""
+    import shutil
+    import subprocess
+    need_tools("socat", "lrz", "lsz")
+    sz = shutil.which("lsz") or shutil.which("sz")
+    recv = tmp_path / "recv"
+    recv.mkdir()
+    src = tmp_path / "up.bin"
+    data = os.urandom(1 << 20)
+    src.write_bytes(data)
+    with PtyPair() as pair, MockDevice(pair.dev_path, "a", tmp_path, recv, interval=0):
+        time.sleep(0.5)
+        fd = _raw_open(pair.host_path)
+        try:
+            os.write(fd, b"rz\r")
+            time.sleep(0.5)
+            rc = subprocess.call([sz, str(src)], stdin=fd, stdout=fd,
+                                 stderr=subprocess.DEVNULL, timeout=60)
+            assert rc == 0
+            assert b"rz done rc=0" in _read_until(fd, b"rz done rc=0", 5)
+        finally:
+            os.close(fd)
+    assert (recv / "up.bin").read_bytes() == data

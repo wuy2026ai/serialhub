@@ -87,14 +87,21 @@ class MockDevice:
             return
         os.makedirs(cwd, exist_ok=True)
         with self.lock:                    # 传输期间持锁：父进程不读不写串口
+            was_streaming = self.stream.is_set()
             self.stream.clear()
+            fd = self.ser.fileno()
+            # pyserial 以 O_NONBLOCK 打开；子进程共享同一文件描述，必须切成阻塞，
+            # 否则 lrz/lsz 的 write 会在 PTY 缓冲写满时 EAGAIN/短写。
+            was_blocking = os.get_blocking(fd)
+            os.set_blocking(fd, True)
             try:
-                fd = self.ser.fileno()
                 cmd = [exe, *args] if label == "sz" else [exe, "-y"]
                 rc = subprocess.call(cmd, stdin=fd, stdout=fd,
                                      stderr=subprocess.DEVNULL, cwd=cwd)
             finally:
-                self.stream.set()
+                os.set_blocking(fd, was_blocking)
+                if was_streaming:          # 恢复传输前的 stream 状态
+                    self.stream.set()
             self.ser.write(f"{label} done rc={rc}\r\n".encode())
 
     def handle(self, line: str) -> None:
