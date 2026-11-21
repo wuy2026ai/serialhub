@@ -173,6 +173,22 @@ button { cursor: pointer; }
 .conn-pill[data-state="open"] .dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(79, 209, 176, 0.18); }
 .conn-pill[data-state="error"] .dot { background: var(--danger); }
 .conn-pill[data-state="error"] { color: var(--danger); border-color: var(--danger); }
+.conn-pill[data-state="stopped"] .dot { background: var(--danger); }
+.conn-pill[data-state="stopped"] { color: var(--danger); border-color: var(--danger); }
+
+/* Exit (stop the daemon): danger-outlined, fills on hover */
+.exit-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 11px;
+  border: 1px solid var(--danger); border-radius: 8px;
+  background: transparent; color: var(--danger);
+  font-family: var(--mono); font-size: 12px; font-weight: 600;
+  transition: all var(--speed) var(--ease);
+}
+.exit-btn:hover:not(:disabled) { color: var(--bg); background: var(--danger); }
+.exit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.exit-btn[hidden] { display: none; }
+.exit-btn .bx { font-size: 13px; }
 
 .token-field {
   display: inline-flex; align-items: center; gap: 7px;
@@ -312,6 +328,20 @@ button { cursor: pointer; }
 .banner .b-ico { font-size: 15px; }
 .banner strong { color: var(--text); font-weight: 600; }
 .banner[hidden] { display: none; }
+
+/* service stopped (after Exit / a {"type":"shutdown"} broadcast): persistent */
+.stopped-banner {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--danger) 18%, transparent), transparent);
+  border-bottom: 1px solid var(--danger);
+  color: var(--danger); font-size: 13px;
+}
+.stopped-banner .b-ico { font-size: 16px; }
+.stopped-banner strong { color: var(--text); font-weight: 600; }
+.stopped-banner .s-msg { flex: 1 1 auto; min-width: 0; }
+.stopped-banner[hidden] { display: none; }
 
 /* ------------------------------------------------------------- workspace -- */
 .workspace { flex: 1 1 auto; position: relative; overflow: hidden; background: var(--bg); }

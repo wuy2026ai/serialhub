@@ -65,6 +65,7 @@ class ServerConfig:
     port: int = 8765
     token: Optional[str] = None
     cors: bool = True
+    allow_shutdown: bool = True   # 允许 POST /api/shutdown（Web UI 的 Exit 按钮）停止服务
 
 
 @dataclass
@@ -159,6 +160,10 @@ class Config:
         if not isinstance(server_raw, dict):
             raise ValueError("server must be a mapping")
         server = _build(ServerConfig, server_raw, "server")
+        if not isinstance(server.allow_shutdown, bool):
+            raise ValueError(
+                f"server.allow_shutdown must be a boolean, got {server.allow_shutdown!r}"
+            )
 
         logging = _build(LoggingConfig, raw.get("logging") or {}, "logging")
         ui = _build(UIConfig, raw.get("ui") or {}, "ui")
@@ -234,6 +239,7 @@ class Config:
                 "port": self.server.port,
                 "token": token,
                 "cors": self.server.cors,
+                "allow_shutdown": self.server.allow_shutdown,
             },
             "defaults": copy.deepcopy(self.defaults),
             "ports": [_port_to_dict(pc) for pc in self.ports],

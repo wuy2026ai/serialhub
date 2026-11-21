@@ -8,6 +8,7 @@ server:
   port: 8765             # Web/HTTP 监听端口
   token: null            # 可选 Bearer Token；非空时 HTTP/WS 均需鉴权
   cors: true             # 是否允许跨域（开发期方便）
+  allow_shutdown: true   # Web UI「Exit」/ POST /api/shutdown 可停止服务；⚠ 0.0.0.0 且无 token 时任何人都能停，必要时设 false
 
 # 所有串口的默认参数（可被每个 ports[] 条目逐项覆盖）
 defaults:

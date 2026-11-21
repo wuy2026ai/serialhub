@@ -122,6 +122,8 @@ const state = {
   wsBackoff: 500,
   wsBackoffMax: 12000,
   wsTimer: null,
+  stopped: false,   // true once the daemon was told to exit (or broadcast "shutdown")
+  timers: [],       // setInterval ids, cancelled when the service stops
   wsState: "idle",
   token: safeGet("serialhub.token", ""),
   theme: safeGet("serialhub.theme", ""),
@@ -962,7 +964,7 @@ function drawSpark(rt) {
 }
 
 /* 8. websocket bus ======================================================== */
-const CONN_DEFAULT_KEY = { idle: "connIdle", connecting: "connConnecting", open: "connLive", error: "connError" };
+const CONN_DEFAULT_KEY = { idle: "connIdle", connecting: "connConnecting", open: "connLive", error: "connError", stopped: "connStopped" };
 const conn = { state: "idle", key: "connIdle", vars: null };
 function setConn(stateName, key, vars) {
   state.wsState = stateName;
@@ -982,6 +984,7 @@ function wsUrl() {
 }
 
 function connectWS() {
+  if (state.stopped) return;
   if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) return;
   if (state.wsTimer) { clearTimeout(state.wsTimer); state.wsTimer = null; }
   setConn("connecting");
@@ -1002,14 +1005,15 @@ function connectWS() {
   });
   ws.addEventListener("close", () => {
     if (state.ws === ws && window.ZmodemUI) window.ZmodemUI.onDisconnect();
+    if (state.stopped) return;   // service exited on purpose: no reconnect loop
     setConn("idle", "connReconnecting");
     scheduleReconnect();
   });
-  ws.addEventListener("error", () => { setConn("error"); });
+  ws.addEventListener("error", () => { if (!state.stopped) setConn("error"); });
 }
 
 function scheduleReconnect() {
-  if (state.wsTimer) return;
+  if (state.wsTimer || state.stopped) return;
   const wait = state.wsBackoff;
   state.wsBackoff = Math.min(state.wsBackoffMax, Math.round(state.wsBackoff * 1.7));
   state.wsTimer = setTimeout(() => { state.wsTimer = null; connectWS(); }, wait);
@@ -1043,6 +1047,7 @@ function handleWsMessage(msg) {
     case "status": onStatus(msg); break;
     case "mark": onMark(msg.port, msg); break;
     case "pong": break;
+    case "shutdown": enterStopped(); break;   // the daemon is exiting (any tab's Exit)
     // ZMODEM: broadcasts (start/end) + this connection's session relay
     case "zmodem": if (window.ZmodemUI) window.ZmodemUI.onBroadcast(msg); break;
     case "zmodem_claimed": if (window.ZmodemUI) window.ZmodemUI.onClaimed(msg); break;
@@ -1290,8 +1295,13 @@ function updateGlobalStats() {
 }
 
 async function pollStatus() {
+  if (state.stopped) return;
   const health = await api("GET", "/health");
-  if (health.ok) $("#statUptime").textContent = fmtDuration(health.uptime_ms);
+  if (state.stopped) return;
+  if (health.ok) {
+    $("#statUptime").textContent = fmtDuration(health.uptime_ms);
+    updateExitButton(health.allow_shutdown);
+  }
   const st = await api("GET", "/api/status");
   if (!st.ok) return;
   (st.ports || []).forEach((p) => {
@@ -1465,8 +1475,51 @@ function portStillKnown(name) {
   return state.runtimes.has(name) || state.ports.has(name) || portInActiveConfig(name);
 }
 
+/* 10c. exit (stop the daemon) ============================================== */
+/* Exit → confirm → POST /api/shutdown. The daemon replies, then ~200 ms later
+   broadcasts {"type":"shutdown"} on /ws, closes every port and exits. Success
+   (or that broadcast, in any open tab) switches the page into a terminal
+   "stopped" state: persistent banner, stopped pill, and no WS reconnect /
+   status polling — the page only works again after a reload once the service
+   is restarted. */
+function updateExitButton(allowed) {
+  const btn = $("#exitBtn");
+  if (!btn) return;
+  btn.hidden = allowed !== true;
+}
+
+function enterStopped() {
+  if (state.stopped) return;
+  state.stopped = true;
+  if (state.wsTimer) { clearTimeout(state.wsTimer); state.wsTimer = null; }
+  (state.timers || []).forEach((id) => clearInterval(id));
+  state.timers = [];
+  const btn = $("#exitBtn");
+  if (btn) btn.disabled = true;
+  $("#stoppedBanner").hidden = false;
+  setConn("stopped", "connStopped");
+  // the daemon closes every port on exit; the socket goes away before those
+  // status events would arrive, so show the ports as released right here
+  Array.from(state.runtimes.keys()).forEach((name) => onStatus({ port: name, open: false }));
+  if (state.ws) {
+    try { state.ws.close(); } catch (_e) { /* ignore */ }
+  }
+}
+
+async function requestExit() {
+  const btn = $("#exitBtn");
+  if (state.stopped || btn.disabled) return;
+  if (!window.confirm(t("exitConfirm"))) return;
+  btn.disabled = true;
+  const r = await api("POST", "/api/shutdown");   // api() toasts any error
+  if (r.ok) enterStopped();
+  else if (!state.stopped) btn.disabled = false;
+}
+
 function bindUI() {
   $("#themeToggle").addEventListener("click", () => applyTheme(state.theme === "dark" ? "light" : "dark"));
+  $("#exitBtn").addEventListener("click", requestExit);
+  $("#stoppedReload").addEventListener("click", () => location.reload());
   // language buttons are created (with their own click handlers) by
   // buildLangSwitcher() from the registry — nothing to bind here.
 
@@ -1621,16 +1674,19 @@ async function init() {
   buildTabs();
 
   connectWS();
-  setInterval(tickRates, 1000);
-  setInterval(pollStatus, 3000);
+  // interval ids are kept so the "service stopped" state can cancel them
+  state.timers = [
+    setInterval(tickRates, 1000),
+    setInterval(pollStatus, 3000),
+    // keep the active port header fresh as buffer/state change server-side
+    setInterval(() => {
+      if (state.active) {
+        const rt = state.runtimes.get(state.active);
+        if (rt) { updatePortHeader(rt); }
+      }
+    }, 2000),
+  ];
   setTimeout(pollStatus, 400);
-  // keep the active port header fresh as buffer/state change server-side
-  setInterval(() => {
-    if (state.active) {
-      const rt = state.runtimes.get(state.active);
-      if (rt) { updatePortHeader(rt); }
-    }
-  }, 2000);
 }
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

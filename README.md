@@ -49,6 +49,7 @@ in a browser; both `python -m serialhub list` on the command line and MCP `wait_
 | CLI | Every subcommand prints a **single line of JSON** `{"ok":true,"data":{...}}`, exit code 0/1 |
 | MCP | 20 tools (stdio) that let an agent drive the serial port through tool calls |
 | Hot reload | After editing config, `serialhub reload` applies added/removed ports, changed params, and rebuilt buffers immediately; `serialhub reload --config other.yaml` switches the active config file at runtime (transient) |
+| Stop from the browser | **Exit** button in the Web UI header (or `serialhub shutdown`): confirm, then the daemon aborts any ZMODEM transfer, closes and releases every serial port and exits; every open tab shows *Service stopped*. Disable with `server.allow_shutdown: false` |
 | No-hardware demo | `device: loop://` runs the full open→send→read→wait_for loop with no hardware |
 
 ---
@@ -176,6 +177,7 @@ Field-by-field names and defaults (consistent with `config.py` / `config.example
 | `port` | int | `8765` | Listen port |
 | `token` | str\|null | `null` | When non-empty, `/api/*` and `/ws` require `Authorization: Bearer <token>` |
 | `cors` | bool | `true` | Whether cross-origin is allowed (handy during development) |
+| `allow_shutdown` | bool | `true` | Allow `POST /api/shutdown` (the Web UI **Exit** button / `serialhub shutdown`) to stop the daemon; `false` hides the button and the endpoint answers `403` |
 
 ### 5.2 `defaults` (default params for every port; each `ports[]` entry can override them)
 
@@ -335,7 +337,7 @@ Open `http://127.0.0.1:8765/`. Dark by default, with a light toggle in the top-r
 | Area | Function |
 |---|---|
 | Top-bar stats | Port count / open count / uptime |
-| Connection status | `live` / `connecting` / `reconnecting` / `unauthorized` status light |
+| Connection status | `live` / `connecting` / `reconnecting` / `unauthorized` / `stopped` status light |
 | token field | When the server sets a `token`, enter the Bearer token here (stored in localStorage) |
 | Tabs | One tab per port, each with a **status dot** and baud rate |
 | Terminal | xterm.js renders **ANSI color**; when the CDN is unavailable it **degrades to plain text** (ANSI stripped) with a banner notice |
@@ -354,8 +356,11 @@ Open `http://127.0.0.1:8765/`. Dark by default, with a light toggle in the top-r
 | Config switch | Top-bar chip shows the active config file (full path in its title); type a path and press **Switch** to `POST /api/reload {"config": …}` at runtime, or **↻** to re-read the active file. A switch may add/remove ports, so tabs, panes and the send bar are reconciled afterwards |
 | Pin control | DTR / RTS toggles and a Reset pulse (pulse sequence), shown only when the port status reports `pins.enabled`; hidden otherwise |
 | Upload (rz) / Download (sz)… | ZMODEM file transfer on the active port, see below |
+| Exit | Top-right, red. Asks for confirmation, then `POST /api/shutdown`: the service stops and releases every serial port. Every open tab then shows a persistent *Service stopped — serial ports released.* banner with **Reload**, and stops reconnecting/polling. Hidden when `server.allow_shutdown: false` |
 
-> The UI works over `/api/*` and `/ws`; the first WS frame pushes `hello` (port overview), then it pushes `line` / `status` / `mark` events.
+> The UI works over `/api/*` and `/ws`; the first WS frame pushes `hello` (port overview), then it pushes `line` / `status` / `mark` events (and `shutdown` when the service is exiting).
+
+> **Security — Exit button**: with `--host 0.0.0.0` and no `token`, anyone who can open the page can stop the service (and so release your serial ports). Set `token:` in the config, or `allow_shutdown: false`. Browser requests to `/api/shutdown` must also come from the page's own origin (`Origin` must match `Host`, else `403`).
 
 **File transfer (rz/sz).** The device needs lrzsz (`rz`/`sz`). **Upload (rz)** sends `rz` to the active port; when the device starts waiting, the port's dialog says *Device is waiting for files* — click **Choose files…** and pick one or more files. **Download (sz)…** asks for a path on the device and sends `sz <path>`; on *Device is sending files* click **Receive** and each file is saved by the browser. You can also type `rz` / `sz file` in the send bar yourself: the dialog appears whenever the device starts a ZMODEM session. Accept within `zmodem_claim_ms` (5 s) or the daemon aborts it. Each file shows bytes / total and rate; **Cancel** aborts the transfer on the device. Only one browser can own a session — other tabs show *Transfer in use by another browser*. While a transfer runs, the port's text output pauses and the send bar returns `409`; closing or reloading the page aborts the transfer. Downloads are held in browser memory until saved (fine for typical embedded files; very large files need that much RAM). Keep the tab visible during a transfer: browsers throttle timers in hidden tabs, which can stall an upload past the 15 s idle timeout (`zmodem_idle_ms`) and abort it.
 
@@ -398,6 +403,7 @@ Exit codes: `0`=success, `1`=failure. Global options: `--url` (default `http://1
 | `clear` | `NAME` | `POST .../clear` | Clear that port's buffer |
 | `bridge` | `{start,stop,status}` `--port NAME` `[--mode server\|client]` `[--tcp-port]` `[--host]` | `POST /api/bridge` | Start/stop/inspect the TCP bridge |
 | `reload` | `[--config F]` | `POST /api/reload` | Hot-reload the config; `--config` switches to another config file at runtime (transient, not persisted) |
+| `shutdown` | - | `POST /api/shutdown` | Stop the daemon like the Web UI **Exit** button (aborts transfers, closes every port, exits); `{"ok":true,"data":{"stopping":true}}` |
 | `mcp` | `[--stdio]` `[--transport]` `[--profile full\|lite]` | (MCP) | Run the MCP server (`lite` = 8 compact tools, see [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)) |
 | `tools` | `[--format anthropic\|openai]` | (local) | Print the lite tool definitions as a raw JSON array (no envelope, no daemon needed) |
 | `call` | `TOOL` `[JSON-ARGS]` | (lite) | Run one lite tool and print **plain text** (no envelope); exit 1 on `error:` |

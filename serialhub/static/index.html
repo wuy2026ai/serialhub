@@ -75,8 +75,25 @@
         <div class="lang-switch" id="langSwitch" role="group" data-i18n-aria="langAria" aria-label="Language"></div>
         <button class="icon-btn" id="themeToggle" data-i18n-title="themeTitle" data-i18n-aria="themeAria"
                 title="Toggle light / dark theme" aria-label="Toggle theme">&#9686;</button>
+        <!-- Exit: confirm → POST /api/shutdown (stops the daemon, releases every
+             serial port). Hidden until GET /health reports allow_shutdown: true. -->
+        <button class="exit-btn" id="exitBtn" type="button" hidden
+                data-i18n-title="exitTitle" data-i18n-aria="exitTitle"
+                title="Stop the serialhub service and release all serial ports"
+                aria-label="Stop the serialhub service and release all serial ports">
+          <span class="bx" aria-hidden="true">&#9211;</span><span data-i18n="exitLabel">Exit</span>
+        </button>
       </div>
     </header>
+
+    <!-- ===================================================== service stopped -->
+    <!-- shown (persistently) after Exit, or when the daemon broadcasts
+         {"type":"shutdown"}; reconnect + status polling are stopped by then. -->
+    <div class="stopped-banner" id="stoppedBanner" role="alert" hidden>
+      <span class="b-ico" aria-hidden="true">&#9209;</span>
+      <span class="s-msg"><strong data-i18n="stoppedStrong">Service stopped &mdash; serial ports released.</strong><span data-i18n="stoppedText"> Start serialhub again, then reload this page.</span></span>
+      <button class="btn" id="stoppedReload" type="button"><span class="bx" aria-hidden="true">&#8635;</span><span data-i18n="stoppedReload">Reload</span></button>
+    </div>
 
     <!-- ===================================================== tabs -->
     <nav class="tabs" id="tabs" role="tablist" data-i18n-aria="tabsAria" aria-label="serial ports"></nav>

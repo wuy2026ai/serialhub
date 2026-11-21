@@ -192,6 +192,10 @@ class Client:
         """Hot-reload the daemon config; ``path`` switches the active file at runtime."""
         return self.call("POST", "/api/reload", body={"config": path} if path else None)
 
+    def shutdown(self) -> dict[str, Any]:
+        """Stop the daemon (closes every port); the server exits ~200 ms after replying."""
+        return self.call("POST", "/api/shutdown")
+
     def switch_config(self, path: str) -> dict[str, Any]:
         """Switch the daemon to another config file at runtime (transient; no disk write)."""
         return self.call("POST", "/api/reload", body={"config": str(path)})

@@ -155,14 +155,20 @@ def _free_port() -> int:
 
 
 class LiveServer:
-    """在线程中运行 uvicorn(create_app)。ports 项如 {"name","device","autostart"}。"""
+    """在线程中运行 uvicorn(create_app)。ports 项如 {"name","device","autostart"}。
 
-    def __init__(self, ports: list[dict[str, Any]]) -> None:
+    ``server`` 覆盖 server 段（如 ``{"allow_shutdown": False}``）；``POST /api/shutdown``
+    经 ``app.state.request_exit`` 让本线程里的 uvicorn 退出（与 ``serialhub serve`` 相同）。
+    """
+
+    def __init__(self, ports: list[dict[str, Any]],
+                 server: Optional[dict[str, Any]] = None) -> None:
         self.port = _free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.ws_url = f"ws://127.0.0.1:{self.port}/ws"
         raw = {
-            "server": {"host": "127.0.0.1", "port": self.port, "token": None, "cors": True},
+            "server": {"host": "127.0.0.1", "port": self.port, "token": None, "cors": True,
+                       **(server or {})},
             "defaults": {"baud": 115200, "reconnect_ms": 200, "reconnect_max_ms": 500,
                          "flush_ms": 20},
             "ports": ports,
@@ -177,6 +183,8 @@ class LiveServer:
         app = create_app(self.hub, self.cfg)
         conf = uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning")
         self._server = uvicorn.Server(conf)
+        server = self._server
+        app.state.request_exit = lambda: setattr(server, "should_exit", True)
         self._thread = threading.Thread(target=self._server.run, daemon=True)
         self._thread.start()
         deadline = time.time() + 10

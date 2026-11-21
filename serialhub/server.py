@@ -11,6 +11,9 @@
     * ``Hub`` / ``Config`` 仅用于类型注解（``TYPE_CHECKING``），运行时按 duck typing
       访问，因此即便 ``hub.py`` / ``config.py`` 尚未就绪，本模块也能被安全导入。
     * 所有 JSON 响应统一 ``{"ok": true, ...}`` / ``{"ok": false, "error": "..."}``。
+    * ``POST /api/shutdown`` 要退出进程时调用 ``app.state.request_exit()``——由运行
+      uvicorn 的一方（``cli serve`` / 测试）注入（通常是 ``server.should_exit = True``）；
+      未注入时该端点返回 503，不会误杀宿主进程。
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Set
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
@@ -45,6 +49,9 @@ except Exception:  # noqa: BLE001 - 包初始化期间允许缺失
     VERSION = "0.1.0"
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+#: ``POST /api/shutdown`` 先回响应、再等这么久才真正停机（让响应与 WS 广播送达）。
+SHUTDOWN_DELAY_S = 0.2
 
 
 class I18nMiddleware:
@@ -156,6 +163,32 @@ def _http_token(request: Request) -> Optional[str]:
     return request.query_params.get("token")
 
 
+def _host_port(netloc: str, scheme: str = "http") -> Optional[tuple[str, int]]:
+    """``"Host:8765"`` → ``("host", 8765)``；省略端口时按 scheme 取默认端口；非法 → None。"""
+    try:
+        parts = urlsplit(f"{scheme}://{netloc}")
+        host = (parts.hostname or "").lower()
+        port = parts.port or (443 if scheme in ("https", "wss") else 80)
+    except ValueError:
+        return None
+    return (host, port) if host else None
+
+
+def _same_origin(request: Request) -> bool:
+    """CSRF 防护：有 ``Origin`` 时其 host:port 必须等于 ``Host``；无 ``Origin``（非浏览器）放行。"""
+    origin = request.headers.get("origin")
+    if origin is None:
+        return True
+    try:
+        parts = urlsplit(origin.strip())
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return False  # 含 "null"（沙箱 iframe / file:// 页面）
+    want = _host_port(request.headers.get("host", ""), parts.scheme)
+    return want is not None and _host_port(parts.netloc, parts.scheme) == want
+
+
 def _ws_token(websocket: WebSocket) -> Optional[str]:
     auth = websocket.headers.get("authorization", "")
     if auth and auth.lower().startswith("bearer "):
@@ -170,6 +203,8 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
     """构建并返回 FastAPI 应用（不启动服务器）。"""
     app = FastAPI(title="serialhub", version=VERSION, docs_url=None, redoc_url=None)
     app.state.started_at = time.time()
+    app.state.request_exit = None  # 由运行 uvicorn 的一方注入（见模块说明）
+    app.state.shutting_down = False
 
     server_cfg = getattr(config, "server", None)
     token: Optional[str] = getattr(server_cfg, "token", None) or None
@@ -217,6 +252,10 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             status_code=500, content={"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         )
 
+    def _allow_shutdown() -> bool:
+        active = getattr(hub, "config", None) or config  # 跟随运行时切换
+        return bool(getattr(getattr(active, "server", None), "allow_shutdown", True))
+
     # ---- 基础 / 健康检查 ---------------------------------------------------- #
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -225,6 +264,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             "status": "ok",
             "version": VERSION,
             "uptime_ms": uptime_ms(app),
+            "allow_shutdown": _allow_shutdown(),
         }
 
     # ---- 端口列表 / 状态 ---------------------------------------------------- #
@@ -394,6 +434,41 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
     async def api_config() -> dict[str, Any]:
         active = getattr(hub, "config", None) or config  # 跟随运行时切换
         return {"ok": True, "config": active.to_dict(redact=True)}
+
+    # ---- 停止服务（Web UI 的 Exit 按钮 / CLI shutdown） --------------------- #
+    async def _shutdown_sequence() -> None:
+        """先让响应送出，再：广播 shutdown → 停桥/关口（中止 ZMODEM、吐残行）→ 停 uvicorn。"""
+        await asyncio.sleep(SHUTDOWN_DELAY_S)
+        try:
+            hub._broadcast({"type": "shutdown"})
+            await asyncio.sleep(0.1)  # 让各 WS 转发任务把广播发出去
+            await asyncio.to_thread(hub.stop)
+        except Exception:  # noqa: BLE001 - 无论如何都要退出
+            pass
+        finally:
+            request_exit = getattr(app.state, "request_exit", None)
+            if callable(request_exit):
+                request_exit()
+
+    @app.post("/api/shutdown")
+    async def api_shutdown(request: Request) -> JSONResponse:
+        if not _allow_shutdown():
+            return JSONResponse(
+                status_code=403, content={"ok": False, "error": t("server.error.shutdown_disabled")}
+            )
+        if not _same_origin(request):
+            return JSONResponse(
+                status_code=403, content={"ok": False, "error": t("server.error.bad_origin")}
+            )
+        if not callable(getattr(app.state, "request_exit", None)):
+            return JSONResponse(
+                status_code=503,
+                content={"ok": False, "error": t("server.error.shutdown_unavailable")},
+            )
+        if not app.state.shutting_down:  # 重复请求只回同一响应，不再起第二个停机流程
+            app.state.shutting_down = True
+            app.state.shutdown_task = asyncio.create_task(_shutdown_sequence())
+        return JSONResponse(status_code=200, content={"ok": True, "data": {"stopping": True}})
 
     # ---- WebSocket --------------------------------------------------------- #
     @app.websocket("/ws")

@@ -264,6 +264,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = add("reload", help=t("cli.cmd.reload"))
     p.add_argument("--config", default=None, help=t("cli.arg.config_reload"))
 
+    add("shutdown", help=t("cli.cmd.shutdown"), description=t("cli.desc.shutdown"))
+
     p = add("serve", help=t("cli.cmd.serve"))
     p.add_argument("--config", required=True)
     p.add_argument("--host", default=None)
@@ -368,6 +370,10 @@ def _dispatch(command: str, args: argparse.Namespace) -> int:
         if target:
             target = os.path.abspath(os.path.expanduser(str(target)))
         env = client.reload(target)
+    elif command == "shutdown":
+        env = client.shutdown()
+        if env.get("ok") and isinstance(env.get("data"), dict):
+            env = {"ok": True, **env["data"]}  # 端点自带 data 包装：拆开，避免 data.data
     else:
         env = {"ok": False, "error": f"unknown command: {command}"}
     return _print_env(env)
@@ -396,9 +402,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     hub = Hub(cfg)
     hub.start()
     app = create_app(hub, cfg)
+    server = uvicorn.Server(uvicorn.Config(app, host=cfg.server.host, port=cfg.server.port,
+                                           log_level=args.log_level or "info"))
+    # POST /api/shutdown (Web UI "Exit" / `serialhub shutdown`) ends server.run() cleanly.
+    app.state.request_exit = lambda: setattr(server, "should_exit", True)
     try:
-        uvicorn.run(app, host=cfg.server.host, port=cfg.server.port,
-                    log_level=args.log_level or "info")
+        server.run()
     except KeyboardInterrupt:
         pass
     finally:

@@ -48,6 +48,7 @@
 | CLI | 每个子命令输出**单行 JSON** `{"ok":true,"data":{...}}`，退出码 0/1 |
 | MCP | 20 个工具（stdio），让 agent 直接以工具调用操作串口 |
 | 热重载 | 改配置后 `serialhub reload`，增删口 / 改参数 / 重建缓冲即时生效；`serialhub reload --config other.yaml` 可在运行时切换配置文件（临时） |
+| 浏览器里停止服务 | Web UI 顶栏 **Exit** 按钮（或 `serialhub shutdown`）：确认后守护中止进行中的 ZMODEM 传输、关闭并释放所有串口、进程退出；所有打开的页面都显示「服务已停止」。用 `server.allow_shutdown: false` 关闭此功能 |
 | 无硬件演示 | `device: loop://` 直接空跑 open→send→read→wait_for |
 
 ---
@@ -175,6 +176,7 @@ python -m serialhub serve --config config.example.yaml --no-autostart
 | `port` | int | `8765` | 监听端口 |
 | `token` | str\|null | `null` | 非空时 `/api/*` 与 `/ws` 需 `Authorization: Bearer <token>` |
 | `cors` | bool | `true` | 是否允许跨域（开发方便） |
+| `allow_shutdown` | bool | `true` | 允许 `POST /api/shutdown`（Web UI 的 **Exit** 按钮 / `serialhub shutdown`）停止守护；`false` 时隐藏按钮、端点返回 `403` |
 
 ### 5.2 `defaults`（所有口的默认参数，可被每个 `ports[]` 逐项覆盖）
 
@@ -330,7 +332,7 @@ ui:
 | 区域 | 功能 |
 |---|---|
 | 顶栏统计 | 端口数 / open 数 / uptime |
-| 连接状态 | `live` / `connecting` / `reconnecting` / `unauthorized` 状态灯 |
+| 连接状态 | `live` / `connecting` / `reconnecting` / `unauthorized` / `stopped` 状态灯 |
 | token 输入框 | 服务端设了 `token` 时，在此填 Bearer token（存 localStorage） |
 | 标签页 | 多口标签，每标签带**状态点**与波特率 |
 | 终端 | xterm.js 渲染 **ANSI 彩色**；CDN 不可用时**降级为纯文本**（去 ANSI）并给横幅提示 |
@@ -349,8 +351,11 @@ ui:
 | 配置切换 | 顶栏 chip 显示当前生效配置文件（完整路径在 title 里）；输入路径点 **Switch** 即 `POST /api/reload {"config": …}` 运行时切换，**↻** 重读当前文件。切换可能增删端口，页签 / 面板 / 发送栏随后自动收敛 |
 | 引脚控制 | DTR / RTS 切换与 Reset 脉冲（脉冲序列）；仅当端口状态里 `pins.enabled` 为真时显示，否则隐藏 |
 | 上传 (rz) / 下载 (sz)… | 当前口的 ZMODEM 文件传输，见下 |
+| Exit（退出） | 右上角红色按钮。先弹确认，再 `POST /api/shutdown`：服务停止并释放所有串口。随后每个打开的页面都显示常驻横幅「服务已停止 — 串口已释放。」及 **刷新** 按钮，并停止重连与轮询。`server.allow_shutdown: false` 时隐藏 |
 
-> UI 通过 `/api/*` 与 `/ws` 工作；WS 首帧推 `hello`（端口概览），随后推 `line` / `status` / `mark` 事件。
+> UI 通过 `/api/*` 与 `/ws` 工作；WS 首帧推 `hello`（端口概览），随后推 `line` / `status` / `mark` 事件（服务退出前推 `shutdown`）。
+
+> **安全提示 — Exit 按钮**：用 `--host 0.0.0.0` 对外且未设 `token` 时，任何能打开页面的人都能停止服务（从而释放你的串口）。请在配置里设 `token:`，或设 `allow_shutdown: false`。浏览器发往 `/api/shutdown` 的请求还必须来自页面自身的源（`Origin` 须与 `Host` 一致，否则 `403`）。
 
 **文件传输（rz/sz）。** 设备上需要 lrzsz（`rz`/`sz`）。**上传 (rz)** 向当前口发送 `rz`；设备开始等待后，该口的对话框显示“设备正在等待文件”，点 **选择文件…** 选一个或多个文件。**下载 (sz)…** 先询问设备上的路径，再发送 `sz <路径>`；出现“设备正在发送文件”时点 **接收**，每个文件由浏览器保存。也可以自己在发送栏输入 `rz` / `sz 文件`：只要设备开始 ZMODEM 会话，对话框就会出现。须在 `zmodem_claim_ms`（5 秒）内接受，否则守护会中止。每个文件显示已传/总字节与速率；**取消** 会中止设备上的传输。一个会话只能由一个浏览器持有，其他标签页显示“传输已被另一个浏览器占用”。传输期间该口的文本输出暂停，发送栏返回 `409`；关闭或刷新页面会中止传输。下载的文件在保存前整份放在浏览器内存里（一般嵌入式文件没问题，超大文件需要同等内存）。传输期间请保持该标签页可见：浏览器会节流隐藏标签页的计时器，上传可能因此停顿超过 15 秒空闲超时（`zmodem_idle_ms`）而被中止。
 
@@ -393,6 +398,7 @@ CLI 是**瘦客户端**：除 `serve` / `mcp` 外，每个子命令打印**恰�
 | `clear` | `NAME` | `POST .../clear` | 清空该口缓冲 |
 | `bridge` | `{start,stop,status}` `--port NAME` `[--mode server\|client]` `[--tcp-port]` `[--host]` | `POST /api/bridge` | 起停/查看 TCP 桥 |
 | `reload` | `[--config F]` | `POST /api/reload` | 热重载配置；`--config` 在运行时切换到另一个配置文件（临时，不落盘） |
+| `shutdown` | - | `POST /api/shutdown` | 等同 Web UI 的 **Exit** 按钮停止守护（中止传输、关闭所有口、退出）；`{"ok":true,"data":{"stopping":true}}` |
 | `mcp` | `[--stdio]` `[--transport]` `[--profile full\|lite]` | (MCP) | 运行 MCP 服务器（`lite` = 8 个精简工具，见 [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)） |
 | `tools` | `[--format anthropic\|openai]` | (本地) | 以原始 JSON 数组打印 lite 工具定义（非信封，无需守护进程） |
 | `call` | `TOOL` `[JSON-ARGS]` | (lite) | 运行一个 lite 工具并打印**纯文本**（非信封）；`error:` 时退出码 1 |

@@ -654,3 +654,32 @@ zmodem.js 原样会对设备的下一行抛 “Only thing after ZFIN should be O
 我方帧头在回注时被当成新会话），失败 `abort:true`；设备自己发 CAN 取消（lsz 找不到文件时如此）则收 0.5 s 文本后以
 `done` 结束，文本照常进环。守护进程行为不变、不增加文件访问面（可在远端）。对外：lite 工具 `zsend`/`zrecv`、
 CLI `serialhub zsend|zrecv`、完整 MCP profile `zmodem_send`/`zmodem_receive`（见 `docs/AGENT-LITE.md`）。
+
+## 15. 停止服务：`POST /api/shutdown` + WS `shutdown`（2026-11 增补）
+
+本节为新增契约，不改动以上各节。
+
+**REST**：`POST /api/shutdown`（无请求体）。
+
+| 条件 | 响应 |
+|---|---|
+| 配置了 `server.token` 而请求未带 / 带错 Bearer | `401 {"ok":false,"error":"unauthorized"}`（与其它 `/api/*` 相同） |
+| `server.allow_shutdown: false` | `403 {"ok":false,"error":"shutdown disabled"}` |
+| 带 `Origin` 头且其 host:port ≠ `Host` 头（含 `Origin: null`） | `403 {"ok":false,"error":"..."}`（CSRF 防护；不带 `Origin` 的非浏览器客户端放行；仅此端点检查） |
+| 应用未注入退出回调（如 TestClient 直接 `create_app`） | `503 {"ok":false,"error":"..."}`，不停任何东西 |
+| 其它 | `200 {"ok":true,"data":{"stopping":true}}`；重复请求返回同样内容，不会重复停机 |
+
+**退出接线**：`create_app` 置 `app.state.request_exit = None`；运行 uvicorn 的一方（`cli serve`、测试的 `LiveServer`）
+用 `uvicorn.Server` 运行并注入 `app.state.request_exit = lambda: setattr(server, "should_exit", True)`。
+接受请求后约 200 ms（`server.SHUTDOWN_DELAY_S`，先让响应送达）按序：
+1. 广播 `{"type":"shutdown"}` 给所有订阅者（不带 `port`，不受 WS `subscribe` 过滤）；
+2. `hub.stop()`（线程里）：停所有桥、关所有口——关口时进行中的 ZMODEM 会话以 `closed` 结束并先写 `ABORT_SEQ`，line 模式残行吐出；
+3. 调 `request_exit()`：uvicorn 优雅退出，`serialhub serve` 返回退出码 0（其 `finally` 里的 `hub.stop()` 幂等）。
+
+**WS**：服务端 → 客户端新增 `{"type":"shutdown"}`：服务即将退出，客户端应停止自动重连与轮询。
+
+**配置**：`server.allow_shutdown: bool = true`（`to_dict` 输出；非 bool → `ValueError`）。`GET /health` 增加
+`allow_shutdown` 字段，Web UI 据此显示 / 隐藏 Exit 按钮。
+
+**CLI / 客户端**：`serialhub shutdown`（`--url` / `--token`，单行 JSON 信封 `{"ok":true,"data":{"stopping":true}}`，退出码 0/1）；
+`Client.shutdown()`。MCP（full / lite）与 `lite.TOOLS` **不**提供停机工具。
