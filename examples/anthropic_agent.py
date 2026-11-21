@@ -24,11 +24,12 @@ from serialhub.client import Client  # noqa: E402
 
 SYSTEM = (
     "You operate serial ports through serialhub tools. Start with ports. "
-    "Output lines are '<seq> <text>'; '>' marks text you sent, '#' a marker. "
-    "Each block header has next=N: pass N as since on your next read so you "
-    "never re-read old lines. more=1 means call read again with that since. "
-    "Use send with wait (a regex) to get a command's reply; use wait for later events. "
-    "Results starting with 'error:' mean the call failed: fix the arguments, do not repeat it."
+    "Lines are '<seq> <text>'; '>' = sent by you, '#' = marker. "
+    "Each block header has next=N: pass N as since next time so you never re-read lines; "
+    "more=1 means read again with that since. "
+    "Use send with wait (regex for the reply, not your echoed command); wait for later events. "
+    "Wait for output lines, not a bare prompt (a prompt has no newline). "
+    "On 'error:' fix the arguments; do not repeat the call."
 )
 MAX_TURNS = 30
 
@@ -44,12 +45,14 @@ def main(argv: list[str]) -> None:
                  os.environ.get("SERIALHUB_TOKEN"))
     messages: list = [{"role": "user", "content": task}]
     for _ in range(MAX_TURNS):
-        reply = llm.messages.create(model=model, max_tokens=1024, system=SYSTEM,
+        reply = llm.messages.create(model=model, max_tokens=4096, system=SYSTEM,
                                     tools=lite.to_anthropic(), messages=messages)
         for block in reply.content:
             if block.type == "text" and block.text.strip():
                 print(block.text)
         if reply.stop_reason != "tool_use":
+            if reply.stop_reason != "end_turn":
+                print(f"[stopped: {reply.stop_reason}]")
             return
         messages.append({"role": "assistant", "content": reply.content})
         results = []

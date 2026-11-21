@@ -419,6 +419,8 @@ def _cmd_call(args: argparse.Namespace) -> int:
             print(f"error: {t('cli.error.call_args_json', error=exc)}")
             return 1
     url, token = _global_options(args)
+    if getattr(args, "url", None) is None:  # same env fallback as `mcp --profile lite`
+        url = os.environ.get("SERIALHUB_URL") or url
     text = lite.call(Client(url, token), args.tool, tool_args)
     print(text)
     return 1 if text.startswith("error:") else 0

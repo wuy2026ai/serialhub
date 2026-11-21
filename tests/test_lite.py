@@ -32,6 +32,8 @@ def live(free_tcp_port, make_config):
          "buffer_lines": 2000, "buffer_bytes": 1 << 22},
         {"name": "t2", "device": "loop://", "autostart": False,
          "buffer_lines": 2000, "buffer_bytes": 1 << 22},
+        {"name": "t3", "device": "loop://", "autostart": True, "eol": "\n",
+         "buffer_lines": 2000, "buffer_bytes": 1 << 22},
     ])
     hub = Hub(cfg)
     hub.start()
@@ -210,13 +212,42 @@ def test_char_cap_sets_more_and_continuation_is_lossless(live) -> None:
 # --------------------------------------------------------------------------- #
 # send
 # --------------------------------------------------------------------------- #
-def test_send_with_wait_matches_echo(live) -> None:
-    _hub, client = live
+def _later(hub, port: str, text: str, delay: float = 0.4) -> None:
+    """Ingest ``text`` as an rx line on ``port`` after ``delay`` seconds (scripted reply)."""
+    def run() -> None:
+        time.sleep(delay)
+        hub.ingest(port, text)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def test_send_wait_skips_exact_echo(live) -> None:
+    hub, client = live
+    _later(hub, "t", "hello back")
     out = lite.call(client, "send", {"port": "t", "data": "hello", "wait": "hel+o"})
     lines = _lines(out)
     assert lines[0] == "sent 7B matched"
-    assert lines[2].endswith(" hello")
-    assert not any(" >" in line for line in lines[2:])  # rx only
+    assert [ln.split(" ", 1)[1] for ln in lines[2:]] == ["hello", "hello back"]
+
+
+def test_send_wait_skips_prompt_prefixed_echo(live) -> None:
+    hub, client = live
+    hub.write_bytes("t", b"root@dev:~# ")  # loop:// echoes this, then the command
+    _later(hub, "t", "uname: Linux 6.1")
+    out = lite.call(client, "send", {"port": "t", "data": "uname -a", "wait": "uname"})
+    lines = _lines(out)
+    assert lines[0] == "sent 10B matched"
+    assert [ln.split(" ", 1)[1] for ln in lines[2:]] == [
+        "root@dev:~# uname -a", "uname: Linux 6.1"]
+
+
+def test_send_wait_only_skips_first_echo(live) -> None:
+    hub, client = live
+    _later(hub, "t", "abc")  # a genuine reply that happens to equal the command
+    out = lite.call(client, "send", {"port": "t", "data": "abc", "wait": "^abc$"})
+    lines = _lines(out)
+    assert lines[0] == "sent 5B matched"
+    assert [ln.split(" ", 1)[1] for ln in lines[2:]] == ["abc (x2)"]  # echo + reply
 
 
 def test_send_without_wait_quiet_period(live) -> None:
@@ -239,24 +270,31 @@ def test_send_timeout(live) -> None:
 
 def test_send_eol_variants(live) -> None:
     _hub, client = live
-    assert _lines(lite.call(client, "send", {"port": "t", "data": "ab", "eol": "lf",
-                                             "wait": "ab"}))[0] == "sent 3B matched"
+    out = lite.call(client, "send", {"port": "t", "data": "ab", "eol": "lf"})
+    assert _lines(out)[0] == "sent 3B"
+    assert _lines(out)[2].endswith(" ab")
     # a trailing lone CR is held by the daemon's line framer until the next byte
     assert _lines(lite.call(client, "send", {"port": "t", "data": "cd",
                                              "eol": "cr"}))[0] == "sent 3B"
     out1 = lite.call(client, "send", {"port": "t", "data": "ef", "eol": "none"})
     assert _lines(out1)[0] == "sent 2B"
-    out2 = lite.call(client, "send", {"port": "t", "data": "gh", "wait": "efgh"})
-    assert _lines(out2)[0] == "sent 4B matched"
+    out2 = lite.call(client, "send", {"port": "t", "data": "gh"})
+    assert _lines(out2)[0] == "sent 4B"
     texts = [line.split(" ", 1)[1] for line in _lines(out1)[2:] + _lines(out2)[2:]]
     assert texts == ["cd", "efgh"]
     assert lite.call(client, "send", {"port": "t", "data": "x", "eol": "bad"}).startswith(
         "error:")
 
 
+def test_send_default_eol_is_port_setting(live) -> None:
+    _hub, client = live
+    assert _lines(lite.call(client, "send", {"port": "t3", "data": "ab"}))[0] == "sent 3B"
+    assert _lines(lite.call(client, "send", {"port": "t", "data": "ab"}))[0] == "sent 4B"
+
+
 def test_send_next_cursor_skips_reply(live) -> None:
     hub, client = live
-    out = lite.call(client, "send", {"port": "t", "data": "abc", "wait": "abc"})
+    out = lite.call(client, "send", {"port": "t", "data": "abc"})
     nxt = int(_header(_block_header(out))["next"])
     later = hub.ingest("t", "later").seq
     assert _lines(lite.call(client, "read", {"port": "t", "since": nxt}))[1:] == [
@@ -266,28 +304,49 @@ def test_send_next_cursor_skips_reply(live) -> None:
 # --------------------------------------------------------------------------- #
 # wait / search / control / ports
 # --------------------------------------------------------------------------- #
-def test_wait_matched_and_timeout(live) -> None:
+def test_wait_matched_shows_lines_since_baseline(live) -> None:
     hub, client = live
+    hub.ingest("t", "before the call")
 
     def later() -> None:
         time.sleep(0.3)
+        hub.ingest("t", "noise")
         hub.ingest("t", "READY now")
 
     threading.Thread(target=later, daemon=True).start()
     out = lite.call(client, "wait", {"port": "t", "regex": "READY", "timeout_ms": 5000})
     lines = _lines(out)
-    assert lines[0].startswith("matched")
-    assert re.match(r"^\d+ READY now$", lines[-1])
+    assert lines[0] == "matched"
+    assert [ln.split(" ", 1)[1] for ln in lines[2:]] == ["noise", "READY now"]
+    assert _header(lines[1])["next"] == lines[-1].split(" ", 1)[0]
     assert lite.call(client, "wait", {"port": "t", "regex": "nope",
                                       "timeout_ms": 200}).startswith("timeout")
 
 
 def test_wait_since(live) -> None:
     hub, client = live
+    a = hub.ingest("t", "first").seq
     seq = hub.ingest("t", "old READY").seq
+    hub.ingest("t", "after")
     out = lite.call(client, "wait", {"port": "t", "regex": "READY", "since": 0,
                                      "timeout_ms": 1000})
-    assert _lines(out)[-1] == f"{seq} old READY"
+    assert _lines(out)[1:] == [f"t {a}-{seq} next={seq} more=0", f"{a} first",
+                               f"{seq} old READY"]
+
+
+def test_wait_cap_trims_front_keeps_match_last(live) -> None:
+    hub, client = live
+    for i in range(40):
+        hub.ingest("t", f"{i:03d}" + "w" * 200)
+    seq = hub.ingest("t", "READY").seq
+    out = lite.call(client, "wait", {"port": "t", "regex": "READY", "since": 0})
+    lines = _lines(out)
+    assert lines[-1] == f"{seq} READY"
+    head = _header(lines[1])
+    assert head["next"] == str(seq)
+    assert int(head["skipped"]) > 0
+    assert len("\n".join(lines[2:])) <= lite.MAX_BLOCK_CHARS
+    assert int(head["skipped"]) + len(lines) - 2 == 41
 
 
 def test_search_with_context(live) -> None:
@@ -297,10 +356,62 @@ def test_search_with_context(live) -> None:
     c = hub.ingest("t", "gamma").seq
     hub.ingest("t", "delta")
     out = lite.call(client, "search", {"port": "t", "regex": "HIT", "context": 1})
-    assert _lines(out)[1:] == [f"{a} alpha", f"{b} HIT one", f"{c} gamma"]
+    assert _lines(out) == ["t hits=1 more=0", f"{a} alpha", f"{b} HIT one", f"{c} gamma"]
     out0 = lite.call(client, "search", {"port": "t", "regex": "HIT"})
-    assert _lines(out0)[1:] == [f"{b} HIT one"]
-    assert lite.call(client, "search", {"port": "t", "regex": "zzz"}).startswith("t empty")
+    assert _lines(out0) == ["t hits=1 more=0", f"{b} HIT one"]
+    assert lite.call(client, "search", {"port": "t", "regex": "zzz"}) == "t hits=0 more=0"
+
+
+def test_search_limit_more_and_no_collapse(live) -> None:
+    hub, client = live
+    p1 = hub.ingest("t", "panic").seq
+    hub.ingest("t", "ok")
+    p2 = hub.ingest("t", "panic").seq
+    hub.ingest("t", "panic")
+    out = lite.call(client, "search", {"port": "t", "regex": "panic", "limit": 2})
+    assert _lines(out) == ["t hits=2 more=1", f"{p1} panic", f"{p2} panic"]
+
+
+def test_filtered_read_does_not_collapse(live) -> None:
+    hub, client = live
+    p1 = hub.ingest("t", "panic").seq
+    hub.ingest("t", "ok")
+    p2 = hub.ingest("t", "panic").seq
+    out = lite.call(client, "read", {"port": "t", "since": 0, "filter": "panic"})
+    assert _lines(out)[1:] == [f"{p1} panic", f"{p2} panic"]
+
+
+def test_read_reports_dropped(live) -> None:
+    hub, client = live
+    seqs = [hub.ingest("t", f"d{i}").seq for i in range(2010)]  # ring holds 2000
+    out = lite.call(client, "read", {"port": "t", "since": seqs[0] - 1, "limit": 3})
+    head = _header(_lines(out)[0])
+    assert head["dropped"] == "10"
+    assert _lines(out)[1] == f"{seqs[10]} d10"
+    out2 = lite.call(client, "read", {"port": "t", "since": seqs[-2]})
+    assert "dropped=" not in out2
+
+
+def test_read_stale_cursor_resets_to_tail(live) -> None:
+    hub, client = live
+    seqs = [hub.ingest("t", f"r{i}").seq for i in range(3)]
+    out = lite.call(client, "read", {"port": "t", "since": 10_000, "limit": 2})
+    lines = _lines(out)
+    assert lines[0] == f"t {seqs[1]}-{seqs[2]} next={seqs[2]} more=0 reset=1"
+    assert lines[1:] == [f"{seqs[1]} r1", f"{seqs[2]} r2"]
+
+
+def test_tail_read_cap_keeps_newest(live) -> None:
+    hub, client = live
+    seqs = [hub.ingest("t", f"{i:03d}" + "n" * 200).seq for i in range(60)]
+    out = lite.call(client, "read", {"port": "t", "limit": 200})
+    lines = _lines(out)
+    head = _header(lines[0])
+    assert lines[-1].startswith(f"{seqs[-1]} 059")
+    assert head["next"] == str(seqs[-1])
+    assert head["more"] == "0"
+    assert int(head["skipped"]) + len(lines) - 1 == 60
+    assert len("\n".join(lines[1:])) <= lite.MAX_BLOCK_CHARS
 
 
 def test_control_actions(live) -> None:
@@ -322,6 +433,7 @@ def test_ports(live) -> None:
     lines = _lines(lite.call(client, "ports", {}))
     assert lines[0] == f"t open 115200 loop:// last={seq}"
     assert lines[1] == "t2 closed 115200 loop:// last=0"
+    assert lines[2] == "t3 open 115200 loop:// last=0"
 
 
 # --------------------------------------------------------------------------- #
@@ -481,7 +593,7 @@ def test_example_agent_loop_with_mocked_sdk(monkeypatch, capsys) -> None:
         types.SimpleNamespace(stop_reason="tool_use", content=[
             _Block(type="text", text="checking"),
             _Block(type="tool_use", id="tu1", name="ports", input={})]),
-        types.SimpleNamespace(stop_reason="end_turn", content=[
+        types.SimpleNamespace(stop_reason="max_tokens", content=[
             _Block(type="text", text="all done")]),
     ]
 
@@ -509,4 +621,84 @@ def test_example_agent_loop_with_mocked_sdk(monkeypatch, capsys) -> None:
     result = calls[1]["messages"][-1]["content"][0]
     assert result == {"type": "tool_result", "tool_use_id": "tu1",
                       "content": "error: offline", "is_error": True}
-    assert "all done" in capsys.readouterr().out
+    assert calls[0]["max_tokens"] == 4096
+    captured = capsys.readouterr()
+    assert "all done" in captured.out
+    assert "max_tokens" in captured.out + captured.err
+
+
+# --------------------------------------------------------------------------- #
+# fix round 1: MCP string args, isError, schema-override warning, CLI env URL
+# --------------------------------------------------------------------------- #
+def _mcp_text(result) -> str:
+    content = getattr(result, "content", result)
+    if isinstance(content, tuple):
+        content = content[0]
+    return "".join(getattr(block, "text", "") for block in content)
+
+
+@pytest.mark.parametrize("data", ['{"a":1}', "[1,2]", "null", "42", "true"])
+def test_mcp_lite_json_looking_strings_sent_verbatim(live, data) -> None:
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from serialhub import mcp_lite
+
+    hub, client = live
+    server = mcp_lite.build(client.base_url, None)
+    out = _mcp_text(asyncio.run(server.call_tool("send", {"port": "t", "data": data})))
+    assert out.startswith("sent "), out
+    tx = hub.read("t", kinds={"tx"})["lines"]
+    assert tx[-1]["text"] == data
+
+
+def test_mcp_lite_json_looking_regex_filter_label(live) -> None:
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from serialhub import mcp_lite
+
+    hub, client = live
+    server = mcp_lite.build(client.base_url, None)
+    seq = hub.ingest("t", "null").seq
+    run = lambda name, args: _mcp_text(asyncio.run(server.call_tool(name, args)))  # noqa: E731
+    assert run("wait", {"port": "t", "regex": "null", "since": 0}).startswith("matched")
+    assert run("read", {"port": "t", "since": 0, "filter": "null"}).endswith(f"{seq} null")
+    assert run("search", {"port": "t", "regex": "null"}).endswith(f"{seq} null")
+    assert run("control", {"port": "t", "action": "mark", "label": '{"x":2}'}).startswith(
+        "mark ")
+    assert hub.read("t", kinds={"mark"})["lines"][-1]["text"] == '{"x":2}'
+
+
+def test_mcp_lite_error_text_flagged_is_error(live) -> None:
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from serialhub import mcp_lite
+
+    _hub, client = live
+    server = mcp_lite.build(client.base_url, None)
+    bad = asyncio.run(server.call_tool("read", {"port": "nope"}))
+    assert _mcp_text(bad) == lite.call(client, "read", {"port": "nope"})
+    if mcp_lite.ERROR_FLAG_SUPPORTED:
+        assert getattr(bad, "is_error", getattr(bad, "isError", None)) is True
+    good = asyncio.run(server.call_tool("ports", {}))
+    assert getattr(good, "is_error", getattr(good, "isError", False)) in (False, None)
+
+
+def test_mcp_lite_warns_when_schema_override_impossible(monkeypatch, capsys) -> None:
+    pytest.importorskip("mcp")
+    from serialhub import mcp_lite
+
+    monkeypatch.setattr(mcp_lite, "_tool_registry", lambda server: None)
+    mcp_lite.build("http://127.0.0.1:1")
+    assert "warning" in capsys.readouterr().err.lower()
+
+
+def test_cli_call_honours_serialhub_url_env(live, capsys, monkeypatch) -> None:
+    from serialhub import cli
+
+    _hub, client = live
+    monkeypatch.setenv("SERIALHUB_URL", client.base_url)
+    assert cli.main(["call", "ports"]) == 0
+    assert capsys.readouterr().out.startswith("t open")

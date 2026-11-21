@@ -1,74 +1,82 @@
 # serialhub lite — a compact agent interface
 
-The 18-tool MCP server returns verbose JSON — costly for a small local model (Qwen-class)
-driven through the Anthropic Messages tool format. **lite** is a compact second interface
-over the same daemon: six tools, plain-text results, one cursor habit. It is a thin client
-(`serialhub/lite.py` over `serialhub/client.py`); `serialhub serve` must be running.
-REST, the other CLI commands and the full MCP profile are unchanged.
+**lite** is a compact second interface for small local models (Qwen-class) using the
+Anthropic Messages tool format: six tools, plain-text results, one cursor habit. A thin
+client (`serialhub/lite.py`); `serialhub serve` must be running. Nothing else changes.
 
 ## Measured schema sizes
 
-Compact JSON (`separators=(",", ":")`) of name + description + input schema per tool
-(a test keeps lite at or below 3,000):
+Compact JSON of name + description + input schema per tool (a test keeps lite ≤ 3,000):
 
 | interface | tools | chars |
 |---|---|---|
 | full MCP profile (`mcp_server.py`) | 18 | 14,957 (18,432 as the raw `tools/list` payload) |
-| lite, Anthropic format (`serialhub tools`) | 6 | 2,572 |
-| lite, OpenAI format (`serialhub tools --format openai`) | 6 | 2,746 |
+| lite, Anthropic format (`serialhub tools`) | 6 | 2,648 |
+| lite, OpenAI format (`serialhub tools --format openai`) | 6 | 2,822 |
 
 ## The six tools
 
 | tool | args | result |
 |---|---|---|
 | `ports` | — | one line per port: `<name> open\|closed <baud> <device> last=<last_seq>` (+ ` err=<last_error>`) |
-| `send` | `port`, `data`, `wait?` (regex), `timeout_ms?` (3000, max 60000), `eol?` (`crlf`\|`lf`\|`cr`\|`none`) | `sent <n>B` (+ ` matched`\|` timeout` with `wait`), then the reply block |
-| `read` | `port`, `since?`, `limit?` (50, max 200), `filter?` (regex) | lines with seq > `since`; without `since`, the last `limit` lines |
-| `wait` | `port`, `regex`, `timeout_ms?` (10000, max 120000), `since?` | `matched` + the line, or `timeout` |
-| `search` | `port`, `regex`, `limit?` (20, max 100), `context?` (0-5) | hits over the whole buffer; windows separated by `--` |
+| `send` | `port`, `data`, `wait?` (regex), `timeout_ms?` (3000, max 60000), `eol?` (`crlf`\|`lf`\|`cr`\|`none`; default: the port's `eol`) | `sent <n>B` (+ ` matched`\|` timeout` with `wait`), then the reply block |
+| `read` | `port`, `since?`, `limit?` (50, max 200), `filter?` (regex) | lines with seq > `since`; without `since`, the latest `limit` lines |
+| `wait` | `port`, `regex`, `timeout_ms?` (10000, max 120000), `since?` | `matched` + every line up to the match, or `timeout` |
+| `search` | `port`, `regex`, `limit?` (20, max 100), `context?` (0-5) | hits over the whole buffer; windows separated by `--`; **does not move the cursor** |
 | `control` | `port`, `action` (`open`\|`close`\|`clear`\|`mark`), `baud?`, `label?` | `open 115200` / `closed` / `cleared 12` / `mark 345` |
 
-- `send` collects **rx** lines that arrive after the write: until `wait` matches, or (no
-  `wait`) until 300 ms pass with no new line, or until `timeout_ms`.
-- `wait` without `since` only considers lines arriving after the call; pass `since` to
-  also check buffered lines after that seq.
-- Out-of-range `limit`/`timeout_ms`/`context` are clamped; `"50"` is accepted as 50.
-- Every failure (unknown tool/port, bad regex, missing or wrongly typed argument, daemon
-  unreachable) is returned as text starting with `error: ` — `call()` never raises.
+- `send` collects **rx** lines after the write until `wait` matches, or (no `wait`) 300 ms
+  of silence, or `timeout_ms`. `wait` ignores the first rx line ending with `data` (the
+  device's echo, maybe prompt-prefixed: `root@dev:~# uname -a`); it is still shown.
+- `wait` without `since` only considers lines arriving after the call. On a match it shows
+  all lines in (since or call start, match]; `next=` is the matched seq.
+- Regexes: `send`'s `wait` matches ANSI-stripped text; `wait`/`search`/`filter` run in the
+  daemon on raw text (ANSI escapes included). Output is always stripped.
+- Out-of-range values are clamped; `"50"` counts as 50; failures are text `error: ...`.
 
-## Line format (send / read / wait / search)
+## Line format (send / read / wait)
 
 ```
-<port> <first_seq>-<last_seq> next=<cursor> more=<0|1>
+<port> <first_seq>-<last_seq> next=<cursor> more=<0|1>[ skipped=<n>][ dropped=<n>][ reset=1]
 <seq> <text>            received line (rx)
 <seq> ><text>           sent by the host (tx)
 <seq> #<text>           marker
-<seq> <text> (x12)      12 consecutive identical lines collapsed; seq is the first one
+<seq> <text> (x12)      12 adjacent identical lines collapsed; seq is the first one
 ```
 
-- Pass `next=` as `since` on the next `read` — you never see a line twice. An empty
-  result is `<port> empty next=<cursor> more=0`.
-- `more=1`: more lines are waiting (the `limit` was reached, or the 4000-char block cap
-  was hit); `read` again with `since=<next>`. No lines are lost or repeated.
-- No timestamps; ANSI escapes are stripped; lines over 240 chars become
-  `<first 240 chars>…+<dropped>`.
+- Pass `next=` as `since` next time — no line is shown twice. Empty: `<port> empty next=<cursor> more=0`.
+  seq is global across all ports, so `<first>-<last>` is a range, not a line count.
+- `more=1`: more lines wait (the `limit` or the 4000-char cap was hit); read again with
+  `since=<next>` — nothing is lost or repeated.
+- `skipped=<n>`: `read` without `since` and `wait` keep the newest lines; `n` were left out.
+- `dropped=<n>`: `n` lines after your cursor were evicted from the ring before you read them.
+- `reset=1`: `since` was beyond the buffer (e.g. daemon restarted, seq began again); the
+  latest lines are returned instead.
+- `search` header: `<port> hits=<n> more=<0|1>` (no `next=`: search is not a cursor read).
+- Collapse is for unfiltered blocks only. No timestamps; lines over 240 chars become `<240 chars>…+<n>`.
 
-Real output (`loop://` echoes what is written):
+Real output (`loop://` echoes what is written; the reply line was scripted):
 
 ```
-> send {"port":"console","data":"uname -a","wait":"uname"}
+> send {"port":"console","data":"uname -a","wait":"Linux"}
 sent 10B matched
-console 11-11 next=11 more=0
+console 11-12 next=12 more=0
 11 uname -a
+12 Linux dev 6.1.0
 ```
+
+## Prompts are not lines
+
+Default `framing: line` emits a line only at a line ending, so a bare prompt (`login: `,
+`# `) never appears and a `wait` for it times out. Wait for output lines, or set
+`framing: idle` (with `flush_ms`) on ports that drive interactive shells.
 
 ## Three ways to use it
 
 ### 1. MCP, lite profile
 
-`serialhub mcp --profile lite` registers exactly the six tools (same names, descriptions
-and schemas) and returns the same text. URL/token: `--url`/`--token`, else the
-`SERIALHUB_URL`/`SERIALHUB_TOKEN` environment variables. `.mcp.json`:
+`serialhub mcp --profile lite`: the same six tools and text (`error:` results flagged
+`isError` where the SDK keeps the text identical). `--url`/`--token`, else `SERIALHUB_URL`/`SERIALHUB_TOKEN`:
 
 ```json
 {
@@ -82,39 +90,31 @@ and schemas) and returns the same text. URL/token: `--url`/`--token`, else the
 }
 ```
 
-Run it from the repo or after `pip install -e .`; `--profile full` (default) is [`MCP.md`](MCP.md).
-
 ### 2. Your own loop: `tools` + `call`
 
 ```bash
 serialhub tools                    # Anthropic tool array, one line of JSON (no daemon needed)
-serialhub tools --format openai    # {"type":"function","function":{...}} entries
-serialhub call ports
 serialhub call send '{"port":"console","data":"help","wait":"ready"}'
 ```
 
-Unlike other subcommands there is **no** `{"ok":..}` envelope: `tools` prints a raw JSON
-array, `call` plain text (exit 1 on `error:`). From Python: `lite.to_anthropic()` /
+No `{"ok":..}` envelope here: `tools` prints a raw JSON array, `call` plain text (exit 1 on
+`error:`; URL from `--url`, else `SERIALHUB_URL`). From Python: `lite.to_anthropic()` /
 `lite.to_openai()` and `lite.call(Client(url, token), name, args)`.
 
 ### 3. The example agent
 
-[`examples/anthropic_agent.py`](../examples/anthropic_agent.py) (`pip install anthropic`):
-while `stop_reason == "tool_use"`, run each `tool_use` block through `lite.call()` and
-answer with a `tool_result` (`is_error` when the text starts with `error:`).
-
-```bash
-MODEL=<name> ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=x \
-  python examples/anthropic_agent.py "open port console and show the boot banner"
-```
+[`examples/anthropic_agent.py`](../examples/anthropic_agent.py) (`pip install anthropic`;
+env `MODEL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `SERIALHUB_URL`): each `tool_use`
+block goes through `lite.call()` and back as a `tool_result` (`is_error` on `error:`).
 
 ## System prompt snippet
 
 ```text
 You operate serial ports through serialhub tools. Start with ports.
-Output lines are '<seq> <text>'; '>' marks text you sent, '#' a marker.
-Each block header has next=N: pass N as since on your next read so you
-never re-read old lines. more=1 means call read again with that since.
-Use send with wait (a regex) to get a command's reply; use wait for later events.
-Results starting with 'error:' mean the call failed: fix the arguments, do not repeat it.
+Lines are '<seq> <text>'; '>' = sent by you, '#' = marker.
+Each block header has next=N: pass N as since next time so you never re-read lines;
+more=1 means read again with that since.
+Use send with wait (regex for the reply, not your echoed command); wait for later events.
+Wait for output lines, not a bare prompt (a prompt has no newline).
+On 'error:' fix the arguments; do not repeat the call.
 ```

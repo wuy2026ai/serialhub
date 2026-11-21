@@ -64,13 +64,13 @@ TOOLS: list[dict[str, Any]] = [
      "description": "List ports: name, open/closed, baud, device, last seq.",
      "input_schema": _obj({}, [])},
     {"name": "send",
-     "description": "Send a line to a port and return the device's reply lines.",
+     "description": "Send a line and return the reply lines (after 0.3 s of silence unless wait is set).",
      "input_schema": _obj({
          "port": _PORT,
          "data": _s("Text to send, without line ending"),
-         "wait": _s("Regex; stop when a reply line matches"),
+         "wait": _s("Regex for reply output, not the echoed command"),
          "timeout_ms": _i("Max wait in ms, default 3000"),
-         "eol": _s("Line ending, default crlf", enum=list(EOL_CHOICES)),
+         "eol": _s("Line ending; default: port setting", enum=list(EOL_CHOICES)),
      }, ["port", "data"])},
     {"name": "read",
      "description": "Read buffered lines after since, or the latest lines if since is omitted.",
@@ -86,10 +86,10 @@ TOOLS: list[dict[str, Any]] = [
          "port": _PORT,
          "regex": _s("Regex to wait for"),
          "timeout_ms": _i("Max wait in ms, default 10000"),
-         "since": _i("Also check lines after this seq"),
+         "since": _i("Pass previous next= to not miss lines"),
      }, ["port", "regex"])},
     {"name": "search",
-     "description": "Search the whole port buffer by regex.",
+     "description": "Search the whole port buffer by regex (does not move the cursor).",
      "input_schema": _obj({
          "port": _PORT,
          "regex": _s("Regex to search for"),
@@ -204,9 +204,26 @@ def _prefix(kind: str) -> str:
     return ">" if kind == KIND_TX else "#" if kind == KIND_MARK else ""
 
 
-def _block(port: str, entries: list[Entry], empty_next: int, more: bool = False) -> str:
-    """Render entries as the compact block (collapse, clip, 4000-char cap)."""
-    # group consecutive identical (kind, text): [first_seq, last_seq, kind, text, count]
+class _Rendered:
+    """Rendered line block: ``lines`` plus the seq range and trimming facts."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.first: Optional[int] = None
+        self.last: Optional[int] = None
+        self.capped = False     # keep="head": lines left out at the END
+        self.skipped = 0        # keep="tail": underlying lines left out at the FRONT
+
+
+def _render(entries: list[Entry], *, collapse: bool, keep: str = "head") -> _Rendered:
+    """Clip/collapse entries and apply the 4000-char cap.
+
+    ``keep="head"`` keeps the oldest lines (cursor continuation: ``more=1``);
+    ``keep="tail"`` keeps the newest lines and counts the trimmed front lines.
+    Collapsing merges only *adjacent* identical buffer lines, so it is used for
+    unfiltered blocks only (never for search hits or filtered reads).
+    """
+    # group: [first_seq, last_seq, kind, text, count]; None = separator
     groups: list[Optional[list[Any]]] = []
     for entry in entries:
         if entry is None:
@@ -216,7 +233,7 @@ def _block(port: str, entries: list[Entry], empty_next: int, more: bool = False)
         seq, kind, text = entry
         text = _clip(text)
         last = groups[-1] if groups else None
-        if last is not None and last[2] == kind and last[3] == text:
+        if collapse and last is not None and last[2] == kind and last[3] == text:
             last[1] = seq
             last[4] += 1
         else:
@@ -224,31 +241,55 @@ def _block(port: str, entries: list[Entry], empty_next: int, more: bool = False)
     while groups and groups[-1] is None:
         groups.pop()
 
-    out: list[str] = []
-    size = 0
-    first_seq: Optional[int] = None
-    last_seq: Optional[int] = None
-    for group in groups:
+    def show(group: Optional[list[Any]]) -> str:
         if group is None:
-            rendered = "--"
-        else:
-            seq, _end, kind, text, count = group
-            rendered = f"{seq} {_prefix(kind)}{text}" + (f" (x{count})" if count > 1 else "")
-        added = len(rendered) + (1 if out else 0)
+            return "--"
+        seq, _end, kind, text, count = group
+        return f"{seq} {_prefix(kind)}{text}" + (f" (x{count})" if count > 1 else "")
+
+    res = _Rendered()
+    kept: list[Optional[list[Any]]] = []
+    size = 0
+    order = groups if keep == "head" else list(reversed(groups))
+    for pos, group in enumerate(order):
+        added = len(show(group)) + (1 if kept else 0)
         if size + added > MAX_BLOCK_CHARS:
-            more = True
+            rest = order[pos:]
+            if keep == "head":
+                res.capped = True
+            else:
+                res.skipped = sum(g[4] for g in rest if g is not None)
             break
-        out.append(rendered)
+        kept.append(group)
         size += added
-        if group is not None:
-            first_seq = group[0] if first_seq is None else first_seq
-            last_seq = group[1]
-    if out and out[-1] == "--":
-        out.pop()
-    if last_seq is None:
-        return f"{port} empty next={empty_next} more={int(more)}"
-    header = f"{port} {first_seq}-{last_seq} next={last_seq} more={int(more)}"
-    return "\n".join([header, *out])
+    if keep != "head":
+        kept.reverse()
+    while kept and kept[0] is None:
+        kept.pop(0)
+    while kept and kept[-1] is None:
+        kept.pop()
+    res.lines = [show(g) for g in kept]
+    real = [g for g in kept if g is not None]
+    if real:
+        res.first, res.last = real[0][0], real[-1][1]
+    return res
+
+
+def _cursor_block(port: str, rendered: _Rendered, empty_next: int, more: bool = False,
+                  *, dropped: int = 0, reset: bool = False) -> str:
+    """``<port> <first>-<last> next=<cursor> more=<0|1>[ skipped=][ dropped=][ reset=1]``."""
+    more = more or rendered.capped
+    extra = ""
+    if rendered.skipped:
+        extra += f" skipped={rendered.skipped}"
+    if dropped:
+        extra += f" dropped={dropped}"
+    if reset:
+        extra += " reset=1"
+    if rendered.last is None:
+        return f"{port} empty next={empty_next} more={int(more)}{extra}"
+    header = f"{port} {rendered.first}-{rendered.last} next={rendered.last} more={int(more)}{extra}"
+    return "\n".join([header, *rendered.lines])
 
 
 def _entries(lines: list[dict[str, Any]]) -> list[Entry]:
@@ -279,25 +320,42 @@ def _tool_ports(client: Client, _a: dict[str, Any]) -> str:
 def _tool_read(client: Client, a: dict[str, Any]) -> str:
     port = a["port"]
     limit = _clamp(a.get("limit"), READ_LIMIT, 1, READ_LIMIT_MAX)
-    if "filter" in a:
-        _regex(a["filter"], "filter")
-    env = _ok(client.read(port, since_seq=a.get("since"), filter=a.get("filter"),
-                          limit=limit))
-    return _block(port, _entries(env.get("lines") or []),
-                  int(env.get("next_seq") or 0), bool(env.get("has_more")))
+    flt = a.get("filter")
+    if flt is not None:
+        _regex(flt, "filter")
+    since = a.get("since")
+    env = _ok(client.read(port, since_seq=since, filter=flt, limit=limit))
+    reset = False
+    last = env.get("last_seq")
+    if since is not None and last is not None and since > int(last):
+        # Stale cursor (e.g. the daemon restarted and seq began again): serve the tail.
+        env = _ok(client.read(port, filter=flt, limit=limit))
+        since, reset = None, True
+    keep = "tail" if since is None else "head"
+    rendered = _render(_entries(env.get("lines") or []), collapse=flt is None, keep=keep)
+    return _cursor_block(port, rendered, int(env.get("next_seq") or 0),
+                         bool(env.get("has_more")), dropped=int(env.get("dropped") or 0),
+                         reset=reset)
+
+
+def _is_echo(text: str, data: str) -> bool:
+    """A device echo of the command, optionally prompt-prefixed (``root@x:~# cmd``)."""
+    return bool(data) and strip_ansi(text).rstrip().endswith(data.rstrip())
 
 
 def _tool_send(client: Client, a: dict[str, Any]) -> str:
-    port = a["port"]
+    port, data = a["port"], a["data"]
     pat = _regex(a["wait"], "wait") if "wait" in a else None
     timeout = _clamp(a.get("timeout_ms"), SEND_TIMEOUT_MS, 0, SEND_TIMEOUT_MAX)
     pos = _last_seq(client, port)
-    sent = _ok(client.send(port, a["data"], eol=a.get("eol", "crlf")))
+    # eol omitted -> None -> the daemon applies the port's configured EOL.
+    sent = _ok(client.send(port, data, eol=a.get("eol")))
     start = time.monotonic()
     deadline = start + timeout / 1000.0
     last_new = start
     collected: list[dict[str, Any]] = []
     matched = extra = False
+    echo_pending = bool(data.strip())  # skip the first echoed command line when matching
     while True:
         env = _ok(client.read(port, since_seq=pos, kinds="rx", limit=SEND_POLL_BATCH))
         new = env.get("lines") or []
@@ -307,7 +365,11 @@ def _tool_send(client: Client, a: dict[str, Any]) -> str:
             last_new = now
             if pat is not None:
                 for idx, line in enumerate(new):
-                    if pat.search(strip_ansi(str(line.get("text") or ""))):
+                    text = str(line.get("text") or "")
+                    if echo_pending and _is_echo(text, data):
+                        echo_pending = False
+                        continue
+                    if pat.search(strip_ansi(text)):
                         collected.extend(new[:idx + 1])
                         extra = idx + 1 < len(new) or bool(env.get("has_more"))
                         matched = True
@@ -324,7 +386,8 @@ def _tool_send(client: Client, a: dict[str, Any]) -> str:
     head = f"sent {sent.get('sent_bytes', 0)}B"
     if pat is not None:
         head += " matched" if matched else " timeout"
-    return head + "\n" + _block(port, _entries(collected), pos, extra)
+    rendered = _render(_entries(collected), collapse=True)
+    return head + "\n" + _cursor_block(port, rendered, pos, extra)
 
 
 def _tool_wait(client: Client, a: dict[str, Any]) -> str:
@@ -333,12 +396,23 @@ def _tool_wait(client: Client, a: dict[str, Any]) -> str:
     timeout = _clamp(a.get("timeout_ms"), WAIT_TIMEOUT_MS, 0, WAIT_TIMEOUT_MAX)
     since = a["since"] if "since" in a else _last_seq(client, port)
     env = _ok(client.wait(port, a["regex"], timeout_ms=timeout, since_seq=since))
-    if env.get("matched") and env.get("line"):
-        return "matched\n" + _block(port, _entries([env["line"]]), since)
-    return "timeout\n" + _block(port, [], since)
+    line = env.get("line")
+    if not (env.get("matched") and line):
+        return "timeout\n" + _cursor_block(port, _Rendered(), since)
+    # Show every line in (since, match] so next= never skips unseen lines;
+    # over the cap, trim from the front so the matched line stays last.
+    match_seq = int(line["seq"])
+    got = _ok(client.read(port, since_seq=since))
+    lines = [ln for ln in got.get("lines") or [] if int(ln["seq"]) <= match_seq]
+    if not lines or int(lines[-1]["seq"]) != match_seq:
+        lines.append(line)  # evicted meanwhile: still show the match itself
+    rendered = _render(_entries(lines), collapse=True, keep="tail")
+    return "matched\n" + _cursor_block(port, rendered, match_seq,
+                                        dropped=int(got.get("dropped") or 0))
 
 
 def _tool_search(client: Client, a: dict[str, Any]) -> str:
+    """Search never moves the cursor: header is ``<port> hits=<n> more=<0|1>``."""
     port = a["port"]
     _regex(a["regex"], "search")
     limit = _clamp(a.get("limit"), SEARCH_LIMIT, 1, SEARCH_LIMIT_MAX)
@@ -362,7 +436,9 @@ def _tool_search(client: Client, a: dict[str, Any]) -> str:
         env_k = client.read(port, since_seq=lo - 1, kinds="tx,mark", limit=KIND_LOOKUP_MAX)
         kinds = {int(ln["seq"]): str(ln.get("kind")) for ln in env_k.get("lines") or []}
         entries = [e if e is None else (e[0], kinds.get(e[0], e[1]), e[2]) for e in entries]
-    return _block(port, entries, int(env.get("next_seq") or 0), len(hits) >= limit)
+    rendered = _render(entries, collapse=False)
+    more = len(hits) >= limit or rendered.capped
+    return "\n".join([f"{port} hits={len(hits)} more={int(more)}", *rendered.lines])
 
 
 def _tool_control(client: Client, a: dict[str, Any]) -> str:
