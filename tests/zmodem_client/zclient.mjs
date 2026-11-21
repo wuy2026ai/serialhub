@@ -20,12 +20,13 @@ import { Buffer } from "node:buffer";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import Zmodem from "zmodem.js";
-import { applyLrzszShim } from "./zmodem-shim.mjs";
+// Same file the browser UI loads (single source of truth); CommonJS → default import.
+import lrzszShim from "../../serialhub/static/vendor/zmodem-shim.js";
 
 const CHUNK = 8192;
 
-// lsz download fix for zmodem.js 0.1.10; see zmodem-shim.mjs.
-applyLrzszShim(Zmodem);
+// lsz download fix for zmodem.js 0.1.10; see serialhub/static/vendor/zmodem-shim.js.
+lrzszShim.applyLrzszShim(Zmodem);
 
 // After zmodem.js reports session_end, keep feeding the Sentry this long and
 // collect what it hands to to_terminal (device output after lsz's "OO", e.g.

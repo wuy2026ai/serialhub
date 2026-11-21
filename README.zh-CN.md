@@ -42,6 +42,7 @@
 | REST + WS | 每个 CLI 动作都有对应 REST 端点；`/ws` 推送实时行事件 |
 | Web UI | 深/浅色、多标签、ANSI 彩色、时间戳/序号、过滤/搜索、暂停/清屏、导出、发送栏、手动开/关端口 |
 | 引脚控制 | 每口用 `pins` 配置 DTR / RTS 驱动与 Reset 脉冲（**默认关闭**：此时守护完全不碰 DTR/RTS）；仅当该口 `pins.enabled: true` 时 Web UI 才显示该组控件 |
+| 文件传输 (rz/sz) | 在 Web UI 里做 ZMODEM 上传/下载（浏览器用 zmodem.js，设备用 lrzsz）；守护识别会话，只把原始字节转给接受它的那个浏览器，负载不进文本缓冲（每口 `zmodem`，默认开启） |
 | TCP 桥 | server（监听，客户端写=下发串口）/ client（连远端透传） |
 | CLI | 每个子命令输出**单行 JSON** `{"ok":true,"data":{...}}`，退出码 0/1 |
 | MCP | 18 个工具（stdio），让 agent 直接以工具调用操作串口 |
@@ -346,8 +347,11 @@ ui:
 | 开/关 | 端口头上的切换按钮（调用 `POST /api/ports/{name}/open` 或 `/close`，保留当前波特率）；请求进行中禁用，成功后刷新状态点、页签与顶部统计 |
 | 配置切换 | 顶栏 chip 显示当前生效配置文件（完整路径在 title 里）；输入路径点 **Switch** 即 `POST /api/reload {"config": …}` 运行时切换，**↻** 重读当前文件。切换可能增删端口，页签 / 面板 / 发送栏随后自动收敛 |
 | 引脚控制 | DTR / RTS 切换与 Reset 脉冲（脉冲序列）；仅当端口状态里 `pins.enabled` 为真时显示，否则隐藏 |
+| 上传 (rz) / 下载 (sz)… | 当前口的 ZMODEM 文件传输，见下 |
 
 > UI 通过 `/api/*` 与 `/ws` 工作；WS 首帧推 `hello`（端口概览），随后推 `line` / `status` / `mark` 事件。
+
+**文件传输（rz/sz）。** 设备上需要 lrzsz（`rz`/`sz`）。**上传 (rz)** 向当前口发送 `rz`；设备开始等待后，该口的对话框显示“设备正在等待文件”，点 **选择文件…** 选一个或多个文件。**下载 (sz)…** 先询问设备上的路径，再发送 `sz <路径>`；出现“设备正在发送文件”时点 **接收**，每个文件由浏览器保存。也可以自己在发送栏输入 `rz` / `sz 文件`：只要设备开始 ZMODEM 会话，对话框就会出现。须在 `zmodem_claim_ms`（5 秒）内接受，否则守护会中止。每个文件显示已传/总字节与速率；**取消** 会中止设备上的传输。一个会话只能由一个浏览器持有，其他标签页显示“传输已被另一个浏览器占用”。传输期间该口的文本输出暂停，发送栏返回 `409`；关闭或刷新页面会中止传输。
 
 > **Language / 语言**：Web UI 提供 `EN | 中文` 切换（选择会持久化）。后端消息依据 `SERIALHUB_LANG` 环境变量，否则依据 HTTP `Accept-Language` 头。新增语言的方法见 [`docs/I18N.md`](docs/I18N.md)。
 
@@ -712,6 +716,10 @@ python tools/mcp_smoke.py --full --tool-timeout 30         # 再跑 list_ports�
 # 单元/集成测试（入口见 pytest.ini 与 pyproject.toml，测试位于 tests/；当前 203 项全部通过）
 pip install -r requirements-dev.txt
 python -m pytest -q
+
+# 仿真测试（-m sim：socat + lrzsz + node）与浏览器测试（-m e2e：Playwright）；缺工具时 skip
+python -m playwright install chromium
+python -m pytest -q -m "sim or e2e"
 
 # MCP 协议自检（自写 stdio JSON-RPC 客户端，不需要守护）
 python tools/mcp_smoke.py

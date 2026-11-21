@@ -43,6 +43,7 @@ in a browser; both `python -m serialhub list` on the command line and MCP `wait_
 | REST + WS | Every CLI action has a matching REST endpoint; `/ws` pushes live line events |
 | Web UI | Dark/light, multi-tab, ANSI color, timestamps/seq, filter/search, pause/clear, export, send bar, manual port open/close |
 | Pin control | DTR / RTS drive plus a Reset pulse, configured per port via `pins` (**off by default**: the daemon then never touches DTR/RTS); the Web UI group appears only when a port reports `pins.enabled: true` |
+| File transfer (rz/sz) | ZMODEM upload/download from the Web UI (zmodem.js in the browser, lrzsz on the device); the daemon detects the session, relays raw bytes to the one browser that accepted it, and keeps payload out of the text buffer (per-port `zmodem`, on by default) |
 | TCP bridge | server (listen; client writes go down to the serial port) / client (dial a remote and relay) |
 | CLI | Every subcommand prints a **single line of JSON** `{"ok":true,"data":{...}}`, exit code 0/1 |
 | MCP | 18 tools (stdio) that let an agent drive the serial port through tool calls |
@@ -351,8 +352,11 @@ Open `http://127.0.0.1:8765/`. Dark by default, with a light toggle in the top-r
 | Open / Close | Toggle button on the port header (calls `POST /api/ports/{name}/open` or `/close`, keeping the current baud); it is disabled while the request is in flight, and on success the status dot, tab and top-bar stats refresh |
 | Config switch | Top-bar chip shows the active config file (full path in its title); type a path and press **Switch** to `POST /api/reload {"config": …}` at runtime, or **↻** to re-read the active file. A switch may add/remove ports, so tabs, panes and the send bar are reconciled afterwards |
 | Pin control | DTR / RTS toggles and a Reset pulse (pulse sequence), shown only when the port status reports `pins.enabled`; hidden otherwise |
+| Upload (rz) / Download (sz)… | ZMODEM file transfer on the active port, see below |
 
 > The UI works over `/api/*` and `/ws`; the first WS frame pushes `hello` (port overview), then it pushes `line` / `status` / `mark` events.
+
+**File transfer (rz/sz).** The device needs lrzsz (`rz`/`sz`). **Upload (rz)** sends `rz` to the active port; when the device starts waiting, the port's dialog says *Device is waiting for files* — click **Choose files…** and pick one or more files. **Download (sz)…** asks for a path on the device and sends `sz <path>`; on *Device is sending files* click **Receive** and each file is saved by the browser. You can also type `rz` / `sz file` in the send bar yourself: the dialog appears whenever the device starts a ZMODEM session. Accept within `zmodem_claim_ms` (5 s) or the daemon aborts it. Each file shows bytes / total and rate; **Cancel** aborts the transfer on the device. Only one browser can own a session — other tabs show *Transfer in use by another browser*. While a transfer runs, the port's text output pauses and the send bar returns `409`; closing or reloading the page aborts the transfer.
 
 > **Language / 语言**: the Web UI has an `EN | 中文` switcher (your choice is persisted). Backend messages follow the `SERIALHUB_LANG` environment variable, else the HTTP `Accept-Language` header. To add a language, see [`docs/I18N.md`](docs/I18N.md).
 
@@ -725,6 +729,10 @@ see [`examples/mcp_client.py`](examples/mcp_client.py) for runnable code.
 # Unit/integration tests (entries in pytest.ini and pyproject.toml; tests live in tests/; currently 203 pass)
 pip install -r requirements-dev.txt
 python -m pytest -q
+
+# Simulator tests (-m sim: socat + lrzsz + node) and the browser test (-m e2e: Playwright); both skip when tools are missing
+python -m playwright install chromium
+python -m pytest -q -m "sim or e2e"
 
 # MCP protocol self-check (hand-written stdio JSON-RPC client, no daemon needed)
 python tools/mcp_smoke.py

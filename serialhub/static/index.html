@@ -132,6 +132,17 @@
         <button class="btn" data-export="json"><span class="bx">&#8595;</span><span data-i18n="exportJson">json</span></button>
       </div>
 
+      <div class="tsep"></div>
+
+      <!-- ZMODEM file transfer on the active port (zmodem-ui.js): rz sends the
+           device "rz"; sz… asks for a device path in the pane's dialog first. -->
+      <div class="tgroup" data-i18n-title="zm.groupTitle" title="ZMODEM file transfer on this port">
+        <button class="btn" id="btnRz" type="button" data-i18n-title="zm.uploadTitle"
+                title="Run rz on the device and send it files from this browser"><span class="bx">&#8593;</span><span data-i18n="zm.uploadBtn">Upload (rz)</span></button>
+        <button class="btn" id="btnSz" type="button" data-i18n-title="zm.downloadTitle"
+                title="Run sz on the device and save its files in this browser"><span class="bx">&#8595;</span><span data-i18n="zm.downloadBtn">Download (sz)&hellip;</span></button>
+      </div>
+
       <div class="search-results" id="searchResults" hidden></div>
     </div>
 
@@ -242,11 +253,31 @@
       <div class="term-wrap">
         <div class="term-host"></div>
         <pre class="log-fallback" hidden></pre>
+        <!-- ZMODEM transfer dialog of this port; zmodem-ui.js owns its state
+             (data-phase / data-direction) and text. -->
+        <div class="zm-dialog" data-zm hidden role="dialog" data-i18n-aria="zm.dialogAria" aria-label="File transfer">
+          <div class="zm-head">
+            <span class="zm-ico" aria-hidden="true">&#8645;</span>
+            <span class="zm-title" data-zm-title></span>
+          </div>
+          <div class="zm-msg" data-zm-msg></div>
+          <div class="zm-path" data-zm-pathrow hidden>
+            <input class="zm-input" data-zm-path type="text" spellcheck="false" autocomplete="off"
+                   data-i18n-ph="zm.pathPh" data-i18n-aria="zm.pathAria"
+                   placeholder="path on the device, e.g. /tmp/log.bin" aria-label="Device path" />
+          </div>
+          <div class="zm-files" data-zm-files hidden></div>
+          <div class="zm-actions">
+            <button class="btn primary" type="button" data-zm-primary><span data-zm-primary-label></span></button>
+            <button class="btn" type="button" data-zm-cancel><span data-i18n="zm.cancel">Cancel</span></button>
+          </div>
+          <input type="file" multiple hidden data-zm-input />
+        </div>
       </div>
     </section>
   </template>
 
-  <!-- xterm.js core + fit addon: local vendor primary, CDN fallback.
+  <!-- xterm.js core + fit addon (+ zmodem.js): local vendor primary, CDN fallback.
        Only if BOTH sources fail do we set the __*Failed flags the app reads
        to enter degraded (plain-text) mode. app.js awaits these promises. -->
   <script>
@@ -273,6 +304,14 @@
       "/static/vendor/addon-fit.min.js",
       "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"
     ], "__fitFailed");
+    // zmodem.js (rz/sz in the browser), then serialhub's lrzsz shim, which
+    // patches window.Zmodem as soon as it runs. zmodem-ui.js awaits this.
+    window.__zmodemReady = loadFirst([
+      "/static/vendor/zmodem.min.js",
+      "https://cdn.jsdelivr.net/npm/zmodem.js@0.1.10/dist/zmodem.js"
+    ], "__zmodemFailed").then(function (ok) {
+      return ok && loadFirst(["/static/vendor/zmodem-shim.js"], "__zmodemFailed");
+    });
   })();
   </script>
 
@@ -292,6 +331,7 @@
   </script>
   <script src="/static/i18n/en.js"></script>
   <script src="/static/i18n/zh.js"></script>
+  <script src="/static/zmodem-ui.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

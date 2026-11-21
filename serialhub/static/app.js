@@ -1000,7 +1000,11 @@ function connectWS() {
     try { msg = JSON.parse(ev.data); } catch (_e) { return; }
     handleWsMessage(msg);
   });
-  ws.addEventListener("close", () => { setConn("idle", "connReconnecting"); scheduleReconnect(); });
+  ws.addEventListener("close", () => {
+    if (state.ws === ws && window.ZmodemUI) window.ZmodemUI.onDisconnect();
+    setConn("idle", "connReconnecting");
+    scheduleReconnect();
+  });
   ws.addEventListener("error", () => { setConn("error"); });
 }
 
@@ -1021,6 +1025,11 @@ function restartWS() {
   }
 }
 
+/* Send one JSON message on the live socket (no-op while disconnected). */
+function wsSend(obj) {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
+}
+
 function handleWsMessage(msg) {
   if (!msg || typeof msg !== "object") return;
   if (msg.ok === false && msg.error === "unauthorized") {
@@ -1034,6 +1043,12 @@ function handleWsMessage(msg) {
     case "status": onStatus(msg); break;
     case "mark": onMark(msg.port, msg); break;
     case "pong": break;
+    // ZMODEM: broadcasts (start/end) + this connection's session relay
+    case "zmodem": if (window.ZmodemUI) window.ZmodemUI.onBroadcast(msg); break;
+    case "zmodem_claimed": if (window.ZmodemUI) window.ZmodemUI.onClaimed(msg); break;
+    case "zmodem_data": if (window.ZmodemUI) window.ZmodemUI.onData(msg); break;
+    case "zmodem_closed": if (window.ZmodemUI) window.ZmodemUI.onClosed(msg); break;
+    case "zmodem_error": if (window.ZmodemUI) window.ZmodemUI.onError(msg); break;
     default: break;
   }
 }
@@ -1239,6 +1254,13 @@ function send() {
   const eol = $("#sendEol").value;
   api("POST", `/api/ports/${encodeURIComponent(name)}/send`, { body: { data, eol } })
     .then((r) => { if (r.ok) { pushHistory(data); input.value = ""; } });
+}
+/* Send a device command (rz / sz <path>) to `name` with the sendbar's line
+   ending (CRLF when it is set to "none" — the device must see a line). */
+function sendCommand(name, text) {
+  const sel = $("#sendEol").value;
+  const eol = sel === "none" ? "crlf" : sel;
+  return api("POST", `/api/ports/${encodeURIComponent(name)}/send`, { body: { data: text, eol } });
 }
 function pushHistory(data) {
   state.sendHistory = state.sendHistory.filter((h) => h !== data);
@@ -1581,6 +1603,14 @@ async function init() {
   $("#btnAuto").classList.toggle("on", state.autoscroll);
   $("#btnTs").classList.toggle("on", state.timestamp);
   bindUI();
+  if (window.ZmodemUI) {
+    window.ZmodemUI.init({
+      wsSend, sendCommand, t, toast,
+      paneFor: (name) => { const rt = state.runtimes.get(name); return rt ? rt.pane : null; },
+      activePort: () => $("#sendPort").value || state.active,
+      wsBuffered: () => (state.ws ? state.ws.bufferedAmount : 0),
+    });
+  }
 
   await loadConfig();
   updateEmptyState();

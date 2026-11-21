@@ -24,3 +24,4 @@ Tip: use stable names like `/dev/serial/by-id/usb-...` for `device:`. For start 
 - With `--host 0.0.0.0` anyone on the network can use the ports; set `token:` in the yaml to require auth, and allow 8765/8766 in the firewall.
 - CLI against one instance: `serialhub --url http://127.0.0.1:8766 read com-b --limit 20`
 - `demo/` has `loop://` versions (no hardware) for a quick test.
+- File transfer: install lrzsz on the device, then use **Upload (rz)** / **Download (sz)…** in the Web UI toolbar.

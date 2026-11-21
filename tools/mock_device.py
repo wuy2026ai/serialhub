@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -125,7 +126,12 @@ class MockDevice:
         elif cmd == "rz":
             self._transfer(("lrz", "rz"), [], self.recv_dir, "rz")
         elif cmd == "sz":
-            self._transfer(("lsz", "sz"), rest.split(), self.files_dir, "sz")
+            try:
+                args = shlex.split(rest)  # 像 shell 一样处理引号（文件名可含空格）
+            except ValueError as exc:
+                self.write_line(f"ERR sz: {exc}")
+                return
+            self._transfer(("lsz", "sz"), args, self.files_dir, "sz")
         else:
             self.write_line(f"ERR unknown: {line.strip()}")
 

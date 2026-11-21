@@ -615,8 +615,12 @@ worker 在摘除会话的同一 `_zm_lock` 临界区里把 `tail` + 队列中尚
 
 **zmodem.js（0.1.10）与 lrzsz 的兼容垫片**：`lsz` 每个文件的第一个 ZDATA 子包以 ZCRCW 结尾并等 ZACK，
 随后发新的 ZDATA 头；zmodem.js 只对 ZCRCQ 回 ZACK、ZDATA 帧后只接受 ZEOF，下载会在 1024 字节处卡住。
-补丁在 `tests/zmodem_client/zmodem-shim.mjs`（无依赖的 ES 模块，`applyLrzszShim(Zmodem)`：回 ZACK 并接受下一个
-ZDATA 头），zclient 与浏览器 UI 共用。浏览器 UI 还须像 zclient 一样：zmodem.js 报 `session_end` 后继续喂 Sentry
+补丁在 `serialhub/static/vendor/zmodem-shim.js`（serialhub 自写、无依赖，`applyLrzszShim(Zmodem)`：回 ZACK 并接受下一个
+ZDATA 头），唯一一份：浏览器以普通 `<script>` 加载（在 `zmodem.min.js` 之后，立即给 `window.Zmodem` 打补丁），
+zclient.mjs 以 CommonJS 导入同一文件。补丁还处理 lsz 在 ZFIN 之后不发 `OO` 就退出的情况（0 字节文件时常见；
+zmodem.js 原样会对设备的下一行抛 “Only thing after ZFIN should be OO”）：ZFIN 之后的非 `OO` 输入直接结束会话并作为
+会话外字节交回（进 `tail_b64`），重复的 ZFIN 头照常应答，完全没有输入则 1 s 后结束——与 lrz 一样把 `OO` 视为可选。
+回归测试 `tests/integration/test_zmodem_shim.py`（`tests/zmodem_client/shim_check.mjs` 重放抓到的 lsz 字节）。浏览器 UI 还须像 zclient 一样：zmodem.js 报 `session_end` 后继续喂 Sentry
 约 200 ms，收集 `to_terminal` 字节，随 `zmodem_end` 的 `tail_b64` 交回。
 
 **测试客户端**：`tests/zmodem_client/zclient.mjs`（Node，依赖锁在 `package-lock.json`，`node_modules/` 不入库；
