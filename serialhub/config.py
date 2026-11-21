@@ -50,8 +50,13 @@ _PORT_FIELDS = {
     "dtr", "rts", "eol", "encoding", "reconnect_ms", "reconnect_max_ms",
     "flush_ms", "framing", "pins", "buffer_lines", "buffer_bytes", "autostart",
     "tcp_bridge", "description", "match",
-    "zmodem", "zmodem_claim_ms", "zmodem_idle_ms",
+    "zmodem", "zmodem_claim_ms", "zmodem_idle_ms", "zmodem_cleanup_eol",
 }
+
+#: ``zmodem_cleanup_eol`` 的合法取值：非干净结束后，非浏览器客户端（zsend/zrecv）写给设备
+#: 冲掉其输入行缓冲的行结束符（``ctrl-u-cr`` = 先 ^U 清行再 CR；``none`` = 不写）。
+ZMODEM_CLEANUP_EOLS = {"cr": b"\r", "lf": b"\n", "crlf": b"\r\n", "ctrl-u-cr": b"\x15\r",
+                       "none": b""}
 
 #: match 规格里允许出现的键（与 discovery.MATCH_KEYS 同源）。
 _VALID_MATCH_KEYS = set(MATCH_KEYS)
@@ -103,6 +108,8 @@ class PortConfig:
     zmodem: bool = True
     zmodem_claim_ms: int = 5000    # 会话开始后这么久无人认领 → 中止（unclaimed）
     zmodem_idle_ms: int = 15000    # 会话内双向都无字节这么久 → 中止（timeout）
+    # zsend/zrecv 非干净结束后写给设备的行结束符（见 ZMODEM_CLEANUP_EOLS）
+    zmodem_cleanup_eol: str = "cr"
 
 
 @dataclass
@@ -328,6 +335,7 @@ def _validate_port(pc: PortConfig, path_label: str) -> None:
     pc.pins = normalize_pins(pc.pins, f"{path_label}.pins")
     pc.zmodem_claim_ms = _as_int(pc.zmodem_claim_ms, f"{path_label}.zmodem_claim_ms")
     pc.zmodem_idle_ms = _as_int(pc.zmodem_idle_ms, f"{path_label}.zmodem_idle_ms")
+    pc.zmodem_cleanup_eol = str(pc.zmodem_cleanup_eol).lower()
 
     if pc.data_bits not in _VALID_DATA_BITS:
         raise ValueError(f"{path_label}.data_bits must be one of {sorted(_VALID_DATA_BITS)}, got {pc.data_bits!r}")
@@ -357,6 +365,9 @@ def _validate_port(pc: PortConfig, path_label: str) -> None:
         raise ValueError(f"{path_label}.zmodem_claim_ms must be > 0, got {pc.zmodem_claim_ms!r}")
     if pc.zmodem_idle_ms <= 0:
         raise ValueError(f"{path_label}.zmodem_idle_ms must be > 0, got {pc.zmodem_idle_ms!r}")
+    if pc.zmodem_cleanup_eol not in ZMODEM_CLEANUP_EOLS:
+        raise ValueError(f"{path_label}.zmodem_cleanup_eol must be one of "
+                         f"{sorted(ZMODEM_CLEANUP_EOLS)}, got {pc.zmodem_cleanup_eol!r}")
     if not pc.name:
         raise ValueError(f"{path_label}.name must be non-empty")
     if not pc.device and not pc.match:
@@ -486,4 +497,5 @@ def _port_to_dict(pc: PortConfig) -> dict:
         "zmodem": pc.zmodem,
         "zmodem_claim_ms": pc.zmodem_claim_ms,
         "zmodem_idle_ms": pc.zmodem_idle_ms,
+        "zmodem_cleanup_eol": pc.zmodem_cleanup_eol,
     }

@@ -635,21 +635,24 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 ### 5.19 `zmodem_send`
 
 经 **ZMODEM** 向设备上传文件。工具会自己发送 `rz`（不要另外 `send`），等守护识别出 ZMODEM 会话后经 `/ws`
-认领，并在 **MCP 服务器进程里**运行纯 Python 的 ZMODEM 引擎——因此 `paths` 是运行 MCP 服务器的那台机器上的
+认领，并在 **MCP 服务器进程里**运行纯 Python 的 ZMODEM 引擎——因此 `path` 是运行 MCP 服务器的那台机器上的
 文件，守护可以在远端。
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `port` | str | 是 | 逻辑端口名 |
-| `paths` | list[str] | 二选一 | 本地文件路径 |
-| `content` | str | 二选一 | 代替 `paths` 的文件内容（解码后 ≤ 1 MiB） |
+| `path` | list[str]（或 str） | 二选一 | 本地文件路径 |
+| `content` | str | 二选一 | 代替 `path` 的文件内容（解码后 ≤ 1 MiB） |
 | `name` | str | 配合 `content` | 设备上的文件名（只取 basename） |
 | `encoding` | str | 否 | `content` 的编码：`text`（UTF-8，默认）或 `base64` |
+| `overwrite` | bool | 否 | 请接收方覆盖已存在的文件（ZMCLOB），默认 true |
 | `cmd` | str | 否 | 设备命令，默认 `rz`；`""` = 设备已在等待 |
-| `timeout_ms` | int | 否 | 总超时，默认 120000，最大 1800000 |
+| `timeout_ms` | int | 否 | 总超时；默认自动（`字节×10/波特率×1.5 + 30 s`），最大 1800000 |
 
 返回：`{files: [{name, bytes, crc32, seconds, skipped}], text}`——`crc32` 是文件字节的 CRC-32（8 位大写十六进制），
-`text` 是 lite 风格的每文件一行摘要（`sent <name> <bytes>B crc=<CRC32> in <s>s`）。
+`text` 是 lite 风格的每文件一行摘要（`sent <name> <bytes>B crc=<CRC32> in <s>s`）。失败时
+`{ok:false, error, files, text}`——`files` 列出失败前已传完的文件。任何失败后客户端都会收拾设备 shell（必要时写一次
+中止序列，再写该口的 `zmodem_cleanup_eol`）。
 
 ### 5.20 `zmodem_receive`
 
@@ -658,17 +661,18 @@ profile、验证步骤、踩坑与撤销的完整过程见 [`DSH.zh-CN.md`](DSH.
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `port` | str | 是 | 逻辑端口名 |
-| `remote` | list[str] | 是 | 设备上的文件名；`cmd` 里的 `{remote}` = 这些名字以空格连接 |
-| `dir` | str | 否 | 本地目录（不存在则创建），默认 `.` |
+| `remote` | list[str]（或 str） | 是 | 设备上的文件名；`cmd` 里的 `{remote}` = 这些名字以空格连接 |
+| `dir` | str | 否 | 本地目录（不存在则创建）；默认当前目录（可写时），否则系统临时目录 |
 | `inline` | bool | 否 | 同时把文本文件内容放进 `text`（上限 4000 字符） |
 | `cmd` | str | 否 | 设备命令，默认 `sz {remote}`；`""` = 不发 |
 | `overwrite` | bool | 否 | 覆盖已存在的文件，而不是另存为 `name.1`、`name.2`…… |
-| `timeout_ms` | int | 否 | 总超时，默认 120000，最大 1800000 |
+| `timeout_ms` | int | 否 | 总超时；默认自动（设备每宣布一个文件大小就相应延长），最大 1800000 |
 
 返回：`{files: [{name, bytes, crc32, path}], missing[], refused[], text}`。设备给出的文件名只取 basename，
 文件绝不会落到 `dir` 之外；先写临时名、完整后再改名，失败时删除残缺文件。10 秒内没有会话 →
 `error: device did not start ZMODEM; device said: <最后几行>`；lrzsz 的 `sz` 遇到不存在的文件 →
-`error: device sent no file; device said: sz done rc=…`；会话已被浏览器占用 → 明确的 `claimed by another client` 错误。
+`error: device sent no file (missing/unreadable remote file?); device said: sz done rc=…`；会话已被浏览器占用 →
+明确的 `claimed by another client … retry in ~5 s` 错误。保存路径总是绝对路径。
 
 ---
 

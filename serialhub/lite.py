@@ -63,8 +63,16 @@ def _i(desc: str) -> dict[str, Any]:
 
 
 def _names(desc: str) -> dict[str, Any]:
-    """One string or an array of strings."""
-    return {"type": ["string", "array"], "items": {"type": "string"}, "description": desc}
+    """An array of strings (a bare string is accepted at runtime and wrapped).
+
+    Declared as a plain ``array``: ``"type": ["string", "array"]`` is rejected by Gemini /
+    OpenAPI-subset and some strict OpenAI-compatible servers.
+    """
+    return {"type": "array", "items": {"type": "string"}, "description": desc}
+
+
+def _b(desc: str) -> dict[str, Any]:
+    return {"type": "boolean", "description": desc}
 
 
 _PORT = _s("Port name")
@@ -116,26 +124,27 @@ TOOLS: list[dict[str, Any]] = [
          "label": _s("Marker text (mark only)"),
      }, ["port", "action"])},
     {"name": "zsend",
-     "description": "Upload file(s) to the device by ZMODEM; runs rz there itself (don't send rz).",
+     "description": "Upload files to the device (ZMODEM); runs rz itself, don't send rz.",
      "input_schema": _obj({
          "port": _PORT,
-         "path": _names("Local file path(s); or use content+name"),
-         "content": _s("File body to upload instead of path"),
-         "name": _s("Device file name for content"),
-         "encoding": _s("content encoding, default text", enum=["text", "base64"]),
+         "path": _names("Local file paths, or content+name"),
+         "content": _s("File body instead of path"),
+         "name": _s("Device name for content"),
+         "encoding": _s("Default text", enum=["text", "base64"]),
+         "overwrite": _b("Replace existing file; default true"),
          "cmd": _s('Device command, default "rz"; "" = none'),
-         "timeout_ms": _i("Max ms, default 120000"),
+         "timeout_ms": _i("Default: auto from size and baud"),
      }, ["port"])},
     {"name": "zrecv",
-     "description": "Download file(s) from the device by ZMODEM; runs sz there itself "
-                    "(don't send sz). Saves to dir.",
+     "description": "Download device files (ZMODEM) into dir; runs sz itself, don't send sz.",
      "input_schema": _obj({
          "port": _PORT,
-         "remote": _names("Device file name(s)"),
+         "remote": _names("Device file names"),
          "dir": _s("Local directory, default ."),
-         "inline": {"type": "boolean", "description": "Also return text file content"},
+         "inline": _b("Also return text content"),
+         "overwrite": _b("Replace existing file; default false"),
          "cmd": _s('Device command, default "sz {remote}"'),
-         "timeout_ms": _i("Max ms, default 120000"),
+         "timeout_ms": _i("Default: auto from size and baud"),
      }, ["port", "remote"])},
 ]
 
@@ -181,7 +190,7 @@ def _validate(name: str, args: Any) -> dict[str, Any]:
         if value is None:
             continue
         spec = props[key]
-        if isinstance(spec["type"], list):  # ["string", "array"]: one name or a list
+        if spec["type"] == "array":  # a list of names; a bare string counts as one
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 value = str(value)
             if isinstance(value, str):
@@ -520,16 +529,18 @@ def _tool_zsend(client: Client, a: dict[str, Any]) -> str:
         raise LiteError("name goes with content; with path the local file name is used")
     return zc.zsend(client.base_url, client.token, a["port"], a.get("path") or [],
                     contents=contents, cmd=a.get("cmd", "rz"),
-                    timeout_ms=zc.clamp_timeout(a.get("timeout_ms")))
+                    timeout_ms=zc.clamp_timeout(a.get("timeout_ms")),
+                    overwrite=a.get("overwrite", True))
 
 
 def _tool_zrecv(client: Client, a: dict[str, Any]) -> str:
     from . import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
 
     return zc.zrecv(client.base_url, client.token, a["port"], a["remote"],
-                    os.path.expanduser(a.get("dir") or "."), cmd=a.get("cmd"),
+                    os.path.expanduser(a["dir"]) if a.get("dir") else None, cmd=a.get("cmd"),
                     timeout_ms=zc.clamp_timeout(a.get("timeout_ms")),
-                    inline=bool(a.get("inline")), cap=MAX_BLOCK_CHARS)
+                    overwrite=bool(a.get("overwrite")), inline=bool(a.get("inline")),
+                    cap=MAX_BLOCK_CHARS)
 
 
 _HANDLERS: dict[str, Callable[[Client, dict[str, Any]], str]] = {

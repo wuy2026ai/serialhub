@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 import time
 
 import pytest
@@ -84,9 +85,9 @@ def _spy_writes(hub) -> list[bytes]:
     real = worker._write_raw
     written: list[bytes] = []
 
-    def spy(data: bytes) -> int:
+    def spy(data: bytes, **kw) -> int:
         written.append(bytes(data))
-        return real(data)
+        return real(data, **kw)
 
     worker._write_raw = spy  # type: ignore[method-assign]
     return written
@@ -569,3 +570,33 @@ def test_queue_bytes_consumed_by_reader_do_not_count(zhub, monkeypatch) -> None:
     assert zhub.zmodem_status("z")["active"] is True
     assert q.queued_bytes == 0
     assert len(got) == len(ZRQINIT) + 3000
+
+
+@pytest.mark.parametrize("value", ["cr", "lf", "crlf", "ctrl-u-cr", "none", "CRLF"])
+def test_cleanup_eol_config(make_config, value) -> None:
+    cfg = make_config(ports=[_port(zmodem_cleanup_eol=value)])
+    assert cfg.port("z").zmodem_cleanup_eol == value.lower()
+    assert cfg.to_dict()["ports"][0]["zmodem_cleanup_eol"] == value.lower()
+
+
+def test_cleanup_eol_default_and_validation(make_config) -> None:
+    assert make_config(ports=[_port()]).port("z").zmodem_cleanup_eol == "cr"
+    with pytest.raises(ValueError, match=r"zmodem_cleanup_eol"):
+        make_config(ports=[_port(zmodem_cleanup_eol="tab")])
+
+
+def test_abort_seq_is_written_without_tcdrain(hub_factory, make_config) -> None:
+    """The read loop writes ABORT_SEQ itself on a deadline (here: unclaimed); it must not wait
+    in tcdrain for a peer that may itself be blocked writing to us (seen with socat + a chatty
+    shell): a deadlock of the read loop."""
+    hub = hub_factory(make_config(ports=[_port(zmodem_claim_ms=200)]))
+    worker = hub._require_worker("z")
+    ser = worker._serial
+    flushes: list = []
+    real_flush = ser.flush
+    ser.flush = lambda: (flushes.append(threading.current_thread() is worker._loop_thread),
+                         real_flush())[1]
+    hub.write_bytes("z", b"rz\r" + ZRQINIT)
+    assert _until(lambda: hub.zmodem_status("z")["active"])
+    assert _until(lambda: not hub.zmodem_status("z")["active"], timeout=5)
+    assert True not in flushes, flushes

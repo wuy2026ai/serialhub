@@ -28,6 +28,13 @@ defaults:
   buffer_lines: 20000    # 每口环形缓冲保留的最大行数
   buffer_bytes: 8388608  # 每口环形缓冲保留的最大字节数（8 MiB）
   autostart: true        # 守护进程启动时是否立即打开
+  # ---- ZMODEM（rz/sz）----
+  # zmodem: true / zmodem_claim_ms: 5000 / zmodem_idle_ms: 15000 为缺省值。
+  # zsend/zrecv（agent/CLI）传输非干净结束（设备取消、超时、出错）后，先等设备安静，再写这个
+  # 行结束符冲掉设备输入行缓冲里的残留字节，然后丢弃 shell 对它的回应：
+  #   cr（默认）| lf | crlf | ctrl-u-cr（先 ^U 清行再回车）| none（不写）
+  # ⚠ U-Boot 风格的 shell 在空行上会重复上一条命令：这类设备用 ctrl-u-cr 或 none。
+  zmodem_cleanup_eol: cr
   # ---- 引脚控制（DTR/RTS）----
   # 默认关闭（enabled: false）。关闭时 worker 任何时刻都不调用 setDTR/setRTS（含 open
   # 时），因此上面的 dtr/rts 也不生效；所有运行时引脚 API（REST/CLI/MCP）都以

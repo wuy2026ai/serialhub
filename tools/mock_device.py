@@ -4,7 +4,11 @@
 用法::
 
     python tools/mock_device.py --device PATH [--baud 115200] [--name dev]
-        [--interval 0.5] [--files-dir DIR] [--recv-dir DIR]
+        [--interval 0.5] [--files-dir DIR] [--recv-dir DIR] [--rz-kill-after SECONDS]
+
+命令：``ping`` / ``echo TEXT`` / ``stream on|off`` / ``ls`` / ``rz [ARGS]``（无参数 = ``lrz -y``，
+否则原样把 ARGS 交给 lrz，如 ``rz -v`` 不覆盖已存在文件）/ ``sz FILE...``。
+``--rz-kill-after`` 让 lrz 在启动这么多秒后被 SIGTERM（lrz 随即发 CAN 退出），模拟传输中途被取消。
 
 PKT 行格式（CRLF 结尾）::
 
@@ -53,12 +57,13 @@ def _find(*names: str) -> str | None:
 
 class MockDevice:
     def __init__(self, ser: serial.Serial, name: str, interval: float,
-                 files_dir: str, recv_dir: str) -> None:
+                 files_dir: str, recv_dir: str, rz_kill_after: float = 0.0) -> None:
         self.ser = ser
         self.name = name
         self.interval = interval
         self.files_dir = files_dir
         self.recv_dir = recv_dir
+        self.rz_kill_after = rz_kill_after
         self.lock = threading.Lock()      # 保护所有写
         self.stream = threading.Event()   # 置位 = 允许周期包
         self.stream.set()
@@ -96,13 +101,28 @@ class MockDevice:
             was_blocking = os.get_blocking(fd)
             os.set_blocking(fd, True)
             try:
-                cmd = [exe, *args] if label == "sz" else [exe, "-y"]
-                rc = subprocess.call(cmd, stdin=fd, stdout=fd,
-                                     stderr=subprocess.DEVNULL, cwd=cwd)
+                cmd = [exe, *args] if label == "sz" or args else [exe, "-y"]
+                proc = subprocess.Popen(cmd, stdin=fd, stdout=fd,
+                                        stderr=subprocess.DEVNULL, cwd=cwd)
+                killer = None
+                if label == "rz" and self.rz_kill_after > 0:
+                    killer = threading.Timer(self.rz_kill_after, proc.terminate)
+                    killer.start()
+                rc = proc.wait()
+                killed = bool(killer) and not killer.is_alive() and rc != 0
+                if killer:
+                    killer.cancel()
             finally:
                 os.set_blocking(fd, was_blocking)
                 if was_streaming:          # 恢复传输前的 stream 状态
                     self.stream.set()
+            if killed:
+                # 被杀的 rz 留下的在途数据：像真实 UART 那样照收不阻塞，但不当命令执行——
+                # 读到连续 300 ms 无数据为止并丢弃（否则仿真里 mock 会逐行回显这些二进制垃圾）
+                quiet = time.monotonic()
+                while time.monotonic() - quiet < 0.3:
+                    if self.ser.read(4096):
+                        quiet = time.monotonic()
             self.ser.write(f"{label} done rc={rc}\r\n".encode())
             # 同时打到 stdout：中止后这行可能落在宿主的排空窗口里被丢弃，测试据此确认退出码
             print(f"{label} done rc={rc}", flush=True)
@@ -124,7 +144,12 @@ class MockDevice:
             for f in sorted(os.listdir(self.recv_dir)):
                 self.write_line(f)
         elif cmd == "rz":
-            self._transfer(("lrz", "rz"), [], self.recv_dir, "rz")
+            try:
+                args = shlex.split(rest)
+            except ValueError as exc:
+                self.write_line(f"ERR rz: {exc}")
+                return
+            self._transfer(("lrz", "rz"), args, self.recv_dir, "rz")
         elif cmd == "sz":
             try:
                 args = shlex.split(rest)  # 像 shell 一样处理引号（文件名可含空格）
@@ -133,7 +158,7 @@ class MockDevice:
                 return
             self._transfer(("lsz", "sz"), args, self.files_dir, "sz")
         else:
-            self.write_line(f"ERR unknown: {line.strip()}")
+            self.write_line(f"ERR unknown: {line.strip()[:60]}")  # 像 shell：只回显开头
 
     def run(self) -> None:
         threading.Thread(target=self._packets, daemon=True).start()
@@ -165,10 +190,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--interval", type=float, default=0.5)
     ap.add_argument("--files-dir", default=".")
     ap.add_argument("--recv-dir", default=".")
+    ap.add_argument("--rz-kill-after", type=float, default=0.0)
     a = ap.parse_args(argv)
     ser = serial.Serial(a.device, a.baud, timeout=0.05)
     try:
-        MockDevice(ser, a.name, a.interval, a.files_dir, a.recv_dir).run()
+        MockDevice(ser, a.name, a.interval, a.files_dir, a.recv_dir, a.rz_kill_after).run()
     except KeyboardInterrupt:
         pass
     finally:

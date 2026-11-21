@@ -11,10 +11,10 @@ Compact JSON of name + description + input schema per tool (a test keeps lite �
 | interface | tools | chars |
 |---|---|---|
 | full MCP profile (`mcp_server.py`) | 20 | 18,244 |
-| lite, Anthropic format (`serialhub tools`) | 8 | 4,107 |
-| lite, OpenAI format (`serialhub tools --format openai`) | 8 | 4,339 |
+| lite, Anthropic format (`serialhub tools`) | 8 | 4,192 |
+| lite, OpenAI format (`serialhub tools --format openai`) | 8 | 4,424 |
 
-The six serial tools alone are 2,648 chars; `zsend` + `zrecv` add 1,459.
+The six serial tools alone are 2,648 chars; `zsend` + `zrecv` add 1,544.
 
 ## The eight tools
 
@@ -26,8 +26,8 @@ The six serial tools alone are 2,648 chars; `zsend` + `zrecv` add 1,459.
 | `wait` | `port`, `regex`, `timeout_ms?` (10000, max 120000), `since?` | `matched` + every line up to the match, or `timeout` |
 | `search` | `port`, `regex`, `limit?` (20, max 100), `context?` (0-5) | hits over the whole buffer; windows separated by `--`; **does not move the cursor** |
 | `control` | `port`, `action` (`open`\|`close`\|`clear`\|`mark`), `baud?`, `label?` | `open 115200` / `closed` / `cleared 12` / `mark 345` |
-| `zsend` | `port`; `path` (local path or array) **or** `content` + `name` (`encoding?`: `text` default, or `base64`); `cmd?` (`rz`; `""` = none); `timeout_ms?` (120000, max 1800000) | one line per file: `sent <name> <bytes>B crc=<CRC32> in <s>s` |
-| `zrecv` | `port`, `remote` (device name or array), `dir?` (`.`), `inline?` (false), `cmd?` (`sz {remote}`), `timeout_ms?` (same) | one line per file: `received <name> <bytes>B crc=<CRC32> -> <saved path>`; with `inline`, `--- <name>` + content for each text file |
+| `zsend` | `port`; `path` (array of local paths; a bare string is accepted) **or** `content` + `name` (`encoding?`: `text` default, or `base64`); `overwrite?` (true); `cmd?` (`rz`; `""` = none); `timeout_ms?` (auto, max 1800000) | one line per file: `sent <name> <bytes>B crc=<CRC32> in <s>s` |
+| `zrecv` | `port`, `remote` (array of device names; a bare string is accepted), `dir?` (cwd if writable, else temp), `inline?` (false), `overwrite?` (false), `cmd?` (`sz {remote}`), `timeout_ms?` (auto) | one line per file: `received <name> <bytes>B crc=<CRC32> -> <absolute path>`; with `inline`, `--- <name>` + content for each text file |
 
 - `send` collects **rx** lines after the write until `wait` matches, or (no `wait`) 300 ms
   of silence, or `timeout_ms`. `wait` ignores the first rx line ending with `data` (the
@@ -47,38 +47,78 @@ remote). The tools send `rz` / `sz <remote>` themselves — do not `send` them f
 
 - `zsend`: exactly one of `path` / `content`. `content` is the file body written by the
   model (UTF-8 text, or `encoding: "base64"`), at most 1 MiB decoded; `name` is reduced to a
-  basename. `cmd: ""` when the device is already waiting in `rz`.
-- `zrecv` always saves into `dir` (created if missing), only under the basename the device
-  sent; an existing file is kept and the new one saved as `name.1`, `name.2`, … Files land
-  under a temporary name and are renamed when complete; partial files are removed on failure.
-  `{remote}` in `cmd` is the names joined by spaces (quoted when they contain spaces).
-- `inline: true` appends the content of files that are UTF-8 text without NUL bytes; binary
-  files get ` (binary, not shown)` on their line. Inline content is capped at 4000 chars per
-  reply; a cut file ends with `…+<n> chars, full file at <saved path>`.
+  basename. `cmd: ""` when the device is already waiting in `rz`. `overwrite` (default true)
+  asks the receiver to replace an existing file (ZMODEM `ZMCLOB`); if it still refuses, the
+  line is `skipped <name>: device refused it (already exists? try cmd "rz -y")`, and a reply
+  where nothing was sent starts with `error: nothing was sent`.
+- `zrecv` always saves into `dir` (created if missing; default: the current directory when
+  writable, else the system temp directory), only under the basename the device sent (names
+  with `:`, Windows device names like `CON`/`COM1`, or trailing dots/spaces are refused); an
+  existing file is kept and the new one saved as `name.1`, `name.2`, … unless `overwrite`.
+  Files land under a temporary name and are renamed when complete; partial files are removed
+  on failure. Saved paths are always absolute. `{remote}` in `cmd` is the names joined by
+  spaces (quoted when they contain spaces).
+- `inline: true` appends the content of text files (first 64 KiB, no NUL, fewer than 5 %
+  undecodable bytes — shown with replacement characters); other files get
+  ` (binary, not shown)` on their line. Inline content is capped at 4000 chars per reply; a
+  cut file ends with `…+<n> chars, full file at <saved path>`.
 - `crc=` is CRC-32 (zlib) of the file bytes, so the agent can check a transfer end to end.
-- Errors: `error: device did not start ZMODEM; device said: <last device lines>` (nothing
-  started within 10 s), `error: device sent no file; device said: sz done rc=128` (lrzsz's
-  `sz` starts a session even for a missing file, then cancels), `error: ZMODEM session on
-  'a' was claimed by another client (a browser tab?)…`, `error: zmodem: session active on
-  port 'a'` (HTTP 409), wrong direction, daemon unreachable, timeout.
+- **Timeout**: omitted = automatic, `bytes × 10 / baud × 1.5 + 30 s` (zrecv extends it when
+  the device announces each file's size), at most 30 min. On expiry:
+  `error: timed out at <n>/<m> bytes after <t>s; at <baud> baud this needs ≈<x>s; retry with timeout_ms>=<y>`.
+- **Low baud**: the sender paces itself from the port's baud — one ZCRCQ acknowledgement per
+  ~1 s of line time (1–8 KiB) and at most four of those unacknowledged — and waits for an
+  acknowledgement as long as the bytes still on the line need, so a 9600-baud line is not
+  flooded. 1 MiB takes ≈ 95 s at 115200 and ≈ 18 min at 9600.
+- **Partial results**: when a transfer fails after some files, those files are listed first
+  and the last line is the `error:`.
+- **Errors**: `error: device did not start ZMODEM; device said: <last device lines>`
+  (nothing started within 10 s); `error: device sent no file (missing/unreadable remote
+  file?); device said: sz done rc=128` (lrzsz's `sz` starts a session even for a missing
+  file, then cancels); `error: device cancelled the transfer; device said: …` /
+  `error: device ended the transfer (its rz/sz exited)…`; `error: ZMODEM session on 'a' was
+  claimed by another client (a browser tab?); close it and retry in ~5 s`; wrong direction
+  (`… retry in ~5 s`); `error: zmodem: session active on port 'a'` (HTTP 409); daemon
+  unreachable; timeout (above). `device said:` only ever quotes the device's own output,
+  never the shell's reaction to protocol bytes.
+- **The shell stays clean.** The engine writes nothing until the device's program has
+  spoken (a cancelling `sz` gets no reply at all). After any failure the client writes the
+  abort sequence once (only if the device's program may still be running), waits until the
+  device is quiet, writes one line terminator to flush the device's input line, discards the
+  shell's reply to it, and returns the device's own text to the ring buffer. The terminator is
+  the per-port setting `zmodem_cleanup_eol`: `cr` (default) | `lf` | `crlf` | `ctrl-u-cr` |
+  `none` — use `ctrl-u-cr` or `none` on U-Boot-style shells, which repeat the last command on
+  an empty line.
 - After a transfer the device's own output (`rz done rc=0`, the prompt) is returned to the
   ring buffer as normal lines, so `read` shows it.
 
+An agent round trip, then a failure followed by one clean `ping` (real output from the
+simulator, mock device running lrzsz; temp dir shown as `/work`):
+
 ```
-> zsend {"port":"console","content":"mode=fast\n","name":"agent.cfg"}
-sent agent.cfg 10B crc=195BE1DD in 0.1s
-> zrecv {"port":"console","remote":["agent.cfg","fw.bin"],"dir":"pulled","inline":true}
-received agent.cfg 10B crc=195BE1DD -> pulled/agent.cfg
-received fw.bin 262144B crc=0C61F2A4 -> pulled/fw.bin (binary, not shown)
+> zsend {"port": "console", "content": "mode=fast\n", "name": "agent.cfg"}
+sent agent.cfg 10B crc=195BE1DD in 0.0s
+> zrecv {"port": "console", "remote": ["agent.cfg", "fw.bin"], "dir": "pulled", "inline": true}
+received agent.cfg 10B crc=195BE1DD -> /work/pulled/agent.cfg
+received fw.bin 262144B crc=6618A177 -> /work/pulled/fw.bin (binary, not shown)
 --- agent.cfg
 mode=fast
+
+> zrecv {"port": "console", "remote": "nope.bin"}
+error: device sent no file (missing/unreadable remote file?); device said: sz done rc=128
+> send {"port": "console", "data": "ping", "wait": "pong"}
+sent 6B matched
+console 14-14 next=14 more=0
+14 pong
 ```
 
-CLI: `serialhub zsend <port> <file>... [--content TEXT|- --name NAME] [--cmd CMD]
-[--timeout-ms N]` and `serialhub zrecv <port> <remote>... [--dir DIR] [--cmd CMD]
+CLI: `serialhub zsend <port> <file>... [--content TEXT|- --name NAME] [--no-overwrite]
+[--cmd CMD] [--timeout-ms N]` and `serialhub zrecv <port> <remote>... [--dir DIR] [--cmd CMD]
 [--overwrite] [--inline] [--timeout-ms N]` print the same text (progress on stderr only when
-it is a TTY; exit 1 on `error:`). The full MCP profile has the same operations as
-`zmodem_send` / `zmodem_receive` with the usual `{"ok": ...}` envelope.
+it is a TTY; `--content -` reads stdin as bytes; exit 1 on an `error:`, `skipped` or
+`not received` line). The full MCP profile has the same operations as `zmodem_send` (`path`,
+`content`, `name`, `encoding`, `overwrite`, `cmd`, `timeout_ms`) / `zmodem_receive` (`remote`,
+`dir`, `inline`, `overwrite`, `cmd`, `timeout_ms`) with the usual `{"ok": ...}` envelope.
 
 ## Line format (send / read / wait)
 

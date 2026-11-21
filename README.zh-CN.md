@@ -357,7 +357,7 @@ ui:
 
 > **安全提示 — Exit 按钮**：用 `--host 0.0.0.0` 对外且未设 `token` 时，任何能打开页面的人都能停止服务（从而释放你的串口）。请在配置里设 `token:`，或设 `allow_shutdown: false`。浏览器发往 `/api/shutdown` 的请求还必须来自页面自身的源（`Origin` 须与 `Host` 一致，否则 `403`）。
 
-**文件传输（rz/sz）。** 设备上需要 lrzsz（`rz`/`sz`）。**上传 (rz)** 向当前口发送 `rz`；设备开始等待后，该口的对话框显示“设备正在等待文件”，点 **选择文件…** 选一个或多个文件。**下载 (sz)…** 先询问设备上的路径，再发送 `sz <路径>`；出现“设备正在发送文件”时点 **接收**，每个文件由浏览器保存。也可以自己在发送栏输入 `rz` / `sz 文件`：只要设备开始 ZMODEM 会话，对话框就会出现。须在 `zmodem_claim_ms`（5 秒）内接受，否则守护会中止。每个文件显示已传/总字节与速率；**取消** 会中止设备上的传输。一个会话只能由一个浏览器持有，其他标签页显示“传输已被另一个浏览器占用”。传输期间该口的文本输出暂停，发送栏返回 `409`；关闭或刷新页面会中止传输。下载的文件在保存前整份放在浏览器内存里（一般嵌入式文件没问题，超大文件需要同等内存）。传输期间请保持该标签页可见：浏览器会节流隐藏标签页的计时器，上传可能因此停顿超过 15 秒空闲超时（`zmodem_idle_ms`）而被中止。
+**文件传输（rz/sz）。** 设备上需要 lrzsz（`rz`/`sz`）。**上传 (rz)** 向当前口发送 `rz`；设备开始等待后，该口的对话框显示“设备正在等待文件”，点 **选择文件…** 选一个或多个文件。**下载 (sz)…** 先询问设备上的路径，再发送 `sz <路径>`；出现“设备正在发送文件”时点 **接收**，每个文件由浏览器保存。也可以自己在发送栏输入 `rz` / `sz 文件`：只要设备开始 ZMODEM 会话，对话框就会出现。须在 `zmodem_claim_ms`（5 秒）内接受，否则守护会中止。每个文件显示已传/总字节与速率；**取消** 会中止设备上的传输。一个会话只能由一个浏览器持有，其他标签页显示“传输已被另一个浏览器占用”。传输期间该口的文本输出暂停，发送栏返回 `409`；关闭或刷新页面会中止传输。下载的文件在保存前整份放在浏览器内存里（一般嵌入式文件没问题，超大文件需要同等内存）。传输期间请保持该标签页可见：浏览器会节流隐藏标签页的计时器，上传可能因此停顿超过 15 秒空闲超时（`zmodem_idle_ms`）而被中止。agent 与脚本不经浏览器用 `zsend` / `zrecv` 传文件（见 [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)）；传输失败后会用每口的 `zmodem_cleanup_eol`（默认 `cr`，可选 `lf`、`crlf`、`ctrl-u-cr`、`none`——U-Boot 风格、空行会重复上一条命令的 shell 用 `ctrl-u-cr`/`none`）冲掉设备输入行。
 
 > **Language / 语言**：Web UI 提供 `EN | 中文` 切换（选择会持久化）。后端消息依据 `SERIALHUB_LANG` 环境变量，否则依据 HTTP `Accept-Language` 头。新增语言的方法见 [`docs/I18N.md`](docs/I18N.md)。
 
@@ -402,8 +402,8 @@ CLI 是**瘦客户端**：除 `serve` / `mcp` 外，每个子命令打印**恰�
 | `mcp` | `[--stdio]` `[--transport]` `[--profile full\|lite]` | (MCP) | 运行 MCP 服务器（`lite` = 8 个精简工具，见 [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)） |
 | `tools` | `[--format anthropic\|openai]` | (本地) | 以原始 JSON 数组打印 lite 工具定义（非信封，无需守护进程） |
 | `call` | `TOOL` `[JSON-ARGS]` | (lite) | 运行一个 lite 工具并打印**纯文本**（非信封）；`error:` 时退出码 1 |
-| `zsend` | `PORT FILE...` `[--content TEXT\|- --name NAME]` `[--encoding text\|base64]` `[--cmd rz]` `[--timeout-ms]` | (`/ws`) | 用内置 Python 引擎做 ZMODEM 上传（自己发送 `rz`）；每个文件打印一行 `sent <name> <bytes>B crc=<CRC32> in <s>s`，纯文本 |
-| `zrecv` | `PORT REMOTE...` `[--dir .]` `[--cmd "sz {remote}"]` `[--overwrite]` `[--inline]` `[--timeout-ms]` | (`/ws`) | ZMODEM 下载到 `--dir`（自己发送 `sz`）；每个文件打印一行 `received <name> <bytes>B crc=<CRC32> -> <path>` |
+| `zsend` | `PORT FILE...` `[--content TEXT\|- --name NAME]` `[--encoding text\|base64]` `[--no-overwrite]` `[--cmd rz]` `[--timeout-ms]` | (`/ws`) | 用内置 Python 引擎做 ZMODEM 上传（自己发送 `rz`）；每个文件打印一行 `sent <name> <bytes>B crc=<CRC32> in <s>s`，纯文本 |
+| `zrecv` | `PORT REMOTE...` `[--dir]` `[--cmd "sz {remote}"]` `[--overwrite]` `[--inline]` `[--timeout-ms]` | (`/ws`) | ZMODEM 下载到 `--dir`（自己发送 `sz`）；每个文件打印一行 `received <name> <bytes>B crc=<CRC32> -> <path>` |
 
 参数细节：
 
@@ -627,8 +627,8 @@ DSH 自带 `@deepseek-ai/dsh-mcp-client` 插件，所以**无需改任何源码*
 | `discover` | — | `devices[]`（`{index, device, description, hwid, vid, pid}`） |
 | `set_pin` | `port, action="set", pin=None, value=None, duration_ms=None` | `action`、`pin`、`value`、`dtr`、`rts`、`duration_ms`；需 `pins.enabled: true` 且端口已打开，`reset` 忽略 `pin` |
 | `switch_config` | `config` | `added`/`removed`/`restarted`/`updated` 与 `config`（生效的绝对路径）；运行时切换配置文件（临时，不落盘） |
-| `zmodem_send` | `port, paths=None, content=None, name=None, encoding="text", cmd="rz", timeout_ms=120000` | `files[]`（`{name, bytes, crc32, seconds, skipped}`）、`text`；ZMODEM 上传，引擎跑在 MCP 进程里（自己发送 `rz`；`paths` 与 `content`+`name` 二选一） |
-| `zmodem_receive` | `port, remote, dir=".", inline=False, cmd=None, overwrite=False, timeout_ms=120000` | `files[]`（`{name, bytes, crc32, path}`）、`missing`、`refused`、`text`；ZMODEM 下载到 `dir`（自己发送 `sz {remote}`） |
+| `zmodem_send` | `port, path=None, content=None, name=None, encoding="text", overwrite=True, cmd="rz", timeout_ms=None` | `files[]`（`{name, bytes, crc32, seconds, skipped}`）、`text`；ZMODEM 上传，引擎跑在 MCP 进程里（自己发送 `rz`；`path` 与 `content`+`name` 二选一；`timeout_ms=None` = 按大小与波特率自动） |
+| `zmodem_receive` | `port, remote, dir=None, inline=False, cmd=None, overwrite=False, timeout_ms=None` | `files[]`（`{name, bytes, crc32, path}`）、`missing`、`refused`、`text`；ZMODEM 下载到 `dir`（自己发送 `sz {remote}`） |
 
 回环演示：
 

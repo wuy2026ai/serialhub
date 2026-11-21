@@ -433,53 +433,66 @@ async def set_pin(port: str, action: str = "set", pin: Optional[str] = None,
                                    value=value, duration_ms=duration_ms)
 
 
+def _names(value: Any) -> list[str]:
+    """``path`` / ``remote``: a list of strings; a bare string counts as one."""
+    if value is None:
+        return []
+    return [value] if isinstance(value, str) else [str(v) for v in value]
+
+
 @mcp.tool(name="zmodem_send", annotations=_MUTATING)
-async def zmodem_send(port: str, paths: Optional[list[str]] = None,
+async def zmodem_send(port: str, path: Optional[Union[list[str], str]] = None,
                       content: Optional[str] = None, name: Optional[str] = None,
-                      encoding: str = "text", cmd: str = "rz",
-                      timeout_ms: int = 120000) -> dict[str, Any]:
+                      encoding: str = "text", overwrite: bool = True, cmd: str = "rz",
+                      timeout_ms: Optional[int] = None) -> dict[str, Any]:
     """Upload file(s) to the device by ZMODEM; sends the rz command itself (do not send it)./
     经 ZMODEM 向设备上传文件；会自己发送 rz 命令（不要另外 send）。
 
-    The ZMODEM engine runs in this MCP process: ``paths`` are files on the machine
-    running the MCP server. Give exactly one of ``paths`` or ``content`` + ``name``.
+    The ZMODEM engine runs in this MCP process: ``path`` names files on the machine
+    running the MCP server. Give exactly one of ``path`` or ``content`` + ``name``.
 
     Args:
         port: Logical port name.
-        paths: Local file path(s) to upload.
-        content: File body to upload instead of ``paths`` (max 1 MiB decoded).
+        path: Local file path(s) to upload.
+        content: File body to upload instead of ``path`` (max 1 MiB decoded).
         name: Device file name for ``content`` (reduced to a basename).
         encoding: ``text`` (UTF-8, default) or ``base64`` for ``content``.
+        overwrite: Ask the receiver to replace an existing file (ZMCLOB; default true).
         cmd: Device command that starts the receiver (default ``rz``; ``""`` = none).
-        timeout_ms: Overall timeout (default 120000, max 1800000).
+        timeout_ms: Overall timeout (default: automatic from size and baud; max 1800000).
 
     Returns:
         dict: ``{"ok": true, "files": [{"name", "bytes", "crc32", "seconds",
-        "skipped"}], "text"}``. On failure ``{"ok": false, "error": "<message>"}``.
+        "skipped"}], "text"}``. On failure ``{"ok": false, "error", "files", "text"}``
+        (``files`` = those sent before the failure).
     """
     from serialhub import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
 
-    if (not paths) == (content is None):
-        return {"ok": False, "error": "give exactly one of paths or content"}
-    contents: list[tuple[str, bytes]] = []
-    if content is not None:
-        if not name:
-            return {"ok": False, "error": "content needs name (the device file name)"}
-        try:
-            contents.append(zc.inline_content(content, name, encoding))
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
-    env = await asyncio.to_thread(zc.send_session, _BASE_URL, _TOKEN, port, paths or [],
-                                  contents=contents, cmd=cmd,
-                                  timeout_ms=zc.clamp_timeout(timeout_ms))
-    return {**env, "text": zc.format_send(env)} if env.get("ok") else env
+    try:
+        paths = _names(path)
+        if (not paths) == (content is None):
+            return {"ok": False, "error": "give exactly one of path or content"}
+        contents: list[tuple[str, bytes]] = []
+        if content is not None:
+            if not name:
+                return {"ok": False, "error": "content needs name (the device file name)"}
+            try:
+                contents.append(zc.inline_content(content, name, encoding))
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+        env = await asyncio.to_thread(zc.send_session, _BASE_URL, _TOKEN, port, paths,
+                                      contents=contents, cmd=cmd, overwrite=overwrite,
+                                      timeout_ms=zc.clamp_timeout(timeout_ms))
+        return {**env, "text": zc.format_send(env)}
+    except Exception as exc:  # noqa: BLE001 - always the usual envelope
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 @mcp.tool(name="zmodem_receive", annotations=_MUTATING)
-async def zmodem_receive(port: str, remote: list[str], dir: str = ".",
+async def zmodem_receive(port: str, remote: Union[list[str], str], dir: Optional[str] = None,
                          inline: bool = False, cmd: Optional[str] = None,
                          overwrite: bool = False,
-                         timeout_ms: int = 120000) -> dict[str, Any]:
+                         timeout_ms: Optional[int] = None) -> dict[str, Any]:
     """Download file(s) from the device by ZMODEM; sends the sz command itself (do not send it)./
     经 ZMODEM 从设备下载文件；会自己发送 sz 命令（不要另外 send）。注意：会写文件。
 
@@ -490,25 +503,29 @@ async def zmodem_receive(port: str, remote: list[str], dir: str = ".",
     Args:
         port: Logical port name.
         remote: Device file name(s).
-        dir: Local directory (created if missing; default ``.``).
+        dir: Local directory (created if missing; default: the current directory if
+            writable, else the temp directory). Saved paths are reported absolute.
         inline: Also return the content of text files (``text``, capped at 4000 chars).
         cmd: Device command; ``{remote}`` = the names (default ``sz {remote}``; ``""`` = none).
         overwrite: Replace existing local files.
-        timeout_ms: Overall timeout (default 120000, max 1800000).
+        timeout_ms: Overall timeout (default: automatic from size and baud; max 1800000).
 
     Returns:
         dict: ``{"ok": true, "files": [{"name", "bytes", "crc32", "path"}], "missing",
-        "refused", "text"}``. On failure ``{"ok": false, "error": "<message>"}``.
+        "refused", "text"}``. On failure ``{"ok": false, "error", "files", "text"}``.
     """
     from serialhub import zmodem_client as zc  # noqa: PLC0415 - websockets only when used
 
-    names = [remote] if isinstance(remote, str) else list(remote or [])
-    if not names:
-        return {"ok": False, "error": "remote is required"}
-    env = await asyncio.to_thread(zc.receive_session, _BASE_URL, _TOKEN, port, names,
-                                  os.path.expanduser(dir or "."), cmd=cmd,
-                                  timeout_ms=zc.clamp_timeout(timeout_ms), overwrite=overwrite)
-    return {**env, "text": zc.format_recv(env, inline=inline)} if env.get("ok") else env
+    try:
+        names = _names(remote)
+        if not names:
+            return {"ok": False, "error": "remote is required"}
+        env = await asyncio.to_thread(zc.receive_session, _BASE_URL, _TOKEN, port, names,
+                                      dir, cmd=cmd, overwrite=overwrite,
+                                      timeout_ms=zc.clamp_timeout(timeout_ms))
+        return {**env, "text": zc.format_recv(env, inline=inline)}
+    except Exception as exc:  # noqa: BLE001 - always the usual envelope
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 # --------------------------------------------------------------------------- #

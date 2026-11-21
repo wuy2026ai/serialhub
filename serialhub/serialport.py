@@ -388,7 +388,12 @@ class SerialPortWorker(threading.Thread):
         return count
 
     def _write_raw(self, data: bytes) -> int:
-        """写原始字节并 flush（不计 tx_lines）；未打开 → RuntimeError，写失败记 last_error 后重抛。"""
+        """写原始字节并 flush（不计 tx_lines）；未打开 → RuntimeError，写失败记 last_error 后重抛。
+
+        在读循环线程里（如截止时间触发的中止串）不做 flush（tcdrain）：tcdrain 要等对端读走数据，
+        而对端（或中间的 socat）此刻可能正卡在把数据写给我们，读循环再等它就是死锁。
+        """
+        drain = threading.current_thread() is not self._loop_thread
         with self._state_lock:
             ser = self._serial
             if ser is None or not self._open:
@@ -399,7 +404,8 @@ class SerialPortWorker(threading.Thread):
             # flush（tcdrain）放在 _io_lock 外：它要等对端读走数据，若持锁等，读循环读不了，
             # 正在发送的设备（lsz）写满缓冲后不再读输入 → tcdrain 永不返回（死锁）。
             try:
-                ser.flush()
+                if drain:
+                    ser.flush()
             except Exception as exc:  # flush 失败记录但不致命
                 with self._state_lock:
                     self._last_error = f"flush: {type(exc).__name__}: {exc}"
@@ -879,7 +885,7 @@ class SerialPortWorker(threading.Thread):
         """（锁外）会话摘除后的收尾：可选写中止串、队列放 None、写 end 标记并广播。"""
         if abort and self.is_open:
             try:
-                self._write_raw(ABORT_SEQ)
+                self._write_raw(ABORT_SEQ)  # 在读循环线程里时不 tcdrain（见 _write_raw）
             except Exception:  # noqa: BLE001 - 写失败已由 _write_raw 记入 last_error 并广播
                 pass
         session.queue.put_nowait(None)

@@ -112,10 +112,10 @@ class MockDevice:
     """以子进程运行 tools/mock_device.py。"""
 
     def __init__(self, dev_path: str, name: str, files_dir: str, recv_dir: str,
-                 interval: float = 0.2) -> None:
+                 interval: float = 0.2, extra: Optional[list[str]] = None) -> None:
         self.cmd = [sys.executable, str(MOCK_DEVICE), "--device", dev_path,
                     "--name", name, "--interval", str(interval),
-                    "--files-dir", str(files_dir), "--recv-dir", str(recv_dir)]
+                    "--files-dir", str(files_dir), "--recv-dir", str(recv_dir), *(extra or [])]
         self.proc: Optional[subprocess.Popen] = None
         self.log_path: Optional[str] = None
 

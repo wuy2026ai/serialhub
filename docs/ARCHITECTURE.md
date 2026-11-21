@@ -539,6 +539,7 @@ class TcpBridge:
 
 **配置**（每口，`PortConfig`）：`zmodem: bool = True`（关掉后起始头按普通文本处理）、
 `zmodem_claim_ms: int = 5000`、`zmodem_idle_ms: int = 15000`（均须 > 0），随 `to_dict()` 往返。
+`zmodem_cleanup_eol: str = "cr"`（`cr`|`lf`|`crlf`|`ctrl-u-cr`|`none`，2026-11 增补）只给非浏览器客户端（zsend/zrecv）用，见下。
 
 **检测**（`serialhub/zmodem.py`）：
 - 起始头正则 `rb"\*\*\x18B0([01])"`：`0`（ZRQINIT，设备跑 `sz`）→ `"download"`，`1`（ZRINIT，设备跑 `rz`）→ `"upload"`。
@@ -646,14 +647,28 @@ zmodem.js 原样会对设备的下一行抛 “Only thing after ZFIN should be O
 订阅就绪后往 stderr 打 `{"ready":true}`，结束时 stdout 打一行 `{"ok","files":[{"name","size"}],"error"}`，退出码 0/1。
 
 **非浏览器客户端（agent / 脚本，2026-11 增补）**：`serialhub/zmodem_proto.py`（纯协议，无 I/O：CRC-16/32、ZDLE、
-十六进制/二进制头、1 KiB 子包、服从 ZRPOS/ZACK/ZSKIP、ZEOF/ZFIN/可选 `OO`、对端 5×CAN、自身失败写 `ABORT_SEQ`、
-每帧超时 + 有界重试 + 总截止时间）+ `serialhub/zmodem_client.py`（`websockets.sync.client`）在**调用方进程**里
-跑完整个会话，协议与 zclient.mjs 相同：先连 `/ws` 并 `subscribe`/`ping`，记 REST 游标，REST send `rz` / `sz {remote}`，
-等本口 `start`（方向须匹配；10 s 没有 → `device did not start ZMODEM` + 设备最后几行），`zmodem_claim`，
-`zmodem_data`/`zmodem_write` 跑引擎；成功后再收 200 ms，`zmodem_end` 带 `tail_b64`（先去掉 0x18，免得设备回显的
-我方帧头在回注时被当成新会话），失败 `abort:true`；设备自己发 CAN 取消（lsz 找不到文件时如此）则收 0.5 s 文本后以
-`done` 结束，文本照常进环。守护进程行为不变、不增加文件访问面（可在远端）。对外：lite 工具 `zsend`/`zrecv`、
-CLI `serialhub zsend|zrecv`、完整 MCP profile `zmodem_send`/`zmodem_receive`（见 `docs/AGENT-LITE.md`）。
+十六进制/二进制头、1 KiB 子包、服从 ZRPOS/ZACK/ZSKIP、ZEOF/ZFIN/可选 `OO`、对端 5×CAN、每帧超时（按“无输入”计）+
+有界重试 + 总截止时间）+ `serialhub/zmodem_client.py`（`websockets.sync.client`）在**调用方进程**里跑完整个会话，
+协议与 zclient.mjs 相同：先连 `/ws` 并 `subscribe`/`ping`，记 REST 游标，经 REST 读端口 `baud` 与
+`zmodem_cleanup_eol`，REST send `rz` / `sz {remote}`，等本口 `start`（方向须匹配；10 s 没有 →
+`device did not start ZMODEM` + 设备最后几行），`zmodem_claim`，`zmodem_data`/`zmodem_write` 跑引擎；成功后再收
+200 ms，`zmodem_end` 带 `tail_b64`。
+- **不往已退出的对端写字节**：接收方先看对方发来了什么——只在收到 ZRQINIT（并静候 0.2 s 没有 CAN/文本）或 0.3 s
+  毫无输入时才发 ZRINIT；发送方的回传通道里出现文本行即判定接收方已退出；握手阶段收到文本也同样处理，二者都不再写。
+- **发送节奏按波特率**：每 `clamp(baud/10, 1 KiB, 8 KiB)`（≈1 s 线上时间）一个 ZCRCQ，未确认数据 ≤ 4 倍；等 ZACK 的
+  时长按在途字节与波特率算；窗口满仍等不到 ZACK 时发空 ZCRCW 要对方报位置，而不是往满管道里重发；同一文件 3 次 ZRPOS
+  后改为 ZCRCW 分段、再多则子包减半（无流控的 MCU）。
+- **统一收尾**（任何非干净结束）：对方可能还活着时写**一次** `ABORT_SEQ`（引擎 `abort_on_error=False` 不写，以
+  `abort:false` 结束故 daemon 也不写）→ 读到 300 ms 静默（≤ 3 s），这段设备文本作提示 → 写一次每口
+  `zmodem_cleanup_eol`（`cr` 默认 | `lf` | `crlf` | `ctrl-u-cr` | `none`）冲掉设备输入行缓冲 → 再读到静默并**丢弃**
+  shell 对它的回应 → `zmodem_end abort:false`、`tail` 只含第 2 步的设备文本（只保留取消前的文本行与取消后、第一行乱码
+  之前的文本行）；第 2 步到 3 s 上限仍未静默才 `abort:true`。daemon 的 `zmodem_write` 失败（如设备不读导致
+  `Write timeout`）后客户端停止写数据，先看紧随其后的设备字节（CAN / 文本）再决定是否中止。
+- **已知局限**：daemon 自己发起的中止（`unclaimed`、`timeout`、断线、浏览器的 abort）仍是 daemon 写 `ABORT_SEQ`
+  并排空，没有上面的“冲掉行缓冲”一步——设备 shell 的输入行里可能残留 CAN/BS，下一条命令可能失败一次。
+
+守护进程行为不变、不增加文件访问面（可在远端）。对外：lite 工具 `zsend`/`zrecv`、CLI `serialhub zsend|zrecv`、
+完整 MCP profile `zmodem_send`/`zmodem_receive`（见 `docs/AGENT-LITE.md`）。
 
 ## 15. 停止服务：`POST /api/shutdown` + WS `shutdown`（2026-11 增补）
 

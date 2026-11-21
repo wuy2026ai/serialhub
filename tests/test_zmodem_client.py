@@ -18,6 +18,7 @@ from serialhub import lite
 from serialhub import zmodem_client as zc
 from serialhub import zmodem_proto as zp
 from serialhub.client import Client
+from serialhub.zmodem import ABORT_SEQ
 
 from test_zmodem_proto import _Chan, _End, _spec  # tests/ is on sys.path (rootdir conftest)
 
@@ -138,3 +139,189 @@ def test_format_recv_inline_text_binary_and_cap(tmp_path) -> None:
     assert out.endswith("x" * shown + f"…+{5000 - shown} chars, full file at {tmp_path / 'c.log'}")
     assert "binary" not in zc.format_recv(env)  # inline off: only the lines
     assert len(zc.format_recv(env).split("\n")) == 3
+
+
+# --------------------------------------------------------------------------- #
+# fix round 1
+# --------------------------------------------------------------------------- #
+class _FakeTransport:
+    """Records writes/ends; ``replies`` = what the device 'says' after each write."""
+
+    def __init__(self, replies: list[bytes], chatty: bool = False) -> None:
+        self.replies = list(replies)
+        self.pending = b""
+        self.writes: list[bytes] = []
+        self.ends: list[tuple[bool, bytes]] = []
+        self.closed = None
+        self.chatty = chatty
+        self.cleaning = False
+        self._error = None
+
+    def write(self, data: bytes, *, force: bool = False) -> None:
+        self.writes.append(data)
+        if self.replies:
+            self.pending += self.replies.pop(0)
+
+    def sync(self, timeout=0):
+        return True
+
+    def settle(self, silence=0.3, cap=3.0):
+        if self.chatty:
+            return b"x" * 10, True
+        out, self.pending = self.pending, b""
+        return out, False
+
+    def end(self, *, abort: bool, tail: bytes = b"", wait: float = 0) -> str:
+        self.ends.append((abort, tail))
+        return "abort" if abort else "done"
+
+
+@pytest.mark.parametrize("setting,eol", [("cr", b"\r"), ("lf", b"\n"), ("crlf", b"\r\n"),
+                                         ("ctrl-u-cr", b"\x15\r"), ("none", b""),
+                                         (None, b"\r"), ("bogus", b"\r")])
+def test_cleanup_eol_values(setting, eol) -> None:
+    assert zc.cleanup_eol_bytes(setting) == eol
+    t = _FakeTransport([b"rz done rc=1\r\n$ ", b"ERR unknown: \x02\x03junk\r\n$ "])
+    lines = zc._cleanup(t, zp.ZmodemError("boom", timed_out=True),
+                        zc.cleanup_eol_bytes(setting)).lines
+    # ABORT_SEQ exactly once, then the terminator (if any) — nothing else
+    assert t.writes == [ABORT_SEQ] + ([eol] if eol else [])
+    assert lines == ["rz done rc=1", "$"]
+    assert t.ends == [(False, b"rz done rc=1\r\n$\r\n")]  # the reply to our eol is dropped
+
+
+def test_cleanup_after_peer_cancel_writes_only_the_eol() -> None:
+    t = _FakeTransport([b"$ "])
+    exc = zp.ZmodemError("cancelled", cancelled=True,
+                         before=zp.encode_hex_header(zp.ZRQINIT) + b"sz: cannot open x\r\n",
+                         after=b"\x08\x08sz done rc=128\r\n")
+    lines = zc._cleanup(t, exc, b"\r").lines
+    assert t.writes == [b"\r"]
+    assert lines == ["sz: cannot open x", "sz done rc=128"]
+
+
+def test_cleanup_stops_hint_at_provoked_junk_and_aborts_when_device_keeps_talking() -> None:
+    exc = zp.ZmodemError("c", cancelled=True,
+                         after=b"rz done rc=143\r\nERR unknown: \x8a\x11\xff\r\nmore\r\n")
+    assert zc._device_lines(exc.before, exc.after) == ["rz done rc=143"]
+    t = _FakeTransport([], chatty=True)
+    zc._cleanup(t, zp.ZmodemError("boom", timed_out=True), b"\r")
+    assert t.writes == [ABORT_SEQ] and t.ends == [(True, b"")]
+
+
+def test_cleanup_classifies_a_write_error_followed_by_can() -> None:
+    """Daemon 'Write timeout' first, device CAN right after: no ABORT_SEQ, reported as gone."""
+    t = _FakeTransport([])
+    t.pending = b"\x18" * 10 + b"\x08" * 10 + b"rz done rc=143\r\nERR unknown: \x01\x02\r\n"
+    out = zc._cleanup(t, zp.ZmodemError("daemon: Write timeout"), b"\r")
+    assert out.gone and out.lines == ["rz done rc=143"]
+    assert t.writes == [b"\r"]
+
+
+def test_cleanup_skipped_when_daemon_already_closed() -> None:
+    t = _FakeTransport([])
+    t.closed = "timeout"
+    zc._cleanup(t, zp.ZmodemError("boom"), b"\r")
+    assert t.writes == [] and t.ends == []
+
+
+@pytest.mark.parametrize("name", ["CON", "nul.txt", "COM1", "lpt9.log", "a:b", "c:\\x\\con",
+                                  "trail.", "trail ", "..", "", "x\x01"])
+def test_safe_name_rejects_windows_hazards(name) -> None:
+    assert zc.safe_name(name) is None
+
+
+def test_safe_name_keeps_normal_names() -> None:
+    assert zc.safe_name("dir/console.log") == "console.log"
+    assert zc.safe_name("测试 file.bin") == "测试 file.bin"
+    assert zc.safe_name("C:\\tmp\\fw.bin") == "fw.bin"
+
+
+def test_inline_tolerates_a_bad_byte_and_reads_at_most_64k(tmp_path) -> None:
+    log = b"boot ok\r\n" * 10 + b"\xff garbled\r\n" + b"ready\r\n"
+    big = b"y" * (zc.INLINE_READ + 1000)
+    env = _env(tmp_path, {"serial.log": log, "big.txt": big})
+    out = zc.format_recv(env, inline=True, cap=lite.MAX_BLOCK_CHARS)
+    assert "(binary" not in out and "--- serial.log\nboot ok" in out and "\ufffd garbled" in out
+    shown = 4000 - len(log.decode("utf-8", "replace"))
+    assert out.endswith(f"…+{len(big) - shown} chars, full file at {tmp_path / 'big.txt'}")
+
+
+def test_mostly_undecodable_is_binary(tmp_path) -> None:
+    env = _env(tmp_path, {"b.dat": bytes(range(0x80, 0x100)) * 4})
+    assert zc.format_recv(env, inline=True).endswith("(binary, not shown)")
+
+
+def test_partial_results_come_before_the_error() -> None:
+    env = {"ok": False, "error": "device cancelled the transfer",
+           "files": [{"name": "a", "bytes": 3, "crc32": "00000001", "seconds": 0.1,
+                      "skipped": False}]}
+    assert zc.format_send(env).split("\n") == [
+        "sent a 3B crc=00000001 in 0.1s", "error: device cancelled the transfer"]
+    renv = {"ok": False, "error": "timed out",
+            "files": [{"name": "a", "bytes": 3, "crc32": "00000001", "path": "/x/a"}]}
+    assert zc.format_recv(renv).split("\n") == ["received a 3B crc=00000001 -> /x/a",
+                                                "error: timed out"]
+
+
+def test_all_skipped_is_an_error() -> None:
+    skipped = {"name": "cfg", "bytes": 3, "crc32": "00000001", "seconds": 0.0, "skipped": True}
+    out = zc.format_send({"ok": True, "files": [skipped]})
+    assert out.split("\n") == ["error: nothing was sent",
+                               'skipped cfg: device refused it (already exists? try cmd "rz -y")']
+    sent = dict(skipped, name="ok", skipped=False)
+    assert not zc.format_send({"ok": True, "files": [sent, skipped]}).startswith("error")
+
+
+def test_auto_timeout_and_message() -> None:
+    assert zc.clamp_timeout(None) is None
+    assert zc.auto_seconds(1 << 20, 115200) == pytest.approx((1 << 20) * 10 / 115200 * 1.5 + 30)
+    assert zc.auto_seconds(1 << 30, 9600) == zc.TIMEOUT_MAX_MS / 1000
+    clock = zc._Clock(None, 9600, 96_000)
+    assert clock() - clock.t0 == pytest.approx(96_000 * 10 / 9600 * 1.5 + 30)
+    clock.done["f"] = 1000
+    msg = clock.message()
+    assert msg.startswith("timed out at 1000/96000 bytes after 0s; at 9600 baud this needs ≈100s;")
+    assert msg.endswith("retry with timeout_ms>=180000")
+    fixed = zc._Clock(5000, 9600, 0)
+    fixed.announce(10_000)
+    assert fixed() - fixed.t0 == pytest.approx(5.0) and fixed.total == 10_000
+    auto = zc._Clock(None, 9600, 0)
+    auto.announce(96_000)
+    assert auto() - time.monotonic() > 170
+
+
+def test_default_dir_falls_back_to_temp(tmp_path, monkeypatch) -> None:
+    import tempfile
+
+    monkeypatch.chdir(tmp_path)
+    assert zc.default_dir() == os.getcwd()
+    monkeypatch.setattr(os, "access", lambda p, m: False)
+    assert zc.default_dir() == tempfile.gettempdir()
+
+
+def test_lite_schema_arrays_and_overwrite() -> None:
+    by = {t["name"]: t["input_schema"]["properties"] for t in lite.TOOLS}
+    assert by["zsend"]["path"]["type"] == "array" and by["zrecv"]["remote"]["type"] == "array"
+    assert by["zsend"]["overwrite"]["type"] == by["zrecv"]["overwrite"]["type"] == "boolean"
+    assert by["zsend"]["timeout_ms"]["description"] == "Default: auto from size and baud"
+    out = lite.call(NOWHERE, "zsend", {"port": "a", "content": "x", "name": "n",
+                                       "overwrite": "maybe"})
+    assert out.startswith("error: overwrite must be true or false")
+
+
+def test_mcp_full_profile_errors_stay_in_envelope(monkeypatch) -> None:
+    pytest.importorskip("mcp")
+    import asyncio
+
+    from serialhub import mcp_server
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(zc, "receive_session", boom)
+    monkeypatch.setattr(zc, "send_session", boom)
+    assert asyncio.run(mcp_server.zmodem_receive("a", "f")) == {
+        "ok": False, "error": "OSError: disk full"}
+    assert asyncio.run(mcp_server.zmodem_send("a", path="x")) == {
+        "ok": False, "error": "OSError: disk full"}

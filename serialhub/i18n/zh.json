@@ -86,14 +86,15 @@
   "cli.arg.zsend_name": "--content 在设备上的文件名（只取 basename）",
   "cli.arg.zsend_encoding": "--content 的编码：text（UTF-8，默认）或 base64",
   "cli.arg.zsend_cmd": "在设备上启动接收方的命令（默认 rz；'' 表示不发）",
-  "cli.arg.zm_timeout": "总超时（毫秒，默认 120000，最大 1800000）",
+  "cli.arg.zm_timeout": "总超时（毫秒；默认按文件大小与波特率自动计算；最大 1800000）",
   "cli.cmd.zrecv": "经 ZMODEM 从设备下载文件（自动发送 sz）",
   "cli.desc.zrecv": "经守护进程用 ZMODEM 从设备下载文件到 --dir。会自己发送 'sz <remote>'。每个文件输出一行：received <name> <bytes>B crc=<CRC32> -> <path>。已存在的文件保留（新文件存为 name.1、name.2……），除非 --overwrite。结果以 'error:' 开头时退出码为 1。",
   "cli.arg.zrecv_remote": "设备上的文件名",
-  "cli.arg.zrecv_dir": "保存到的本地目录（不存在则创建；默认 .）",
+  "cli.arg.zrecv_dir": "保存到的本地目录（不存在则创建；默认：当前目录可写则用它，否则用系统临时目录）",
   "cli.arg.zrecv_cmd": "设备命令，{remote} 替换为文件名（默认 'sz {remote}'；'' 表示不发）",
   "cli.arg.zrecv_overwrite": "覆盖已存在的本地文件，而不是另存为 name.1、name.2……",
   "cli.arg.zrecv_inline": "同时打印文本文件内容（上限 4000 字符）",
   "cli.error.zsend_one": "给出文件路径或 --content，二者只能选一",
-  "cli.error.zsend_name": "--content 需要 --name"
+  "cli.error.zsend_name": "--content 需要 --name",
+  "cli.arg.zsend_no_overwrite": "保留设备上已存在的同名文件（lrz 会回 ZSKIP）；默认覆盖"
 }

@@ -653,20 +653,23 @@ active. Use `status` / `list_ports` afterwards to see the new port set.
 
 Upload file(s) to the device by **ZMODEM**. The tool sends the `rz` command itself (do not `send` it), waits
 for the daemon's ZMODEM session, claims it over `/ws` and runs a pure-Python ZMODEM engine **in the MCP server
-process** — so `paths` are files on the machine running the MCP server, and the daemon may be remote.
+process** — so `path` names files on the machine running the MCP server, and the daemon may be remote.
 
 | Args | Type | Required | Notes |
 |---|---|---|---|
 | `port` | str | yes | Logical port name |
-| `paths` | list[str] | one of | Local file paths |
-| `content` | str | one of | File body instead of `paths` (≤ 1 MiB decoded) |
+| `path` | list[str] (or str) | one of | Local file paths |
+| `content` | str | one of | File body instead of `path` (≤ 1 MiB decoded) |
 | `name` | str | with `content` | Device file name (reduced to a basename) |
 | `encoding` | str | no | `text` (UTF-8, default) or `base64` for `content` |
+| `overwrite` | bool | no | Ask the receiver to replace an existing file (ZMCLOB), default true |
 | `cmd` | str | no | Device command, default `rz`; `""` = the device is already waiting |
-| `timeout_ms` | int | no | Overall timeout, default 120000, max 1800000 |
+| `timeout_ms` | int | no | Overall timeout; default automatic (`bytes×10/baud×1.5 + 30 s`), max 1800000 |
 
 Returns: `{files: [{name, bytes, crc32, seconds, skipped}], text}` — `crc32` is CRC-32 of the file bytes
-(8 upper-case hex), `text` the lite one-line-per-file summary (`sent <name> <bytes>B crc=<CRC32> in <s>s`).
+(8 upper-case hex), `text` the lite one-line-per-file summary (`sent <name> <bytes>B crc=<CRC32> in <s>s`). On failure
+`{ok:false, error, files, text}` — `files` lists what was sent before it failed. After any failure the
+client cleans up the device shell (one abort sequence if needed, then the port's `zmodem_cleanup_eol`).
 
 ### 5.20 `zmodem_receive`
 
@@ -675,19 +678,20 @@ Download file(s) from the device by **ZMODEM** into a local directory. Sends `sz
 | Args | Type | Required | Notes |
 |---|---|---|---|
 | `port` | str | yes | Logical port name |
-| `remote` | list[str] | yes | Device file name(s); `{remote}` in `cmd` = these joined by spaces |
-| `dir` | str | no | Local directory (created if missing), default `.` |
+| `remote` | list[str] (or str) | yes | Device file name(s); `{remote}` in `cmd` = these joined by spaces |
+| `dir` | str | no | Local directory (created if missing); default the current directory if writable, else the temp directory |
 | `inline` | bool | no | Also put text-file content into `text` (capped at 4000 chars) |
 | `cmd` | str | no | Device command, default `sz {remote}`; `""` = none |
 | `overwrite` | bool | no | Replace existing files instead of saving `name.1`, `name.2`, … |
-| `timeout_ms` | int | no | Overall timeout, default 120000, max 1800000 |
+| `timeout_ms` | int | no | Overall timeout; default automatic (extended as each file's size is announced), max 1800000 |
 
 Returns: `{files: [{name, bytes, crc32, path}], missing[], refused[], text}`. Only the basename of a
 device-supplied name is used and files never leave `dir`; a file is written under a temporary name and
 renamed when complete, partial files are removed on failure. No session within 10 s →
 `error: device did not start ZMODEM; device said: <last lines>`; lrzsz's `sz` for a missing file →
-`error: device sent no file; device said: sz done rc=…`; a browser already holding the session → a clear
-`claimed by another client` error.
+`error: device sent no file (missing/unreadable remote file?); device said: sz done rc=…`; a browser
+already holding the session → a clear `claimed by another client … retry in ~5 s` error. Saved paths are
+absolute.
 
 ---
 

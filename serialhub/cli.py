@@ -297,12 +297,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--encoding", default="text", choices=["text", "base64"],
                    help=t("cli.arg.zsend_encoding"))
     p.add_argument("--cmd", default="rz", help=t("cli.arg.zsend_cmd"))
+    p.add_argument("--no-overwrite", action="store_true", help=t("cli.arg.zsend_no_overwrite"))
     p.add_argument("--timeout-ms", type=int, default=None, help=t("cli.arg.zm_timeout"))
 
     p = add("zrecv", help=t("cli.cmd.zrecv"), description=t("cli.desc.zrecv"))
     p.add_argument("port")
     p.add_argument("remote", nargs="+", help=t("cli.arg.zrecv_remote"))
-    p.add_argument("--dir", default=".", help=t("cli.arg.zrecv_dir"))
+    p.add_argument("--dir", default=None, help=t("cli.arg.zrecv_dir"))
     p.add_argument("--cmd", default=None, help=t("cli.arg.zrecv_cmd"))
     p.add_argument("--overwrite", action="store_true", help=t("cli.arg.zrecv_overwrite"))
     p.add_argument("--inline", action="store_true", help=t("cli.arg.zrecv_inline"))
@@ -493,7 +494,8 @@ def _cmd_zmodem(args: argparse.Namespace) -> int:
             elif not args.content_name:
                 text = f"error: {t('cli.error.zsend_name')}"
             else:
-                body = sys.stdin.read() if args.content == "-" else args.content
+                # stdin 按字节读：Windows 上文本模式会改写换行
+                body = sys.stdin.buffer.read() if args.content == "-" else args.content
                 try:
                     contents.append(zc.inline_content(body, args.content_name, args.encoding))
                     text = ""
@@ -506,13 +508,14 @@ def _cmd_zmodem(args: argparse.Namespace) -> int:
         if not text:
             text = zc.zsend(url, token, args.port, args.files, contents=contents,
                             cmd=args.cmd, timeout_ms=zc.clamp_timeout(args.timeout_ms),
-                            progress=_progress())
+                            overwrite=not args.no_overwrite, progress=_progress())
     else:
-        text = zc.zrecv(url, token, args.port, args.remote, os.path.expanduser(args.dir),
+        text = zc.zrecv(url, token, args.port, args.remote, args.dir,
                         cmd=args.cmd, timeout_ms=zc.clamp_timeout(args.timeout_ms),
                         overwrite=args.overwrite, inline=args.inline, progress=_progress())
     print(text)
-    return 1 if text.startswith("error:") or "\nnot received " in "\n" + text else 0
+    bad = ("error:", "not received ", "skipped ")
+    return 1 if any(line.startswith(bad) for line in text.split("\n")) else 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:

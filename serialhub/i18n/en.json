@@ -86,14 +86,15 @@
   "cli.arg.zsend_name": "device file name for --content (reduced to a basename)",
   "cli.arg.zsend_encoding": "encoding of --content: text (UTF-8, default) or base64",
   "cli.arg.zsend_cmd": "device command that starts the receiver (default rz; '' = none)",
-  "cli.arg.zm_timeout": "overall timeout in ms (default 120000, max 1800000)",
+  "cli.arg.zm_timeout": "overall timeout in ms (default: automatic from file size and baud; max 1800000)",
   "cli.cmd.zrecv": "download file(s) from the device by ZMODEM (sends sz itself)",
   "cli.desc.zrecv": "Download files from the device by ZMODEM through the daemon into --dir. Sends 'sz <remote>' itself. Prints one line per file: received <name> <bytes>B crc=<CRC32> -> <path>. Existing files are kept (new one saved as name.1, name.2, ...) unless --overwrite. Exit 1 on 'error:'.",
   "cli.arg.zrecv_remote": "device file name(s)",
-  "cli.arg.zrecv_dir": "local directory to save into (created if missing; default .)",
+  "cli.arg.zrecv_dir": "local directory to save into (created if missing; default: current directory if writable, else the temp directory)",
   "cli.arg.zrecv_cmd": "device command, {remote} = the names (default 'sz {remote}'; '' = none)",
   "cli.arg.zrecv_overwrite": "replace existing local files instead of saving name.1, name.2, ...",
   "cli.arg.zrecv_inline": "also print the content of text files (capped at 4000 chars)",
   "cli.error.zsend_one": "give file path(s) or --content, not both",
-  "cli.error.zsend_name": "--content needs --name"
+  "cli.error.zsend_name": "--content needs --name",
+  "cli.arg.zsend_no_overwrite": "keep an existing device file (lrz then answers ZSKIP); default: overwrite"
 }
