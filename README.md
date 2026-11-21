@@ -16,6 +16,7 @@ Turn one or more serial ports into a **persistent, reviewable, incrementally rea
 > The design contract (data model / Hub / REST / CLI / MCP, all frozen) is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 > The MCP-specific guide is in [`docs/MCP.md`](docs/MCP.md) (Chinese: [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)).
 > The DSH (DeepSeek Harness) integration walkthrough is in [`docs/DSH.md`](docs/DSH.md) (Chinese: [`docs/DSH.zh-CN.md`](docs/DSH.zh-CN.md)).
+> The compact 6-tool interface for small local LLMs (`mcp --profile lite`, `tools`, `call`) is in [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md).
 
 ---
 
@@ -397,7 +398,9 @@ Exit codes: `0`=success, `1`=failure. Global options: `--url` (default `http://1
 | `clear` | `NAME` | `POST .../clear` | Clear that port's buffer |
 | `bridge` | `{start,stop,status}` `--port NAME` `[--mode server\|client]` `[--tcp-port]` `[--host]` | `POST /api/bridge` | Start/stop/inspect the TCP bridge |
 | `reload` | `[--config F]` | `POST /api/reload` | Hot-reload the config; `--config` switches to another config file at runtime (transient, not persisted) |
-| `mcp` | `[--stdio]` `[--transport]` | (MCP) | Run the MCP server |
+| `mcp` | `[--stdio]` `[--transport]` `[--profile full\|lite]` | (MCP) | Run the MCP server (`lite` = 6 compact tools, see [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)) |
+| `tools` | `[--format anthropic\|openai]` | (local) | Print the lite tool definitions as a raw JSON array (no envelope, no daemon needed) |
+| `call` | `TOOL` `[JSON-ARGS]` | (lite) | Run one lite tool and print **plain text** (no envelope); exit 1 on `error:` |
 
 Argument details:
 

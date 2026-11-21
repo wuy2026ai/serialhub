@@ -16,6 +16,7 @@
 > 设计契约（数据模型 / Hub / REST / CLI / MCP，全部冻结）见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 > MCP 专项说明见 [`docs/MCP.zh-CN.md`](docs/MCP.zh-CN.md)。
 > DSH（DeepSeek Harness）接入全过程见 [`docs/DSH.zh-CN.md`](docs/DSH.zh-CN.md)。
+> 面向本地小模型的 6 工具精简接口（`mcp --profile lite`、`tools`、`call`）见 [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)（英文）。
 
 ---
 
@@ -392,7 +393,9 @@ CLI 是**瘦客户端**：除 `serve` / `mcp` 外，每个子命令打印**恰�
 | `clear` | `NAME` | `POST .../clear` | 清空该口缓冲 |
 | `bridge` | `{start,stop,status}` `--port NAME` `[--mode server\|client]` `[--tcp-port]` `[--host]` | `POST /api/bridge` | 起停/查看 TCP 桥 |
 | `reload` | `[--config F]` | `POST /api/reload` | 热重载配置；`--config` 在运行时切换到另一个配置文件（临时，不落盘） |
-| `mcp` | `[--stdio]` `[--transport]` | (MCP) | 运行 MCP 服务器 |
+| `mcp` | `[--stdio]` `[--transport]` `[--profile full\|lite]` | (MCP) | 运行 MCP 服务器（`lite` = 6 个精简工具，见 [`docs/AGENT-LITE.md`](docs/AGENT-LITE.md)） |
+| `tools` | `[--format anthropic\|openai]` | (本地) | 以原始 JSON 数组打印 lite 工具定义（非信封，无需守护进程） |
+| `call` | `TOOL` `[JSON-ARGS]` | (lite) | 运行一个 lite 工具并打印**纯文本**（非信封）；`error:` 时退出码 1 |
 
 参数细节：
 

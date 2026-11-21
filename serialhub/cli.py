@@ -4,6 +4,8 @@
 daemon: every non-``serve`` subcommand prints exactly one line of JSON —
 ``{"ok": true, "data": <result>}`` or ``{"ok": false, "error": "<message>"}`` —
 and exits 0 on success / 1 on failure. ``serve`` runs the daemon in-process.
+The lite-interface commands are deliberately different: ``tools`` prints a raw
+JSON array of tool definitions and ``call`` prints plain text (``serialhub.lite``).
 
 ``hub``/``server``/``tcp_bridge`` (and uvicorn) are imported lazily inside the
 ``serve`` handler only, so ``serialhub list`` and the MCP server start with
@@ -269,6 +271,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p = add("mcp", help=t("cli.cmd.mcp"))
     p.add_argument("--stdio", action="store_true", help=t("cli.arg.stdio"))
     p.add_argument("--transport", default="stdio", help=t("cli.arg.transport"))
+    p.add_argument("--profile", default="full", choices=["full", "lite"],
+                   help=t("cli.arg.profile"))
+
+    # lite 接口：输出刻意不同于其它子命令的单行 JSON 信封（原始 JSON 数组 / 纯文本）。
+    p = add("tools", help=t("cli.cmd.tools"), description=t("cli.desc.tools"))
+    p.add_argument("--format", default="anthropic", choices=["anthropic", "openai"],
+                   help=t("cli.arg.tools_format"))
+
+    p = add("call", help=t("cli.cmd.call"), description=t("cli.desc.call"))
+    p.add_argument("tool", help=t("cli.arg.call_tool"))
+    p.add_argument("args", nargs="?", default=None, help=t("cli.arg.call_args"))
 
     return parser
 
@@ -371,11 +384,44 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_mcp(args: argparse.Namespace) -> int:
+    transport = "stdio" if args.stdio else args.transport
+    if getattr(args, "profile", "full") == "lite":
+        from . import mcp_lite  # noqa: PLC0415 - lazy by design
+
+        mcp_lite.main(transport=transport, base_url=getattr(args, "url", None),
+                      token=getattr(args, "token", None))
+        return 0
+
     from . import mcp_server  # noqa: PLC0415 - lazy by design
 
-    transport = "stdio" if args.stdio else args.transport
     mcp_server.main(transport=transport)
     return 0
+
+
+def _cmd_tools(args: argparse.Namespace) -> int:
+    """Print the lite tool definitions as one compact JSON array (no daemon needed)."""
+    from . import lite  # noqa: PLC0415
+
+    tools = lite.to_openai() if args.format == "openai" else lite.to_anthropic()
+    print(json.dumps(tools, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def _cmd_call(args: argparse.Namespace) -> int:
+    """Run one lite tool and print its plain-text result; exit 1 on ``error:``."""
+    from . import lite  # noqa: PLC0415
+
+    tool_args: Any = {}
+    if args.args:
+        try:
+            tool_args = json.loads(args.args)
+        except json.JSONDecodeError as exc:
+            print(f"error: {t('cli.error.call_args_json', error=exc)}")
+            return 1
+    url, token = _global_options(args)
+    text = lite.call(Client(url, token), args.tool, tool_args)
+    print(text)
+    return 1 if text.startswith("error:") else 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -385,6 +431,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cmd_serve(args)
     if args.command == "mcp":
         return _cmd_mcp(args)
+    if args.command == "tools":
+        return _cmd_tools(args)
+    if args.command == "call":
+        try:
+            return _cmd_call(args)
+        except BrokenPipeError:
+            return 1
     try:
         return _dispatch(args.command, args)
     except BrokenPipeError:
