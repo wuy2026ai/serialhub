@@ -112,6 +112,17 @@ class SendBody(BaseModel):
     timeout_ms: Optional[int] = None
 
 
+class ExchangeBody(BaseModel):
+    """``POST /api/ports/{name}/exchange`` 请求体（§16：写出并收集回复，一次请求）。"""
+
+    data: str
+    eol: Optional[str] = None
+    wait_regex: Optional[str] = None
+    timeout_ms: Optional[int] = None
+    quiet_ms: Optional[int] = None
+    since_seq: Optional[int] = None
+
+
 class ExportBody(BaseModel):
     path: Optional[str] = None
     format: str = "raw"
@@ -378,6 +389,21 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
                 eol=body.eol,
                 wait_regex=body.wait_regex,
                 timeout_ms=body.timeout_ms,
+            ),
+        }
+
+    @app.post("/api/ports/{name}/exchange")
+    def api_exchange(name: str, body: ExchangeBody) -> dict[str, Any]:
+        return {
+            "ok": True,
+            **hub.exchange(
+                name,
+                body.data,
+                eol=body.eol,
+                wait_regex=body.wait_regex,
+                timeout_ms=body.timeout_ms,
+                quiet_ms=body.quiet_ms,
+                since_seq=body.since_seq,
             ),
         }
 

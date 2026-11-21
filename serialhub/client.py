@@ -165,6 +165,25 @@ class Client:
             "data": data, "eol": eol, "wait_regex": wait_regex, "timeout_ms": timeout_ms,
         }, timeout=wait)
 
+    def exchange(self, name: str, data: str, *, eol: Optional[str] = None,
+                 wait_regex: Optional[str] = None, timeout_ms: Optional[int] = None,
+                 quiet_ms: Optional[int] = None,
+                 since_seq: Optional[int] = None) -> dict[str, Any]:
+        """Send a line and collect the reply in ONE request (``POST .../exchange``).
+
+        The daemon returns on ``wait_regex`` / the port's ``prompt`` / ``quiet_ms`` of
+        silence after the last byte / ``timeout_ms`` (``reason`` says which). A daemon
+        without the endpoint (older version) yields ``{"ok": False, "unsupported": True}``.
+        """
+        wait = ((timeout_ms if timeout_ms is not None else 10000) / 1000.0) + 15.0
+        env = self.call("POST", self._port_path(name, "exchange"), body={
+            "data": data, "eol": eol, "wait_regex": wait_regex, "timeout_ms": timeout_ms,
+            "quiet_ms": quiet_ms, "since_seq": since_seq,
+        }, timeout=wait)
+        if not env.get("ok") and env.get("detail") == "Not Found":
+            env["unsupported"] = True  # route missing (404 without our error envelope)
+        return env
+
     def snapshot(self, name: str, *, tail_lines: int = 200) -> dict[str, Any]:
         return self.call("GET", self._port_path(name, "snapshot"),
                          params={"tail_lines": tail_lines})

@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Optional
 
@@ -51,7 +52,12 @@ _PORT_FIELDS = {
     "flush_ms", "framing", "pins", "buffer_lines", "buffer_bytes", "autostart",
     "tcp_bridge", "description", "match",
     "zmodem", "zmodem_claim_ms", "zmodem_idle_ms", "zmodem_cleanup_eol",
+    "prompt", "reply_quiet_ms", "reply_first_ms",
 }
+
+#: ``reply_quiet_ms`` / ``reply_first_ms`` 缺省值（毫秒，§16 ``/exchange``）。
+DEFAULT_REPLY_QUIET_MS = 100
+DEFAULT_REPLY_FIRST_MS = 300
 
 #: ``zmodem_cleanup_eol`` 的合法取值：非干净结束后，非浏览器客户端（zsend/zrecv）写给设备
 #: 冲掉其输入行缓冲的行结束符（``ctrl-u-cr`` = 先 ^U 清行再 CR；``none`` = 不写）。
@@ -110,6 +116,12 @@ class PortConfig:
     zmodem_idle_ms: int = 15000    # 会话内双向都无字节这么久 → 中止（timeout）
     # zsend/zrecv 非干净结束后写给设备的行结束符（见 ZMODEM_CLEANUP_EOLS）
     zmodem_cleanup_eol: str = "cr"
+    # 一问一答（§16 POST /exchange、lite send）：prompt 为设备提示符正则（缺省 None = 不按提示符结束），
+    # 命中未结束的尾巴（pending）或最后一行 rx 即判定回复结束；否则最后一个字节后静默
+    # reply_quiet_ms 结束；写出后一个字节都没收到时最多等 reply_first_ms。
+    prompt: Optional[str] = None
+    reply_quiet_ms: int = DEFAULT_REPLY_QUIET_MS
+    reply_first_ms: int = DEFAULT_REPLY_FIRST_MS
 
 
 @dataclass
@@ -336,6 +348,19 @@ def _validate_port(pc: PortConfig, path_label: str) -> None:
     pc.zmodem_claim_ms = _as_int(pc.zmodem_claim_ms, f"{path_label}.zmodem_claim_ms")
     pc.zmodem_idle_ms = _as_int(pc.zmodem_idle_ms, f"{path_label}.zmodem_idle_ms")
     pc.zmodem_cleanup_eol = str(pc.zmodem_cleanup_eol).lower()
+    pc.reply_quiet_ms = _as_int(pc.reply_quiet_ms, f"{path_label}.reply_quiet_ms")
+    pc.reply_first_ms = _as_int(pc.reply_first_ms, f"{path_label}.reply_first_ms")
+    if pc.reply_quiet_ms < 0:
+        raise ValueError(f"{path_label}.reply_quiet_ms must be >= 0, got {pc.reply_quiet_ms!r}")
+    if pc.reply_first_ms < 0:
+        raise ValueError(f"{path_label}.reply_first_ms must be >= 0, got {pc.reply_first_ms!r}")
+    if pc.prompt is not None:
+        if not isinstance(pc.prompt, str) or not pc.prompt:
+            raise ValueError(f"{path_label}.prompt must be a non-empty regex string, got {pc.prompt!r}")
+        try:
+            re.compile(pc.prompt)
+        except re.error as exc:
+            raise ValueError(f"{path_label}.prompt is not a valid regex: {exc}") from exc
 
     if pc.data_bits not in _VALID_DATA_BITS:
         raise ValueError(f"{path_label}.data_bits must be one of {sorted(_VALID_DATA_BITS)}, got {pc.data_bits!r}")
@@ -498,4 +523,7 @@ def _port_to_dict(pc: PortConfig) -> dict:
         "zmodem_claim_ms": pc.zmodem_claim_ms,
         "zmodem_idle_ms": pc.zmodem_idle_ms,
         "zmodem_cleanup_eol": pc.zmodem_cleanup_eol,
+        "prompt": pc.prompt,
+        "reply_quiet_ms": pc.reply_quiet_ms,
+        "reply_first_ms": pc.reply_first_ms,
     }

@@ -280,8 +280,10 @@ def test_send_eol_variants(live) -> None:
     assert _lines(out1)[0] == "sent 2B"
     out2 = lite.call(client, "send", {"port": "t", "data": "gh"})
     assert _lines(out2)[0] == "sent 4B"
-    texts = [line.split(" ", 1)[1] for line in _lines(out1)[2:] + _lines(out2)[2:]]
+    texts = [line.split(" ", 1)[1] for line in _lines(out1)[2:] + _lines(out2)[2:]
+             if not line.startswith("~")]  # "~ef": the unterminated tail, no seq
     assert texts == ["cd", "efgh"]
+    assert _lines(out1)[-1] == "~ef"
     assert lite.call(client, "send", {"port": "t", "data": "x", "eol": "bad"}).startswith(
         "error:")
 

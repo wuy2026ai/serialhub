@@ -36,6 +36,12 @@ defaults:
   #   | none（不写）
   # ⚠ U-Boot 风格的 shell 在空行上会重复上一条命令（^U 后回车仍是空行，同样会重复）：这类设备用 none。
   zmodem_cleanup_eol: cr
+  # ---- 一问一答（POST /api/ports/{name}/exchange、agent lite `send`）----
+  # 写出命令后收集回复，先到者结束：wait_regex 命中 → prompt 命中 → 静默 → 超时。
+  # prompt: null         # 设备提示符正则，如 "=> $"（U-Boot）、"[#$] $"（shell）、"login: $"；
+  #                      # 命中未结束的尾巴（无换行的提示符）或最后一行 rx 即立刻返回（缺省 null = 不用）
+  reply_quiet_ms: 100    # 最后一个字节之后静默这么久即认为回复结束（按字节计，不按行）
+  reply_first_ms: 300    # 写出后一个字节都没收到时最多等这么久（不超过 timeout_ms）再按静默返回
   # ---- 引脚控制（DTR/RTS）----
   # 默认关闭（enabled: false）。关闭时 worker 任何时刻都不调用 setDTR/setRTS（含 open
   # 时），因此上面的 dtr/rts 也不生效；所有运行时引脚 API（REST/CLI/MCP）都以

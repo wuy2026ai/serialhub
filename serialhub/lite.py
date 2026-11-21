@@ -12,6 +12,7 @@ Compact line format (send/read/wait/search)::
     <seq> ><text>         tx (sent by host)
     <seq> #<text>         mark
     <seq> <text> (x12)    12 consecutive identical lines collapsed; seq = first
+    ~<text>               last line only: unterminated tail, e.g. a prompt; no seq
 
 Empty result: ``<port> empty next=<cursor> more=0``. Pass ``next`` back as ``since``.
 
@@ -36,8 +37,8 @@ from .models import KIND_MARK, KIND_TX, strip_ansi
 # --------------------------------------------------------------------------- #
 MAX_LINE_CHARS = 240          # longer lines are cut to this + "…+<dropped>"
 MAX_BLOCK_CHARS = 4000        # cap on one reply's line block
-QUIET_MS = 300                # send without wait: stop after this long with no new line
-POLL_MS = 50                  # send: poll interval while collecting the reply
+QUIET_MS = 300                # send fallback (daemon without /exchange): stop after this long with no new line
+POLL_MS = 50                  # send fallback: poll interval while collecting the reply
 SEND_TIMEOUT_MS, SEND_TIMEOUT_MAX = 3000, 60000
 WAIT_TIMEOUT_MS, WAIT_TIMEOUT_MAX = 10000, 120000
 READ_LIMIT, READ_LIMIT_MAX = 50, 200
@@ -83,7 +84,7 @@ TOOLS: list[dict[str, Any]] = [
      "description": "List ports: name, open/closed, baud, device, last seq.",
      "input_schema": _obj({}, [])},
     {"name": "send",
-     "description": "Send a line and return the reply lines (after 0.3 s of silence unless wait is set).",
+     "description": "Send a line and return the reply lines (after 0.1 s of silence unless wait is set).",
      "input_schema": _obj({
          "port": _PORT,
          "data": _s("Text to send, without line ending"),
@@ -354,6 +355,12 @@ def _entries(lines: list[dict[str, Any]]) -> list[Entry]:
             for ln in lines]
 
 
+def _with_pending(text: str, env: dict[str, Any]) -> str:
+    """Append the ``~<tail>`` line when the port has an unterminated tail (a prompt)."""
+    tail = env.get("pending")
+    return f"{text}\n~{_clip(str(tail))}" if tail else text
+
+
 def _last_seq(client: Client, port: str) -> int:
     """Current newest seq in a port's buffer (0 when empty)."""
     return int(_ok(client.read(port, limit=0)).get("next_seq") or 0)
@@ -390,9 +397,9 @@ def _tool_read(client: Client, a: dict[str, Any]) -> str:
         since, reset = None, True
     keep = "tail" if since is None else "head"
     rendered = _render(_entries(env.get("lines") or []), collapse=flt is None, keep=keep)
-    return _cursor_block(port, rendered, int(env.get("next_seq") or 0),
-                         bool(env.get("has_more")), dropped=int(env.get("dropped") or 0),
-                         reset=reset)
+    return _with_pending(_cursor_block(port, rendered, int(env.get("next_seq") or 0),
+                                       bool(env.get("has_more")),
+                                       dropped=int(env.get("dropped") or 0), reset=reset), env)
 
 
 def _is_echo(text: str, data: str) -> bool:
@@ -401,6 +408,27 @@ def _is_echo(text: str, data: str) -> bool:
 
 
 def _tool_send(client: Client, a: dict[str, Any]) -> str:
+    """One ``POST .../exchange`` (write + server-side collect); polling fallback for old daemons."""
+    port, data = a["port"], a["data"]
+    if "wait" in a:
+        _regex(a["wait"], "wait")
+    timeout = _clamp(a.get("timeout_ms"), SEND_TIMEOUT_MS, 0, SEND_TIMEOUT_MAX)
+    env = client.exchange(port, data, eol=a.get("eol"), wait_regex=a.get("wait"),
+                          timeout_ms=timeout)
+    if env.get("unsupported"):
+        return _send_polling(client, a)
+    env = _ok(env)
+    head = f"sent {env.get('sent_bytes', 0)}B"
+    if "wait" in a:
+        head += " matched" if env.get("reason") == "regex" else " timeout"
+    rendered = _render(_entries(env.get("lines") or []), collapse=True)
+    block = _cursor_block(port, rendered, int(env.get("next_seq") or 0),
+                          bool(env.get("has_more")))
+    return _with_pending(head + "\n" + block, env)
+
+
+def _send_polling(client: Client, a: dict[str, Any]) -> str:
+    """Pre-/exchange daemons: write, then poll ``read`` until wait/quiet/timeout."""
     port, data = a["port"], a["data"]
     pat = _regex(a["wait"], "wait") if "wait" in a else None
     timeout = _clamp(a.get("timeout_ms"), SEND_TIMEOUT_MS, 0, SEND_TIMEOUT_MAX)
@@ -454,8 +482,14 @@ def _tool_wait(client: Client, a: dict[str, Any]) -> str:
     since = a["since"] if "since" in a else _last_seq(client, port)
     env = _ok(client.wait(port, a["regex"], timeout_ms=timeout, since_seq=since))
     line = env.get("line")
+    if env.get("matched") and not line:
+        # matched the unterminated tail (e.g. "login: "): show every line since the cursor
+        got = _ok(client.read(port, since_seq=since))
+        rendered = _render(_entries(got.get("lines") or []), collapse=True, keep="tail")
+        return _with_pending("matched\n" + _cursor_block(
+            port, rendered, since, dropped=int(got.get("dropped") or 0)), env)
     if not (env.get("matched") and line):
-        return "timeout\n" + _cursor_block(port, _Rendered(), since)
+        return _with_pending("timeout\n" + _cursor_block(port, _Rendered(), since), env)
     # Show every line in (since, match] so next= never skips unseen lines;
     # over the cap, trim from the front so the matched line stays last.
     match_seq = int(line["seq"])
@@ -464,8 +498,9 @@ def _tool_wait(client: Client, a: dict[str, Any]) -> str:
     if not lines or int(lines[-1]["seq"]) != match_seq:
         lines.append(line)  # evicted meanwhile: still show the match itself
     rendered = _render(_entries(lines), collapse=True, keep="tail")
-    return "matched\n" + _cursor_block(port, rendered, match_seq,
-                                        dropped=int(got.get("dropped") or 0))
+    return _with_pending("matched\n" + _cursor_block(port, rendered, match_seq,
+                                                      dropped=int(got.get("dropped") or 0)),
+                         got)
 
 
 def _tool_search(client: Client, a: dict[str, Any]) -> str:

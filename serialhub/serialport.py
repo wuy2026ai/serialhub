@@ -55,7 +55,7 @@ import serial
 from . import discovery
 from .config import DEFAULT_PULSE_MS, normalize_pins
 from .i18n import t
-from .models import now_ms
+from .models import now_ms, strip_ansi
 from . import zmodem as _zmodem  # 排空/队列上限常量按模块属性读取（便于测试调小）
 from .zmodem import ABORT_SEQ, END_REASONS, Detection, ZmodemDetector, ZmodemSession
 
@@ -74,6 +74,11 @@ _ACTIVE_POLL_S = 0.005
 
 #: 中止串的有界排空上限（秒）：轮询 ``out_waiting`` 至多这么久，排不空就丢弃输出缓冲。
 _ABORT_DRAIN_S = 1.0
+
+#: 未结束尾巴（pending，§16）的最大字符数：只保留最后这么多字符（提示符在末尾）。
+PENDING_MAX_CHARS = 240
+#: 计算 pending 时最多看残行缓冲末尾这么多字节（超长残行不必整段解码）。
+_PENDING_WINDOW = 1024
 
 #: 允许被引脚 API 操作的引脚（DTR/RTS）。
 _PIN_NAMES = ("dtr", "rts")
@@ -110,6 +115,12 @@ class SerialPortWorker(threading.Thread):
         self._reconnect_count: int = 0
         self._rx_lines: int = 0
         self._tx_lines: int = 0
+        # 收到的字节总数与最后一个字节到达的单调时刻（/exchange 的静默按字节计，§16）。
+        self._rx_bytes_total: int = 0
+        self._last_rx_mono: float = 0.0
+        # 最近一次发布的 pending（未结束尾巴）：(残行长度, 末尾窗口字节) 与文本，只由读循环线程使用。
+        self._pending_key: tuple = (0, b"")
+        self._pending_text: str = ""
         self._encoding: str = getattr(pc, "encoding", None) or "utf-8"
         self._flush_ms: int = max(0, int(getattr(pc, "flush_ms", 50)))
         # 断帧策略：默认 "line"（只按 EOL 分行）；"idle" 才启用 flush_ms 时间片分帧。
@@ -169,6 +180,11 @@ class SerialPortWorker(threading.Thread):
     def tx_lines(self) -> int:
         with self._counters_lock:
             return self._tx_lines
+
+    def rx_activity(self) -> tuple[int, float]:
+        """``(收到的字节总数, 最后一个字节到达的 time.monotonic())``；从未收到时刻为 0.0。"""
+        with self._counters_lock:
+            return self._rx_bytes_total, self._last_rx_mono
 
     @property
     def resolved_device(self) -> str:
@@ -612,6 +628,7 @@ class SerialPortWorker(threading.Thread):
                     self._flush_line_residual(buf)  # line 模式：断开前吐出残行
                     buf.clear()
                     residual_since = None
+                    self._publish_pending(buf)
                     with self._state_lock:
                         self._reconnect_count += 1
                     self._stop.wait(backoff / 1000.0)
@@ -649,10 +666,47 @@ class SerialPortWorker(threading.Thread):
                     and (now_ms() - residual_since) >= self._flush_ms
                 ):
                     self._drain_residual(buf)
+                self._publish_pending(buf)
         finally:
             # close()/stop() 退出循环：line 模式的残行（含检测器留住的字节）作为最后一行吐出。
             buf.extend(self._zm_detector.flush())
             self._flush_line_residual(buf)
+            buf.clear()
+            self._publish_pending(buf)
+
+    def _publish_pending(self, buf: bytearray) -> None:
+        """残行缓冲有变化时，把未结束尾巴（如提示符 ``=> ``）发布给 hub（§16）。
+
+        不消费解码器状态（getstate → decode → setstate）；去 ANSI、去结尾孤立 ``\r``、
+        只留最后 :data:`PENDING_MAX_CHARS` 个字符。它没有 seq、不入环：EOL 到来后整行照常入环。
+        超长残行只解码末尾 :data:`_PENDING_WINDOW` 字节（新解码器，丢弃开头的半个字符）。
+        """
+        size = len(buf)
+        window = bytes(buf[-_PENDING_WINDOW:]) if size else b""
+        key = (size, window)
+        if key == self._pending_key:
+            return
+        self._pending_key = key
+        text = ""
+        if window:
+            if size <= _PENDING_WINDOW:
+                dec = self._decoder
+                state = dec.getstate()
+                try:
+                    text = dec.decode(window)
+                finally:
+                    dec.setstate(state)
+            else:
+                text = self._make_decoder().decode(window).lstrip("\ufffd")
+            if text.endswith("\r"):
+                text = text[:-1]
+            text = strip_ansi(text)[-PENDING_MAX_CHARS:]
+        if text == self._pending_text:
+            return
+        self._pending_text = text
+        setter = getattr(self._hub, "set_pending", None)
+        if setter is not None:
+            setter(self._pc.name, text)
 
     def _frame(
         self, buf: bytearray, text: bytes, residual_since: Optional[int], now: int
@@ -984,6 +1038,10 @@ class SerialPortWorker(threading.Thread):
             self._close_serial()
             self._broadcast_status()
             return None
+        if data:
+            with self._counters_lock:
+                self._rx_bytes_total += len(data)
+                self._last_rx_mono = time.monotonic()
         if active and not data:
             self._stop.wait(_ACTIVE_POLL_S)  # 锁外短暂让出，避免空转
         return data

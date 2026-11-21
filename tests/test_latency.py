@@ -301,3 +301,252 @@ def test_wait_returns_promptly_after_match(live) -> None:
     done = time.monotonic()
     assert env["matched"] and env["line"]["text"] == "READY 1"
     assert done - stamp["t"] < 0.05
+
+
+# --------------------------------------------------------------------------- #
+# 5. config keys
+# --------------------------------------------------------------------------- #
+def test_config_reply_keys_defaults_and_validation() -> None:
+    cfg = Config.from_dict({"ports": [{"name": "a", "device": "loop://"}]})
+    pc = cfg.port("a")
+    assert (pc.prompt, pc.reply_quiet_ms, pc.reply_first_ms) == (None, 100, 300)
+    out = cfg.to_dict()["ports"][0]
+    assert (out["prompt"], out["reply_quiet_ms"], out["reply_first_ms"]) == (None, 100, 300)
+    cfg = Config.from_dict({"ports": [{"name": "a", "device": "loop://", "prompt": "=> $",
+                                       "reply_quiet_ms": "40", "reply_first_ms": 0}]})
+    assert (cfg.port("a").prompt, cfg.port("a").reply_quiet_ms,
+            cfg.port("a").reply_first_ms) == ("=> $", 40, 0)
+    for bad, field in (({"prompt": "("}, "prompt"), ({"prompt": 5}, "prompt"),
+                       ({"reply_quiet_ms": -1}, "reply_quiet_ms"),
+                       ({"reply_first_ms": "x"}, "reply_first_ms")):
+        with pytest.raises(ValueError, match=field):
+            Config.from_dict({"ports": [{"name": "a", "device": "loop://", **bad}]})
+
+
+# --------------------------------------------------------------------------- #
+# 3. pending (unterminated tail)
+# --------------------------------------------------------------------------- #
+def test_pending_tail_appears_and_clears(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config)
+    sub = hub.subscribe()
+    hub.write_bytes("t", b"boot ok\r\n\x1b[1m=> \x1b[0m")
+    assert _until(lambda: hub.pending("t") == "=> ")
+    assert _rx(hub) == ["boot ok"]  # no seq for the tail
+    assert hub.read("t")["pending"] == "=> "
+    assert hub.status("t")["pending"] == "=> "
+    assert hub.list_ports()["ports"][0]["pending"] == "=> "
+    partials = []
+    while not sub.empty():
+        ev = sub.get_nowait()
+        if ev.get("type") == "partial":
+            partials.append(ev)
+    assert partials and partials[-1] == {"type": "partial", "port": "t", "text": "=> "}
+    assert all("seq" not in ev for ev in partials)
+    hub.write_bytes("t", b"help\r\n")
+    assert _until(lambda: "\x1b[1m=> \x1b[0mhelp" in _rx(hub))
+    assert _until(lambda: hub.pending("t") == "")
+    assert "pending" not in hub.read("t")
+    assert "pending" not in hub.status("t")
+    ev = None
+    while not sub.empty():
+        e = sub.get_nowait()
+        if e.get("type") == "partial":
+            ev = e
+    assert ev == {"type": "partial", "port": "t", "text": ""}
+
+
+def test_pending_tail_capped_and_cleared_on_close(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config)
+    hub.write_bytes("t", b"x" * 300 + b"END")
+    assert _until(lambda: hub.pending("t").endswith("END"))
+    assert len(hub.pending("t")) == 240
+    hub.close("t")
+    assert hub.pending("t") == ""
+    assert _rx(hub)[-1].endswith("END")  # close still flushes the residual as a line
+
+
+def test_pending_tail_multibyte_split_not_garbled(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config)
+    data = "密码: ".encode()
+    hub.write_bytes("t", data[:2])
+    time.sleep(0.05)
+    assert "�" not in hub.pending("t")
+    hub.write_bytes("t", data[2:])
+    assert _until(lambda: hub.pending("t") == "密码: ")
+    hub.write_bytes("t", b"\n")
+    assert _until(lambda: _rx(hub) == ["密码: "])
+
+
+def test_wait_for_matches_pending_tail(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config)
+    since = hub.read("t", limit=0)["next_seq"]
+    threading.Timer(0.1, hub.write_bytes, ("t", b"login: ")).start()
+    res = hub.wait_for("t", r"login: $", timeout_ms=2000, since_seq=since)
+    assert res["matched"] is True and res["line"] is None and res["seq"] is None
+    assert res["pending"] == "login: "
+    # already pending at call time: immediate
+    t0 = time.monotonic()
+    assert hub.wait_for("t", "login", timeout_ms=2000, since_seq=since)["matched"]
+    assert time.monotonic() - t0 < 0.05
+
+
+# --------------------------------------------------------------------------- #
+# 4. exchange
+# --------------------------------------------------------------------------- #
+def _reply(hub: Hub, port: str, data: bytes, delay: float) -> None:
+    threading.Timer(delay, hub.write_bytes, (port, data)).start()
+
+
+def test_exchange_regex_skips_echo(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config)
+    _reply(hub, "t", b"pong\r\n", 0.05)
+    res = hub.exchange("t", "pong", wait_regex="pong", timeout_ms=2000)
+    assert res["reason"] == "regex" and res["matched"] is True
+    assert [ln["text"] for ln in res["lines"]] == ["pong", "pong"]  # echo + reply
+    assert res["sent_bytes"] == 6
+    assert res["next_seq"] == res["lines"][-1]["seq"]
+    assert all(ln["kind"] == "rx" for ln in res["lines"])
+
+
+def test_exchange_quiet_from_last_byte(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config, reply_quiet_ms=150)
+    _reply(hub, "t", b"partial ", 0.1)   # bytes but no line: still resets the quiet clock
+    _reply(hub, "t", b"done\r\n", 0.2)
+    t0 = time.monotonic()
+    res = hub.exchange("t", "cmd")
+    took = time.monotonic() - t0
+    assert res["reason"] == "quiet" and res["matched"] is False
+    assert [ln["text"] for ln in res["lines"]] == ["cmd", "partial done"]
+    assert 0.33 < took < 0.6, took
+
+
+def test_exchange_quiet_default_and_first_byte(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config, eol="none")
+    hub.write_bytes("t", b"\n")
+    _until(lambda: _rx(hub))
+    # loop:// echoes immediately -> quiet ends ~100 ms after the echo
+    t0 = time.monotonic()
+    res = hub.exchange("t", "x\n")
+    took = time.monotonic() - t0
+    assert res["reason"] == "quiet" and 0.08 < took < 0.3, took
+    # nothing at all arrives (eol none, empty data) -> wait reply_first_ms (300) then quiet
+    t0 = time.monotonic()
+    res = hub.exchange("t", "", timeout_ms=5000)
+    took = time.monotonic() - t0
+    assert res["reason"] == "quiet" and res["lines"] == [] and 0.28 < took < 0.6, took
+    t0 = time.monotonic()
+    res = hub.exchange("t", "", timeout_ms=100)  # min(timeout_ms, reply_first_ms)
+    assert res["reason"] == "quiet" and time.monotonic() - t0 < 0.3
+
+
+def test_exchange_prompt_and_timeout(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config, prompt=r"=> $", reply_quiet_ms=1000)
+    _reply(hub, "t", b"ver 1.2\r\n=> ", 0.05)
+    t0 = time.monotonic()
+    res = hub.exchange("t", "version")
+    took = time.monotonic() - t0
+    assert res["reason"] == "prompt" and res["pending"] == "=> ", res
+    assert [ln["text"] for ln in res["lines"]] == ["version", "ver 1.2"]
+    assert took < 0.3, took
+    res = hub.exchange("t", "foo", wait_regex="never", timeout_ms=200)
+    assert res["reason"] == "timeout" and res["matched"] is False
+
+
+def test_exchange_regex_matches_pending(hub_factory, make_config) -> None:
+    hub = _one_port_hub(hub_factory, make_config)
+    _reply(hub, "t", b"Password: ", 0.05)
+    res = hub.exchange("t", "su", wait_regex=r"Password:", timeout_ms=2000)
+    assert res["reason"] == "regex" and res["pending"] == "Password: "
+
+
+def test_exchange_rest_endpoint(live) -> None:
+    hub, client = live
+    _reply(hub, "p", b"ok\r\n=> ", 0.05)
+    env = client.exchange("p", "status")
+    assert env["ok"] and env["reason"] == "prompt" and env["pending"] == "=> "
+    assert [ln["text"] for ln in env["lines"]] == ["status", "ok"]
+    assert env["sent_bytes"] == 8
+    bad = client.exchange("p", "x", wait_regex="(")
+    assert not bad["ok"]
+    assert not client.exchange("nope", "x")["ok"]
+
+
+# --------------------------------------------------------------------------- #
+# lite: one request per send, `~` pending line, 404 fallback
+# --------------------------------------------------------------------------- #
+def _count_calls(monkeypatch):
+    from serialhub.client import Client
+
+    calls: list[str] = []
+    orig = Client.call
+
+    def call(self, method, path, **kw):
+        calls.append(f"{method} {path.rsplit('/', 1)[-1]}")
+        return orig(self, method, path, **kw)
+
+    monkeypatch.setattr(Client, "call", call)
+    return calls
+
+
+def test_lite_send_is_one_request(live, monkeypatch) -> None:
+    from serialhub import lite
+
+    hub, client = live
+    calls = _count_calls(monkeypatch)
+    _reply(hub, "t", b"pong\r\n", 0.03)
+    t0 = time.monotonic()
+    out = lite.call(client, "send", {"port": "t", "data": "ping", "wait": "pong"})
+    assert time.monotonic() - t0 < 0.5
+    assert out.split("\n")[0] == "sent 6B matched"
+    assert calls == ["POST exchange"]
+    calls.clear()
+    t0 = time.monotonic()
+    out = lite.call(client, "send", {"port": "t", "data": "ping"})
+    took = time.monotonic() - t0
+    assert calls == ["POST exchange"] and took < 0.35, took
+    assert out.split("\n")[2].endswith(" ping")
+
+
+def test_lite_pending_tilde_line(live) -> None:
+    from serialhub import lite
+
+    hub, client = live
+    _reply(hub, "p", b"U-Boot 2024\r\n=> ", 0.03)
+    out = lite.call(client, "send", {"port": "p", "data": "version"})
+    assert out.split("\n")[-1] == "~=> "
+    out = lite.call(client, "read", {"port": "p"})
+    assert out.split("\n")[-1] == "~=> "
+    assert lite.call(client, "wait", {"port": "p", "regex": "=> $",
+                                      "timeout_ms": 1000}).split("\n")[-1] == "~=> "
+    hub.write_bytes("p", b"\r\n")
+    assert _until(lambda: hub.pending("p") == "")
+    assert "~" not in lite.call(client, "read", {"port": "p"})
+
+
+def test_lite_wait_matches_pending_prompt(live) -> None:
+    from serialhub import lite
+
+    hub, client = live
+    _reply(hub, "t", b"login: ", 0.1)
+    out = lite.call(client, "wait", {"port": "t", "regex": "login:", "timeout_ms": 2000})
+    lines = out.split("\n")
+    assert lines[0] == "matched" and lines[-1] == "~login: "
+
+
+def test_lite_send_falls_back_on_old_daemon(live, monkeypatch) -> None:
+    from serialhub import lite
+    from serialhub.client import Client
+
+    hub, client = live
+    orig = Client.call
+
+    def old_daemon(self, method, path, **kw):
+        if path.endswith("/exchange"):
+            return {"ok": False, "detail": "Not Found", "error": "HTTP 404: Not Found"}
+        return orig(self, method, path, **kw)
+
+    monkeypatch.setattr(Client, "call", old_daemon)
+    _reply(hub, "t", b"pong\r\n", 0.03)
+    out = lite.call(client, "send", {"port": "t", "data": "ping", "wait": "pong"})
+    assert out.split("\n")[0] == "sent 6B matched"
+    assert lite.call(client, "send", {"port": "nope", "data": "x"}).startswith("error:")
