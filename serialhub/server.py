@@ -23,6 +23,7 @@ import base64
 import binascii
 import json
 import queue
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -518,8 +519,21 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
             ports = []
         await websocket.send_json({"type": "hello", "ports": ports})
 
-        # 2) 订阅广播
-        q = hub.subscribe()
+        # 2) 订阅广播：读线程每入队一个事件就调 _notify；同一批次只投递一次唤醒到事件循环，
+        #    _pump 醒来后一次取走全部已到事件（不再每个事件占一次线程跳转，§16）。
+        loop = asyncio.get_running_loop()
+        wake = asyncio.Event()
+        armed = threading.Event()  # 已投递唤醒、_pump 尚未开始取 → 不重复投递
+
+        def _notify() -> None:
+            if not armed.is_set():
+                armed.set()
+                try:
+                    loop.call_soon_threadsafe(wake.set)
+                except RuntimeError:  # 事件循环已关闭
+                    pass
+
+        q = hub.subscribe(notify=_notify)
         subscribed: Optional[Set[str]] = None  # None 表示全部端口
         # ZMODEM：本连接的稳定身份；port -> (session_id, 会话转发任务)；
         # zm_claimed 记下本连接认领过的每个会话（从不删除），断开时逐个幂等 end。
@@ -527,23 +541,40 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         zm_sessions: dict[str, tuple[str, asyncio.Task]] = {}
         zm_claimed: list[tuple[str, str]] = []
 
-        async def _pump() -> None:
-            """后台任务：把阻塞队列的事件喂给 WebSocket。"""
+        def _take_batch() -> list:
+            """取走队列里已到的全部事件；``partial`` 每口只留最新一条（位置取最后一条）。"""
+            batch: list = []
             while True:
                 try:
-                    event = await asyncio.to_thread(q.get, True, 1.0)
+                    batch.append(q.get_nowait())
                 except queue.Empty:
-                    continue
-                except Exception:  # noqa: BLE001
                     break
-                if subscribed is not None and isinstance(event, dict):
-                    ev_port = event.get("port")
-                    if ev_port is not None and ev_port not in subscribed:
+            out: list = []
+            seen: set = set()
+            for event in reversed(batch):  # 从后往前：每口第一条见到的 partial 即最新
+                if isinstance(event, dict) and event.get("type") == "partial":
+                    if event.get("port") in seen:
                         continue
-                try:
-                    await websocket.send_json(event)
-                except Exception:  # noqa: BLE001 - 客户端已断开
-                    break
+                    seen.add(event.get("port"))
+                out.append(event)
+            out.reverse()
+            return out
+
+        async def _pump() -> None:
+            """后台任务：一次唤醒 → 取走整批事件 → 逐条（每行一帧，契约不变）连续发出。"""
+            while True:
+                await wake.wait()
+                wake.clear()
+                armed.clear()  # 先清再取：之后入队的事件一定会再投递一次唤醒
+                for event in _take_batch():
+                    if subscribed is not None and isinstance(event, dict):
+                        ev_port = event.get("port")
+                        if ev_port is not None and ev_port not in subscribed:
+                            continue
+                    try:
+                        await websocket.send_json(event)
+                    except Exception:  # noqa: BLE001 - 客户端已断开
+                        return
 
         async def _zm_error(port: Any, exc: BaseException, session: Any = None,
                             *, claim: bool = False) -> None:

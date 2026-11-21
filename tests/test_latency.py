@@ -550,3 +550,64 @@ def test_lite_send_falls_back_on_old_daemon(live, monkeypatch) -> None:
     out = lite.call(client, "send", {"port": "t", "data": "ping", "wait": "pong"})
     assert out.split("\n")[0] == "sent 6B matched"
     assert lite.call(client, "send", {"port": "nope", "data": "x"}).startswith("error:")
+
+
+# --------------------------------------------------------------------------- #
+# B. WebSocket pump: one wake-up per batch, partial events coalesced
+# --------------------------------------------------------------------------- #
+def test_ws_burst_keeps_up_with_three_clients(live) -> None:
+    import json as _json
+
+    from websockets.sync.client import connect
+
+    hub, client = live
+    url = client.base_url.replace("http", "ws") + "/ws"
+    import contextlib
+
+    with contextlib.ExitStack() as stack:
+        socks = [stack.enter_context(connect(url)) for _ in range(3)]
+        for ws in socks:
+            ws.recv(timeout=5)  # hello
+        n = 2000
+        t0 = time.monotonic()
+        for i in range(n):
+            hub.ingest("t", f"burst {i:05d} the quick brown fox jumps over the lazy dog")
+        ingest_done = time.monotonic()
+        finish = []
+        for ws in socks:
+            count = 0
+            while True:
+                ev = _json.loads(ws.recv(timeout=10))
+                if ev.get("type") == "line":
+                    count += 1
+                    if ev["line"]["text"].startswith(f"burst {n - 1:05d}"):
+                        break
+            finish.append(time.monotonic())
+            assert count == n
+        # old pump: one asyncio.to_thread(q.get) hop per event -> ~0.1-0.3 s behind
+        assert max(finish) - ingest_done < 0.25, (ingest_done - t0, [f - ingest_done for f in finish])
+
+
+def test_ws_partial_events_coalesced(live) -> None:
+    import json as _json
+
+    from websockets.sync.client import connect
+
+    hub, client = live
+    url = client.base_url.replace("http", "ws") + "/ws"
+    with connect(url) as ws:
+        ws.recv(timeout=5)
+        time.sleep(0.1)
+        for i in range(200):
+            hub.set_pending("t", f"typing {i}")
+        hub.ingest("t", "sentinel")
+        partials = []
+        while True:
+            ev = _json.loads(ws.recv(timeout=5))
+            if ev.get("type") == "partial":
+                partials.append(ev["text"])
+            if ev.get("type") == "line" and ev["line"]["text"] == "sentinel":
+                break
+        assert partials and partials[-1] == "typing 199"
+        assert len(partials) < 200
+        hub.set_pending("t", "")
