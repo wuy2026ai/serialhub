@@ -322,16 +322,27 @@
     // ZMODEM (zmodem.js, serialhub's lrzsz shim, then zmodem-ui.js) is loaded
     // lazily by app.js on the first zmodem event / rz-sz click via
     // window.__loadZmodem(); the promise is memoised and keeps the load order.
+    // These three scripts are LOCAL ONLY (never a CDN: an offline machine would
+    // hang on the fallback past the daemon's 5 s claim window) and the whole load
+    // is bounded to 2 s, so a stalled local load fails fast — app.js then toasts
+    // and the next rz/sz click retries.
     window.__loadZmodem = function () {
       if (window.__zmodemLoading) return window.__zmodemLoading;
       window.__zmodemReady = loadFirst([
-        "/static/vendor/zmodem.min.js",
-        "https://cdn.jsdelivr.net/npm/zmodem.js@0.1.10/dist/zmodem.js"
+        "/static/vendor/zmodem.min.js"
       ], "__zmodemFailed").then(function (ok) {
         return ok && loadFirst(["/static/vendor/zmodem-shim.js"], "__zmodemFailed");
       });
-      window.__zmodemLoading = window.__zmodemReady.then(function () {
+      var load = window.__zmodemReady.then(function (ok) {
+        if (!ok) return false;
         return loadFirst(["/static/zmodem-ui.js"], "__zmodemUiFailed");
+      });
+      window.__zmodemLoading = Promise.race([
+        load,
+        new Promise(function (resolve) { setTimeout(function () { resolve(false); }, 2000); }),
+      ]).then(function (ok) {
+        if (!window.ZmodemUI) window.__zmodemLoading = null;   // failed / timed out: a later call retries
+        return ok;
       });
       return window.__zmodemLoading;
     };

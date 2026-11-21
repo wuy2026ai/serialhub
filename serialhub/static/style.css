@@ -546,6 +546,7 @@ button { cursor: pointer; }
   background: var(--bg); padding: 4px 8px 4px 0;
 }
 .log-fallback .lf-ts { color: var(--text-faint); }
+.log-fallback .lf-sep { color: var(--text-faint); }   /* "--- service restarted ---" break line */
 .log-fallback .lf-seq { color: var(--accent); }
 .log-fallback .lf-tx { color: var(--tx); }
 .log-fallback .lf-rx { color: var(--text); }

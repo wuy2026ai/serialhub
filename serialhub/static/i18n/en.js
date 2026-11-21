@@ -89,6 +89,7 @@ window.SERIALHUB_I18N.register('en', {
   buffer: "buffer",
   bufHint: "{n} lines / {bytes}",
   markLine: "\u2500\u2500 mark: {label} \u2500\u2500",
+  restartSep: "--- service restarted ---",
   toastDismiss: "Dismiss",
   toastNetworkError: "Network error: {msg}",
   toastUnauthorized: "Unauthorized \u2014 set the token in the top bar.",

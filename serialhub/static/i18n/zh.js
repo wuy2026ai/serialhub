@@ -78,6 +78,7 @@ window.SERIALHUB_I18N.register('zh', {
   buffer: "缓冲",
   bufHint: "{n} 行 / {bytes}",
   markLine: "\u2500\u2500 标记: {label} \u2500\u2500",
+  restartSep: "\u2500\u2500 服务已重启 \u2500\u2500",
   toastDismiss: "关闭",
   toastNetworkError: "网络错误：{msg}",
   toastUnauthorized: "未授权 \u2014 请在顶栏填写令牌。",

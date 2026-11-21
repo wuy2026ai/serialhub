@@ -125,6 +125,7 @@ const state = {
   stopped: false,   // true once the daemon was told to exit (or broadcast "shutdown")
   timers: [],       // setInterval ids, cancelled when the service stops
   wsState: "idle",
+  boot: null,      // daemon boot id from the /ws hello (D4): a change = daemon restarted (U1)
   token: safeGet("serialhub.token", ""),
   theme: safeGet("serialhub.theme", ""),
   lang: detectLang(),
@@ -288,6 +289,7 @@ function createRuntime(name) {
     term: null, fit: null, ro: null,
     pend: { shown: "", want: "", raf: 0 },   // unterminated tail ("partial"), see pendSet
     lastSeq: null, histBusy: false, liveQ: [], clearGen: 0,   // history/dedupe
+    seenSeqs: new Set(), seenOrder: [],   // dedupe window of the last SEEN_WINDOW seqs (U2)
     lines: [],          // retained records for filter/search/fallback
     deferred: [],       // lines buffered while paused
     hits: [], hitIdx: -1,
@@ -873,6 +875,19 @@ function renderFallback(rt, rec) {
 
 function trimArr(arr, n) { while (arr.length > n) arr.shift(); }
 
+/* Dedupe window (U2): a tx/mark line can get its seq just before an rx line but be
+   broadcast just after it, so a single high-water mark ("seq <= lastSeq => seen")
+   would drop a late line that was never rendered. Remember the last SEEN_WINDOW
+   seqs instead: a never-seen lower seq still renders, while true duplicates (a live
+   line that a history fetch also returned — history seqs enter the same window)
+   are still dropped. rt.lastSeq stays as the cursor for since_seq fetches only. */
+const SEEN_WINDOW = 256;
+function seenSeqAdd(rt, seq) {
+  if (!rt.seenSeqs.has(seq)) { rt.seenSeqs.add(seq); rt.seenOrder.push(seq); }
+  while (rt.seenOrder.length > SEEN_WINDOW) rt.seenSeqs.delete(rt.seenOrder.shift());
+}
+function seenSeqReset(rt) { rt.seenSeqs = new Set(); rt.seenOrder = []; }
+
 /* Pending tail ("partial" WS event / REST `pending`): the unterminated last line (a prompt such as
    "=> ") shown live at the bottom of the terminal. rt.pend.shown is what is currently on the cursor
    row (no trailing \r\n). Updates are erased with \r\x1b[2K and rewritten, at most once per animation
@@ -885,8 +900,9 @@ function pendFit(rt, text) {
   return s;
 }
 function pendTarget(rt) {
-  if (state.stopped || state.paused || rt.filterRe || rt.histBusy) return null;   // null: leave as is
-  if (window.ZmodemUI && window.ZmodemUI.busy(rt.name)) return "";                // never draw during a transfer
+  if (state.stopped || state.paused || rt.histBusy) return null;   // null: leave as is
+  if (rt.filterRe) return "";                                      // filtered: erase (the tail is unfiltered)
+  if (window.ZmodemUI && window.ZmodemUI.busy(rt.name)) return ""; // never draw during a transfer
   return pendFit(rt, rt.pend.want);
 }
 function pendFlush(rt) {
@@ -929,8 +945,9 @@ function onLine(name, line) {
   if (rt.histBusy) { rt.liveQ.push(line); return; }   // history fetch in flight: replay after it
   const seq = line.seq;
   if (typeof seq === "number") {
-    if (rt.lastSeq != null && seq <= rt.lastSeq) return;   // already shown (history overlap)
-    rt.lastSeq = seq;
+    if (rt.seenSeqs.has(seq)) return;   // true duplicate (history overlap / replayed event)
+    seenSeqAdd(rt, seq);
+    if (rt.lastSeq == null || seq > rt.lastSeq) rt.lastSeq = seq;   // cursor for since_seq only
   }
   pendErase(rt);   // the completed line replaces the tail
   const rec = buildRecord(line);
@@ -984,7 +1001,7 @@ async function loadHistory(rt) {
   try {
     const since = rt.lastSeq;
     let r = await fetchRead(rt.name, since == null ? { limit: HISTORY_LINES } : { since_seq: since });
-    if (r && since != null && r.last_seq != null && r.last_seq < since) {   // daemon restarted: seq reset
+    if (r && since != null && (r.last_seq == null || r.last_seq < since)) {   // daemon restarted: seq reset (empty buffer => last_seq null)
       rt.lastSeq = null;
       r = await fetchRead(rt.name, { limit: HISTORY_LINES });
     }
@@ -994,7 +1011,8 @@ async function loadHistory(rt) {
     if (lines.length > state.maxRenderLines) lines = lines.slice(-state.maxRenderLines);
     const base = rt.lastSeq;
     const fresh = lines.filter((l) => base == null || l.seq > base);
-    fresh.forEach((l) => { if (typeof l.seq === "number" && (rt.lastSeq == null || l.seq > rt.lastSeq)) rt.lastSeq = l.seq; });
+    // history seqs enter the dedupe window too, so the live copies are dropped as duplicates
+    fresh.forEach((l) => { if (typeof l.seq === "number") { seenSeqAdd(rt, l.seq); if (rt.lastSeq == null || l.seq > rt.lastSeq) rt.lastSeq = l.seq; } });
     if (gen === rt.clearGen && portStillKnown(rt.name)) pendErase(rt);
     if (fresh.length && gen === rt.clearGen && portStillKnown(rt.name)) {   // "clear" while fetching: drop
       const recs = fresh.map(buildRecord);
@@ -1160,13 +1178,23 @@ function wsSend(obj) {
 }
 
 /* ZMODEM scripts are loaded on demand (first zmodem message or rz/sz click).
-   Messages that arrive while they load are queued and replayed in order. */
+   Messages that arrive while they load are queued and replayed in order.
+   The three scripts are local-only (no CDN fallback) and the load is bounded to
+   2 s in index.html: on failure we toast once and drop the queue instead of
+   hanging past the daemon's 5 s claim window; an explicit rz/sz click retries. */
 let zmQueue = null;
-function ensureZmodem() {
+function ensureZmodem(userAction) {
   if (window.ZmodemUI && state.zmInited) return Promise.resolve();
-  if (state.zmPromise) return state.zmPromise;
+  if (state.zmPromise && !state.zmFailed) return state.zmPromise;
+  if (!userAction && state.zmFailed) return state.zmPromise || Promise.resolve();   // stay failed until the user retries
   state.zmPromise = (window.__loadZmodem ? window.__loadZmodem() : Promise.resolve()).then(() => {
-    if (!window.ZmodemUI) return;
+    if (!window.ZmodemUI) {
+      state.zmFailed = true;
+      zmQueue = null;   // nothing will ever consume them
+      toast(t("zm.unavailable"), "error");
+      return;
+    }
+    state.zmFailed = false;
     window.ZmodemUI.init({
       wsSend, sendCommand, t, toast,
       paneFor: (name) => { const rt = state.runtimes.get(name); return rt ? rt.pane : null; },
@@ -1181,6 +1209,7 @@ function ensureZmodem() {
 }
 function zmRoute(fn, msg) {
   if (state.zmInited) { window.ZmodemUI[fn](msg); return; }
+  if (state.zmFailed) return;   // vendor scripts unavailable (toast already shown): drop
   (zmQueue = zmQueue || []).push([fn, msg]);
   ensureZmodem();
 }
@@ -1200,7 +1229,7 @@ function dispatchWsMessage(msg) {
     return;
   }
   switch (msg.type) {
-    case "hello": onHello(msg.ports || []); break;
+    case "hello": onHello(msg.ports || [], msg.boot); break;
     case "line": if (msg.line) onLine(msg.port, msg.line); break;
     case "partial": pendSet(msg.port, typeof msg.text === "string" ? msg.text : ""); break;
     case "status": onStatus(msg); break;
@@ -1217,7 +1246,14 @@ function dispatchWsMessage(msg) {
   }
 }
 
-function onHello(ports) {
+function onHello(ports, boot) {
+  /* Daemon identity (U1): the hello's `boot` id changes iff the daemon restarted.
+     Older daemons send none -> keep today's behaviour (the loadHistory seq-reset
+     heuristic below). A change is detected only after the FIRST hello, so a page
+     load against a running daemon never draws a separator. */
+  const bootId = boot == null ? null : String(boot);
+  if (bootId != null && state.boot != null && bootId !== state.boot) onDaemonRestart();
+  if (bootId != null) state.boot = bootId;
   const seen = new Set();
   ports.forEach((p) => {
     if (!p || !p.name || !portInActiveConfig(p.name)) return;
@@ -1231,6 +1267,36 @@ function onHello(ports) {
   });
   if (!state.active && ports.length) activate(ports[0].name);
   updateGlobalStats();
+}
+
+/* The daemon restarted under us (new boot id): its ring buffer — and with it every
+   seq — restarted from zero, so each port's cursor and dedupe window are stale and
+   every new line would be dropped as "already shown". Reset them, drop traffic that
+   is still queued from the old daemon, mark the break with a separator line and
+   re-read the history from the beginning. */
+function onDaemonRestart() {
+  state.runtimes.forEach((rt) => {
+    rt.lastSeq = null;
+    seenSeqReset(rt);
+    rt.liveQ = [];          // old-daemon lines: their seqs mean nothing now
+    pendErase(rt);          // the old prompt tail died with the old daemon
+    renderSeparator(rt, t("restartSep"));
+    loadHistory(rt);        // lastSeq == null => full reload (skipped if already busy)
+  });
+}
+
+/* One visible break line in the terminal (not a record: no seq, never filtered). */
+function renderSeparator(rt, text) {
+  if (rt.term) {
+    rt.term.write(`\x1b[2m${text}\x1b[0m\r\n`);
+    if (state.autoscroll && state.active === rt.name) rt.term.scrollToBottom();
+  } else {
+    const row = document.createElement("div");
+    row.className = "lf-sep";
+    row.textContent = text;
+    rt.el.fallback.appendChild(row);
+    if (state.autoscroll && state.active === rt.name) rt.el.fallback.scrollTop = rt.el.fallback.scrollHeight;
+  }
 }
 
 function onStatus(msg) {
@@ -1261,6 +1327,7 @@ function applyFilter(pattern) {
   rt.filterRe = pattern ? compileRe(pattern) : null;
   const fld = $("#filterInput");
   fld.classList.toggle("invalid", !!pattern && !rt.filterRe);
+  pendSchedule(rt);   // U3: sync the tail with the new filter state now, not on the next partial
 }
 function rebuildView(rt) {
   // Re-render the retained buffer under the current filter state.
@@ -1708,7 +1775,8 @@ function bindUI() {
     e.currentTarget.classList.toggle("on", state.paused);
     refreshPauseBtn();
     if (!state.paused) {
-      state.runtimes.forEach((rt) => { rt.deferred.forEach((rec) => renderRecord(rt, rec)); rt.deferred = []; });
+      // U3: the tail remembered while paused is (re)drawn after the buffered lines
+      state.runtimes.forEach((rt) => { rt.deferred.forEach((rec) => renderRecord(rt, rec)); rt.deferred = []; pendSchedule(rt); });
       toast(t("toastResumed"), "info");
     } else {
       toast(t("toastPaused"), "info");
@@ -1822,16 +1890,20 @@ async function init() {
   $("#btnAuto").classList.toggle("on", state.autoscroll);
   $("#btnTs").classList.toggle("on", state.timestamp);
   bindUI();
-  // ZMODEM UI loads lazily; rz/sz buttons trigger the load, then re-click.
+  // ZMODEM UI loads lazily; rz/sz buttons trigger the load, then re-click. The
+  // first click is also the explicit retry after a failed (bounded) load.
   ["btnRz", "btnSz"].forEach((id) => {
     const b = document.getElementById(id);
     if (!b) return;
-    b.addEventListener("click", function once(e) {
-      if (state.zmInited) return;
-      b.removeEventListener("click", once);
-      e.stopImmediatePropagation();
-      ensureZmodem().then(() => b.click());
-    });
+    const arm = () => {
+      b.addEventListener("click", function once(e) {
+        if (state.zmInited) return;
+        b.removeEventListener("click", once);
+        e.stopImmediatePropagation();
+        ensureZmodem(true).then(() => { if (state.zmInited) b.click(); else arm(); });
+      });
+    };
+    arm();
   });
 
   await loadConfig(cfgPromise);
