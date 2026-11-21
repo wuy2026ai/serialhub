@@ -268,6 +268,9 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         }
 
     # ---- 端口列表 / 状态 ---------------------------------------------------- #
+    # 约定（§16）：可能阻塞的端点（wait/send 的等待、open/close 的线程 join、引脚脉冲的睡眠、
+    # 导出/重载的磁盘 I/O）写成普通 ``def``，由 FastAPI 放进线程池执行，绝不阻塞事件循环
+    # （否则一个 wait 会让所有其它 REST/WS 客户端一起卡住）；其余纯内存端点保持 ``async def``。
     @app.get("/api/ports")
     async def api_ports() -> dict[str, Any]:
         return {"ok": True, **hub.list_ports()}
@@ -277,12 +280,12 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         return {"ok": True, **hub.status(name)}
 
     @app.post("/api/ports/{name}/open")
-    async def api_open(name: str, body: Optional[OpenBody] = None) -> dict[str, Any]:
+    def api_open(name: str, body: Optional[OpenBody] = None) -> dict[str, Any]:
         b = body or OpenBody()
         return {"ok": True, **hub.open(name, baud=b.baud, device=b.device)}
 
     @app.post("/api/ports/{name}/close")
-    async def api_close(name: str) -> dict[str, Any]:
+    def api_close(name: str) -> dict[str, Any]:
         return {"ok": True, **hub.close(name)}
 
     # ---- 运行时改设备（临时，不落盘） -------------------------------------- #
@@ -291,7 +294,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         return {"ok": True, **hub.list_devices()}
 
     @app.post("/api/ports/{name}/device")
-    async def api_set_device(
+    def api_set_device(
         name: str, body: Optional[SetDeviceBody] = None
     ) -> dict[str, Any]:
         b = body or SetDeviceBody()
@@ -306,7 +309,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         return {"ok": True, **hub.pins_status(name)}
 
     @app.post("/api/ports/{name}/pins")
-    async def api_set_pin(name: str, body: Optional[PinBody] = None) -> dict[str, Any]:
+    def api_set_pin(name: str, body: Optional[PinBody] = None) -> dict[str, Any]:
         b = body or PinBody()
         return {
             "ok": True,
@@ -353,7 +356,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         }
 
     @app.get("/api/ports/{name}/wait")
-    async def api_wait(
+    def api_wait(
         name: str,
         regex: str,
         timeout_ms: int = 10000,
@@ -366,7 +369,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
 
     # ---- 数据：send / snapshot / export / clear / mark --------------------- #
     @app.post("/api/ports/{name}/send")
-    async def api_send(name: str, body: SendBody) -> dict[str, Any]:
+    def api_send(name: str, body: SendBody) -> dict[str, Any]:
         return {
             "ok": True,
             **hub.send(
@@ -383,7 +386,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         return {"ok": True, **hub.snapshot(name, tail_lines=tail_lines)}
 
     @app.post("/api/ports/{name}/export")
-    async def api_export(name: str, body: Optional[ExportBody] = None) -> dict[str, Any]:
+    def api_export(name: str, body: Optional[ExportBody] = None) -> dict[str, Any]:
         b = body or ExportBody()
         return {"ok": True, **hub.export(name, path=b.path, fmt=b.format, rng=b.range)}
 
@@ -416,7 +419,7 @@ def create_app(hub: "Hub", config: "Config") -> FastAPI:
         raise ValueError(t("server.error.unknown_bridge_action", action=body.action))
 
     @app.post("/api/reload")
-    async def api_reload(body: Optional[ReloadBody] = None) -> dict[str, Any]:
+    def api_reload(body: Optional[ReloadBody] = None) -> dict[str, Any]:
         """热重载；``{"config": "<path>"}`` 时在运行时切换到该配置文件（仅内存，不落盘）。"""
         from .config import Config as RuntimeConfig  # 延迟导入：config.py 可能尚未落地
 

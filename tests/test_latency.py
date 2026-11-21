@@ -223,3 +223,81 @@ def test_windows_style_no_fd_reads_outside_lock(monkeypatch) -> None:
         t0 = time.monotonic()
         worker.close()
         assert time.monotonic() - t0 < 1.0
+
+
+# --------------------------------------------------------------------------- #
+# 2. waits never block the event loop
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def live(free_tcp_port, make_config):
+    """Started Hub + uvicorn on a free port; yields ``(hub, Client)``."""
+    import uvicorn
+
+    from serialhub.client import Client
+    from serialhub.server import create_app
+
+    cfg = make_config(ports=[
+        {"name": "t", "device": "loop://", "autostart": True,
+         "buffer_lines": 2000, "buffer_bytes": 1 << 22},
+        {"name": "p", "device": "loop://", "autostart": True, "prompt": r"=> $",
+         "buffer_lines": 2000, "buffer_bytes": 1 << 22},
+    ])
+    hub = Hub(cfg)
+    hub.start()
+    port = free_tcp_port()
+    server = uvicorn.Server(uvicorn.Config(create_app(hub, cfg), host="127.0.0.1",
+                                           port=port, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not server.started and time.time() < deadline:
+        time.sleep(0.02)
+    try:
+        assert server.started, "uvicorn failed to start"
+        yield hub, Client(f"http://127.0.0.1:{port}", timeout=10)
+    finally:
+        server.should_exit = True
+        thread.join(10)
+        hub.stop()
+
+
+@pytest.mark.parametrize("blocker", ["wait", "send"])
+def test_pending_wait_does_not_delay_other_clients(live, blocker) -> None:
+    hub, client = live
+    from serialhub.client import Client
+
+    other = Client(client.base_url, timeout=10)
+    client.read("t", limit=0)  # warm up
+    if blocker == "wait":
+        target = lambda: client.wait("t", "never-matches", timeout_ms=1500)  # noqa: E731
+    else:
+        target = lambda: client.send("t", "x", wait_regex="never-matches",  # noqa: E731
+                                     timeout_ms=1500)
+    th = threading.Thread(target=target, daemon=True)
+    th.start()
+    time.sleep(0.2)
+    lat = []
+    for _ in range(5):
+        t0 = time.monotonic()
+        assert other.read("t", limit=1)["ok"]
+        lat.append(time.monotonic() - t0)
+    th.join(5)
+    # old async-def handler ran hub.wait_for on the event loop: every request stalled ~1.3 s
+    assert max(lat) < 0.2, lat
+
+
+def test_wait_returns_promptly_after_match(live) -> None:
+    hub, client = live
+    since = int(client.read("t", limit=0)["next_seq"])
+    stamp: dict = {}
+
+    def later() -> None:
+        time.sleep(0.2)
+        stamp["t"] = time.monotonic()
+        hub.ingest("t", "READY 1")
+
+    threading.Thread(target=later, daemon=True).start()
+    env = client.wait("t", "READY", timeout_ms=3000, since_seq=since)
+    done = time.monotonic()
+    assert env["matched"] and env["line"]["text"] == "READY 1"
+    assert done - stamp["t"] < 0.05
