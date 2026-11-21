@@ -530,3 +530,48 @@ class TcpBridge:
 - 线程安全：Hub 的 seq/缓冲/队列用锁；worker 不直接改缓冲，一律经 `hub.ingest`。
 - 类型注解齐全；`from __future__ import annotations`；文件头 docstring 说明职责。
 - `__init__.py` 暴露 `__version__ = "0.1.0"`。
+
+---
+
+## 14. ZMODEM raw 会话（zmodem.py + serialport.py + hub.py，2026-11 增补）
+
+> 新增章节，不改动上面冻结的 §1–§13。
+
+**配置**（每口，`PortConfig`）：`zmodem: bool = True`（关掉后起始头按普通文本处理）、
+`zmodem_claim_ms: int = 5000`、`zmodem_idle_ms: int = 15000`（均须 > 0），随 `to_dict()` 往返。
+
+**检测**（`serialhub/zmodem.py`）：
+- 起始头正则 `rb"\*\*\x18B0([01])"`：`0`（ZRQINIT，设备跑 `sz`）→ `"download"`，`1`（ZRINIT，设备跑 `rz`）→ `"upload"`。
+- `ZmodemDetector.feed(data) -> (text_bytes, Detection|None)`：命中时 `text` = 头之前的字节，
+  `Detection.initial` = 头及其后同批字节。未命中时只留住结尾恰为 `**\x18B0` 前缀的字节（≤5 字节），
+  `flush()` 释放；worker 在空读（0.1 s 读超时）时调用 `flush()`，故普通文本最多迟一轮读，`line`/`idle` 两种断帧都适用。
+- `ABORT_SEQ = b"\x18"*8 + b"\x08"*8`。
+
+**会话**（worker 驱动，每口至多一个）：
+- 命中 → 头前残行立即作为一行吐出（lrzsz `sz` 先打印 `rz\r`）→ 新建 `ZmodemSession`（`id` = uuid4 hex 前 8 位），
+  `initial` 进 `pending` → `hub.mark(port, "[zmodem] start <direction>")` → 广播
+  `{"type":"zmodem","event":"start","port","session","direction"}`。
+- 会话中读到的**全部**字节只进会话：未认领进 `pending`，认领后进会话的**无界** `queue.Queue`（`None` = 结束哨兵）。
+  不断行、不解码、不经 `Hub.ingest`/环形缓冲/`Hub._broadcast`；检测器停用。
+- 会话中普通 `worker.write`（因此 `hub.send`/`hub.write_bytes`/TCP 桥写入）→ `RuntimeError("zmodem: session active on port '<name>'")`。
+- 每轮读循环检查：未认领超过 `zmodem_claim_ms` → `unclaimed`；双向都无字节超过 `zmodem_idle_ms` → `timeout`；二者都先写 `ABORT_SEQ`。
+- `close()`/`Hub.stop()` → `closed`（尽力写 `ABORT_SEQ` 后关口）；串口读错误断线 → `closed`（不写）。
+- 结束：队列放 `None` → `hub.mark(port, "[zmodem] end reason=<r> rx=<n> tx=<n>")` → 广播
+  `{"type":"zmodem","event":"end","port","session","reason","rx_bytes","tx_bytes"}`，
+  `reason ∈ done|abort|timeout|unclaimed|closed|disconnect`；随后回到行模式。
+
+**Hub API**（未知端口一律 `KeyError`）：
+```python
+def zmodem_status(self, name) -> dict  # {"port","active","session","direction","owner","rx_bytes","tx_bytes"}
+def zmodem_claim(self, name, client_id: str) -> tuple[str, queue.Queue]
+    # 先把 pending 回放进队列；同一 client 重复认领返回同一会话；
+    # RuntimeError("zmodem: no active session") / RuntimeError("zmodem: claimed by another client")
+def zmodem_write(self, name, session_id, client_id, data: bytes) -> int
+    # 仅 owner；原始写，tx_bytes += n，刷新活动时间；会话不符 → 上述两种 RuntimeError
+def zmodem_end(self, name, session_id, client_id: Optional[str], *, abort=False, reason="done") -> dict
+    # 幂等；返回 {"port","session","reason","rx_bytes","tx_bytes"}；abort 先写 ABORT_SEQ。
+    # client_id 非 None 且会话被他人认领 → RuntimeError；已结束的会话返回同一摘要，未知 id 返回 reason=None。
+```
+
+**锁**：worker 新增 `_zm_lock`（叶子锁）守护会话指针与会话字段；持有时不做串口 I/O、不调 hub、不阻塞
+（只对无界队列 `put_nowait`，保证数据、认领回放与结束哨兵的先后顺序）。

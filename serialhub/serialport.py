@@ -18,6 +18,14 @@
 :meth:`~SerialPortWorker.pulse_pin` / :meth:`~SerialPortWorker.reset_pins` 操作引脚；
 睡眠一律在 ``_state_lock`` 之外，序列途中端口关闭则安静退出。
 
+ZMODEM（``pc.zmodem``，默认开）：读到的字节先过 :class:`~serialhub.zmodem.ZmodemDetector`，
+只把头之前的部分断行；命中起始头即把头前残行立即成行、开启会话并切到 raw 模式——此后
+读到的全部字节只进会话（认领前进 ``pending``，认领后进会话的无界队列），不断行、不入环、
+不广播。每轮读循环检查认领/空闲超时；会话结束（含超时、关口、断线）后回到行模式。
+会话期间普通 :meth:`SerialPortWorker.write` 被拒绝，只有会话 owner 经
+:meth:`SerialPortWorker.zmodem_write` 写原始字节。``_zm_lock`` 是叶子锁：持有期间
+不做串口 I/O、不调 hub、不阻塞。
+
 任何串口错误都记入 ``last_error`` 并广播 status 事件，绝不崩溃进程。
 
 仅被 ``Hub`` 使用；不直接改缓冲（一律经 ``hub.ingest``）。
@@ -28,6 +36,7 @@
 from __future__ import annotations
 
 import codecs
+import queue
 import threading
 from typing import TYPE_CHECKING, Optional
 
@@ -37,6 +46,7 @@ from . import discovery
 from .config import DEFAULT_PULSE_MS, normalize_pins
 from .i18n import t
 from .models import now_ms
+from .zmodem import ABORT_SEQ, Detection, ZmodemDetector, ZmodemSession
 
 if TYPE_CHECKING:  # 仅类型标注，避免与 hub 形成运行期循环导入
     from .hub import Hub
@@ -99,6 +109,14 @@ class SerialPortWorker(threading.Thread):
         self._counters_lock = threading.Lock()
         self._stop = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
+        # ZMODEM：检测器只由读循环线程使用；会话指针与会话字段由 _zm_lock 守护。
+        self._zm_enabled: bool = bool(getattr(pc, "zmodem", True))
+        self._zm_claim_ms: int = int(getattr(pc, "zmodem_claim_ms", 5000))
+        self._zm_idle_ms: int = int(getattr(pc, "zmodem_idle_ms", 15000))
+        self._zm_detector = ZmodemDetector()
+        self._zm_lock = threading.Lock()
+        self._zm_session: Optional[ZmodemSession] = None
+        self._zm_last_end: Optional[dict] = None
 
     # ---- 属性 ----
     @property
@@ -295,13 +313,14 @@ class SerialPortWorker(threading.Thread):
                 self._loop_thread.start()
 
     def close(self) -> None:
-        """停止读循环并释放端口（幂等）。"""
+        """停止读循环并释放端口（幂等）；进行中的 ZMODEM 会话以 ``closed`` 结束。"""
         with self._state_lock:
             self._want_open = False
         self._stop.set()
         thread = self._loop_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=3.0)
+        self._zm_end_current("closed", abort=True)  # 关口前尽力让设备退出 rz/sz
         self._close_serial()
         self._broadcast_status()
 
@@ -318,6 +337,10 @@ class SerialPortWorker(threading.Thread):
             self._uses_match = bool(getattr(pc, "match", None))
             self._pins = normalize_pins(getattr(pc, "pins", None), strict=False)
             self._pin_initial = self._resolve_initial(pc)
+        with self._zm_lock:
+            self._zm_enabled = bool(getattr(pc, "zmodem", True))
+            self._zm_claim_ms = int(getattr(pc, "zmodem_claim_ms", 5000))
+            self._zm_idle_ms = int(getattr(pc, "zmodem_idle_ms", 15000))
 
     def _make_decoder(self) -> "codecs.IncrementalDecoder":
         """按当前 ``encoding`` 建增量解码器；未知编码回退 utf-8（不让配置炸掉读循环）。"""
@@ -328,7 +351,22 @@ class SerialPortWorker(threading.Thread):
         return factory(errors="replace")  # type: ignore[no-any-return]
 
     def write(self, data: bytes) -> int:
-        """线程安全写串口（原始字节，不追加 EOL）；未打开 → RuntimeError。"""
+        """线程安全写串口（原始字节，不追加 EOL）；未打开 → RuntimeError。
+
+        ZMODEM 会话进行中 → RuntimeError（普通写入会破坏传输；会话内只走
+        :meth:`zmodem_write`）。
+        """
+        with self._zm_lock:
+            active = self._zm_session is not None
+        if active:
+            raise RuntimeError(f"zmodem: session active on port '{self._pc.name}'")
+        count = self._write_raw(data)
+        with self._counters_lock:
+            self._tx_lines += 1
+        return count
+
+    def _write_raw(self, data: bytes) -> int:
+        """写原始字节并 flush（不计 tx_lines）；未打开 → RuntimeError，写失败记 last_error 后重抛。"""
         with self._state_lock:
             ser = self._serial
             if ser is None or not self._open:
@@ -346,10 +384,7 @@ class SerialPortWorker(threading.Thread):
                 self._last_error = f"write: {type(exc).__name__}: {exc}"
             self._broadcast_status()
             raise
-        count = int(written) if written is not None else len(data)
-        with self._counters_lock:
-            self._tx_lines += 1
-        return count
+        return int(written) if written is not None else len(data)
 
     def status(self) -> dict:
         with self._state_lock:
@@ -502,6 +537,8 @@ class SerialPortWorker(threading.Thread):
 
                 data = self._read_once()
                 if data is None:
+                    self._zm_end_current("closed", abort=False)  # 串口已断，无法再写中止串
+                    buf.extend(self._zm_detector.flush())
                     self._flush_line_residual(buf)  # line 模式：断开前吐出残行
                     buf.clear()
                     residual_since = None
@@ -513,14 +550,18 @@ class SerialPortWorker(threading.Thread):
 
                 now = now_ms()
                 if data:
-                    if not buf:
-                        residual_since = now
-                    buf.extend(data)
-                    self._emit_complete_lines(buf)
-                    if not buf:
-                        residual_since = None
-                    elif residual_since is None:
-                        residual_since = now
+                    text, detection = self._zm_split(data)
+                else:
+                    # 读超时（空读）：释放检测器留住的头前缀，普通文本最多迟一轮。
+                    text, detection = self._zm_detector.flush(), None
+                if text:
+                    residual_since = self._frame(buf, text, residual_since, now)
+                if detection is not None:
+                    if buf:
+                        self._drain_residual(buf)  # 头前残行（如 sz 打印的 "rz\r"）立即成行
+                    residual_since = None
+                    self._zm_begin(detection)
+                self._zm_check_deadlines()
 
                 # 时间片分帧只在 framing == "idle" 且 flush_ms > 0 时生效（flush_ms=0
                 # 不再等价于“每轮都吐”）；默认的 "line" 模式残行一直留到断开/关闭。
@@ -533,8 +574,193 @@ class SerialPortWorker(threading.Thread):
                 ):
                     self._drain_residual(buf)
         finally:
-            # close()/stop() 退出循环：line 模式的残行作为最后一行吐出。
+            # close()/stop() 退出循环：line 模式的残行（含检测器留住的字节）作为最后一行吐出。
+            buf.extend(self._zm_detector.flush())
             self._flush_line_residual(buf)
+
+    def _frame(
+        self, buf: bytearray, text: bytes, residual_since: Optional[int], now: int
+    ) -> Optional[int]:
+        """把文本字节并入行缓冲并吐出整行；返回更新后的残行起始时刻。"""
+        if not buf:
+            residual_since = now
+        buf.extend(text)
+        self._emit_complete_lines(buf)
+        if not buf:
+            return None
+        return residual_since if residual_since is not None else now
+
+    # ---- ZMODEM ----
+    def zmodem_status(self) -> dict:
+        """当前会话快照：``{"port","active","session","direction","owner","rx_bytes","tx_bytes"}``。"""
+        with self._zm_lock:
+            s = self._zm_session
+            if s is None:
+                return {
+                    "port": self._pc.name, "active": False, "session": None,
+                    "direction": None, "owner": None, "rx_bytes": 0, "tx_bytes": 0,
+                }
+            return {
+                "port": s.port, "active": True, "session": s.id,
+                "direction": s.direction, "owner": s.owner,
+                "rx_bytes": s.rx_bytes, "tx_bytes": s.tx_bytes,
+            }
+
+    def zmodem_claim(self, client_id: str) -> tuple[str, "queue.Queue[Optional[bytes]]"]:
+        """认领当前会话：先把 ``pending`` 回放进队列，返回 ``(session_id, queue)``。
+
+        同一 ``client_id`` 重复认领返回同一会话；无会话 / 已被他人认领 → RuntimeError。
+        """
+        with self._zm_lock:
+            s = self._zm_session
+            if s is None:
+                raise RuntimeError("zmodem: no active session")
+            if s.owner is not None and s.owner != client_id:
+                raise RuntimeError("zmodem: claimed by another client")
+            if s.owner is None:
+                s.owner = client_id
+                if s.pending:
+                    s.queue.put_nowait(bytes(s.pending))
+                    s.pending.clear()
+                s.last_activity_ms = now_ms()
+            return s.id, s.queue
+
+    def zmodem_write(self, session_id: str, client_id: str, data: bytes) -> int:
+        """会话 owner 写原始字节到设备；计入 ``tx_bytes`` 并刷新活动时间。"""
+        self._zm_require_owner(session_id, client_id)
+        n = self._write_raw(bytes(data))
+        with self._zm_lock:
+            s = self._zm_session
+            if s is not None and s.id == session_id:
+                s.tx_bytes += n
+                s.last_activity_ms = now_ms()
+        return n
+
+    def zmodem_end(
+        self,
+        session_id: str,
+        client_id: Optional[str],
+        *,
+        abort: bool = False,
+        reason: str = "done",
+    ) -> dict:
+        """结束会话（幂等）：返回结束摘要 ``{"port","session","reason","rx_bytes","tx_bytes"}``。
+
+        ``client_id`` 非 None 且会话已被别人认领 → RuntimeError。会话已结束：若正是最近
+        结束的那个则返回同一摘要，否则返回 ``reason=None`` 的空摘要（不抛）。
+        """
+        with self._zm_lock:
+            s = self._zm_session
+            if s is None or s.id != session_id:
+                last = self._zm_last_end
+                if last is not None and last["session"] == session_id:
+                    return dict(last)
+                return {
+                    "port": self._pc.name, "session": session_id, "reason": None,
+                    "rx_bytes": 0, "tx_bytes": 0,
+                }
+            if client_id is not None and s.owner is not None and s.owner != client_id:
+                raise RuntimeError("zmodem: claimed by another client")
+        return self._zm_finish(s, reason, abort=abort)
+
+    def _zm_require_owner(self, session_id: str, client_id: str) -> None:
+        with self._zm_lock:
+            s = self._zm_session
+            if s is None or s.id != session_id:
+                raise RuntimeError("zmodem: no active session")
+            if s.owner != client_id:
+                raise RuntimeError("zmodem: claimed by another client")
+
+    def _zm_split(self, data: bytes) -> tuple[bytes, Optional[Detection]]:
+        """读到的字节分流：会话中 → 全部进会话（返回空文本）；否则过检测器。"""
+        if self._zm_feed_session(data):
+            return b"", None
+        with self._zm_lock:
+            enabled = self._zm_enabled
+        if not enabled:
+            return data, None
+        return self._zm_detector.feed(data)
+
+    def _zm_feed_session(self, data: bytes) -> bool:
+        """会话进行中则把 ``data`` 交给会话（认领前进 pending）并返回 True。
+
+        在 ``_zm_lock`` 下入队（无界队列不阻塞），保证与认领回放、结束哨兵的先后顺序。
+        """
+        with self._zm_lock:
+            s = self._zm_session
+            if s is None:
+                return False
+            s.rx_bytes += len(data)
+            s.last_activity_ms = now_ms()
+            if s.owner is None:
+                s.pending.extend(data)
+            else:
+                s.queue.put_nowait(bytes(data))
+            return True
+
+    def _zm_begin(self, detection: Detection) -> None:
+        """开启会话：``initial``（头及其后字节）进 pending，写 start 标记并广播 start 事件。"""
+        session = ZmodemSession(port=self._pc.name, direction=detection.direction)
+        session.pending.extend(detection.initial)
+        session.rx_bytes = len(detection.initial)
+        with self._zm_lock:
+            self._zm_session = session
+        self._hub.mark(session.port, f"[zmodem] start {session.direction}")
+        self._hub._broadcast({
+            "type": "zmodem", "event": "start", "port": session.port,
+            "session": session.id, "direction": session.direction,
+        })
+
+    def _zm_check_deadlines(self) -> None:
+        """每轮读循环调用：认领超时 → ``unclaimed``，双向空闲超时 → ``timeout``（均中止）。"""
+        with self._zm_lock:
+            s = self._zm_session
+            if s is None:
+                return
+            now = now_ms()
+            reason: Optional[str] = None
+            if s.owner is None and now - s.started_ms >= self._zm_claim_ms:
+                reason = "unclaimed"
+            elif now - s.last_activity_ms >= self._zm_idle_ms:
+                reason = "timeout"
+        if reason is not None:
+            self._zm_finish(s, reason, abort=True)
+
+    def _zm_end_current(self, reason: str, *, abort: bool) -> None:
+        with self._zm_lock:
+            s = self._zm_session
+        if s is not None:
+            self._zm_finish(s, reason, abort=abort)
+
+    def _zm_finish(self, session: ZmodemSession, reason: str, *, abort: bool) -> dict:
+        """结束 ``session``（只生效一次）：可选写中止串、队列放 None、写 end 标记并广播。"""
+        with self._zm_lock:
+            if self._zm_session is not session:
+                last = self._zm_last_end
+                if last is not None and last["session"] == session.id:
+                    return dict(last)
+                return {
+                    "port": session.port, "session": session.id, "reason": None,
+                    "rx_bytes": session.rx_bytes, "tx_bytes": session.tx_bytes,
+                }
+            self._zm_session = None
+            summary = {
+                "port": session.port, "session": session.id, "reason": reason,
+                "rx_bytes": session.rx_bytes, "tx_bytes": session.tx_bytes,
+            }
+            self._zm_last_end = summary
+        if abort and self.is_open:
+            try:
+                self._write_raw(ABORT_SEQ)
+            except Exception:  # noqa: BLE001 - 写失败已由 _write_raw 记入 last_error 并广播
+                pass
+        session.queue.put_nowait(None)
+        self._hub.mark(
+            session.port,
+            f"[zmodem] end reason={reason} rx={summary['rx_bytes']} tx={summary['tx_bytes']}",
+        )
+        self._hub._broadcast({"type": "zmodem", "event": "end", **summary})
+        return dict(summary)
 
     def _drain_residual(self, buf: bytearray) -> None:
         """把缓冲里的残行立即吐出（idle 时间片 / line 断开都复用它）。"""

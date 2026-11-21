@@ -50,6 +50,7 @@ _PORT_FIELDS = {
     "dtr", "rts", "eol", "encoding", "reconnect_ms", "reconnect_max_ms",
     "flush_ms", "framing", "pins", "buffer_lines", "buffer_bytes", "autostart",
     "tcp_bridge", "description", "match",
+    "zmodem", "zmodem_claim_ms", "zmodem_idle_ms",
 }
 
 #: match 规格里允许出现的键（与 discovery.MATCH_KEYS 同源）。
@@ -97,6 +98,10 @@ class PortConfig:
     autostart: bool = True
     tcp_bridge: Optional[dict] = None
     match: Optional[dict] = None   # 自动发现规格（device 为空时使用）：VID/PID、描述子串等
+    # ZMODEM（rz/sz）检测：命中起始头后该口切到 raw 模式，直到会话结束。
+    zmodem: bool = True
+    zmodem_claim_ms: int = 5000    # 会话开始后这么久无人认领 → 中止（unclaimed）
+    zmodem_idle_ms: int = 15000    # 会话内双向都无字节这么久 → 中止（timeout）
 
 
 @dataclass
@@ -315,6 +320,8 @@ def _validate_port(pc: PortConfig, path_label: str) -> None:
     pc.flush_ms = _as_int(pc.flush_ms, f"{path_label}.flush_ms")
     pc.framing = str(pc.framing).lower()
     pc.pins = normalize_pins(pc.pins, f"{path_label}.pins")
+    pc.zmodem_claim_ms = _as_int(pc.zmodem_claim_ms, f"{path_label}.zmodem_claim_ms")
+    pc.zmodem_idle_ms = _as_int(pc.zmodem_idle_ms, f"{path_label}.zmodem_idle_ms")
 
     if pc.data_bits not in _VALID_DATA_BITS:
         raise ValueError(f"{path_label}.data_bits must be one of {sorted(_VALID_DATA_BITS)}, got {pc.data_bits!r}")
@@ -338,6 +345,12 @@ def _validate_port(pc: PortConfig, path_label: str) -> None:
         raise ValueError(
             f"{path_label}.framing must be one of {sorted(_VALID_FRAMING)}, got {pc.framing!r}"
         )
+    if not isinstance(pc.zmodem, bool):
+        raise ValueError(f"{path_label}.zmodem must be a boolean, got {pc.zmodem!r}")
+    if pc.zmodem_claim_ms <= 0:
+        raise ValueError(f"{path_label}.zmodem_claim_ms must be > 0, got {pc.zmodem_claim_ms!r}")
+    if pc.zmodem_idle_ms <= 0:
+        raise ValueError(f"{path_label}.zmodem_idle_ms must be > 0, got {pc.zmodem_idle_ms!r}")
     if not pc.name:
         raise ValueError(f"{path_label}.name must be non-empty")
     if not pc.device and not pc.match:
@@ -464,4 +477,7 @@ def _port_to_dict(pc: PortConfig) -> dict:
         "buffer_bytes": pc.buffer_bytes,
         "autostart": pc.autostart,
         "tcp_bridge": copy.deepcopy(pc.tcp_bridge),
+        "zmodem": pc.zmodem,
+        "zmodem_claim_ms": pc.zmodem_claim_ms,
+        "zmodem_idle_ms": pc.zmodem_idle_ms,
     }

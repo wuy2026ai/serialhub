@@ -559,6 +559,38 @@ class Hub:
             result["seq"] = waited["seq"]
         return result
 
+    # ---- ZMODEM（rz/sz raw 会话）----
+    def zmodem_status(self, name: str) -> dict:
+        """``{"port","active","session","direction","owner","rx_bytes","tx_bytes"}``；未知端口 → KeyError。"""
+        return self._require_worker(name).zmodem_status()
+
+    def zmodem_claim(self, name: str, client_id: str) -> "tuple[str, queue.Queue]":
+        """认领该口当前会话，返回 ``(session_id, queue)``；认领前收到的字节先回放进队列。
+
+        队列无界，元素为负载 ``bytes``，``None`` 为结束哨兵。无会话 →
+        ``RuntimeError("zmodem: no active session")``；已被别的客户端认领 →
+        ``RuntimeError("zmodem: claimed by another client")``。
+        """
+        return self._require_worker(name).zmodem_claim(client_id)
+
+    def zmodem_write(self, name: str, session_id: str, client_id: str, data: bytes) -> int:
+        """会话 owner 写原始字节（不追加 EOL、不入环）；返回写出字节数。"""
+        return self._require_worker(name).zmodem_write(session_id, client_id, data)
+
+    def zmodem_end(
+        self,
+        name: str,
+        session_id: str,
+        client_id: Optional[str],
+        *,
+        abort: bool = False,
+        reason: str = "done",
+    ) -> dict:
+        """结束会话（幂等）；``abort=True`` 先向设备写 ``ABORT_SEQ``。返回结束摘要。"""
+        return self._require_worker(name).zmodem_end(
+            session_id, client_id, abort=abort, reason=reason
+        )
+
     # ---- 供 worker / 桥使用 ----
     def next_seq(self) -> int:
         with self._seq_lock:
